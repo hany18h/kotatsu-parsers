@@ -75,3 +75,4 @@ dependencies {
 }
 
 tasks.register('generateTestsReport', ReportGenerateTask)
+
