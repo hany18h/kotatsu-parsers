@@ -14,7 +14,7 @@ import java.util.*
 @Broken
 @MangaSourceParser("ONMA", "Onma", "ar")
 internal class Onma(context: MangaLoaderContext) :
-	MmrcmsParser(context, MangaParserSource.ONMA, "onma.me") {
+	MmrcmsParser(context, MangaParserSource.ONMA, "onma.top") {
 
 	override val sourceLocale: Locale = Locale.ENGLISH
 	override val selectState = "h3:contains(الحالة) .text"
