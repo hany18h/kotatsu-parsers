@@ -40,7 +40,7 @@ internal class Dilar(context: MangaLoaderContext) :
         )
 
     private val apiHeaders: Headers
-        get() = headersBuilder()
+        get() = Headers.Builder()
             .add("Accept", "application/json")
             .add("Content-Type", "application/json")
             .add("Referer", "https://$domain/")
@@ -49,7 +49,6 @@ internal class Dilar(context: MangaLoaderContext) :
     // === القوائم ===
     override suspend fun getListPage(
         page: Int,
-        order: SortOrder?,
         filter: MangaListFilter
     ): List<Manga> {
         if (!filter.query.isNullOrEmpty()) {
@@ -77,7 +76,7 @@ internal class Dilar(context: MangaLoaderContext) :
                 url = "/api/mangas/$mangaId",
                 publicUrl = "https://$domain/mangas/$mangaId",
                 title = manga.getString("title"),
-                altTitles = null,
+                altTitle = null,
                 coverUrl = "https://$domain/uploads/manga/cover/$mangaId/${manga.optString("cover")}",
                 rating = manga.optString("rating").toFloatOrNull()?.div(10) ?: RATING_UNKNOWN,
                 tags = manga.optJSONArray("categories")?.let { cats ->
@@ -91,10 +90,10 @@ internal class Dilar(context: MangaLoaderContext) :
                         }
                     }.toSet()
                 } ?: emptySet(),
-                authors = null,
+                author = null,
                 state = null,
                 source = source,
-                contentRating = ContentRating.SAFE,
+                isNsfw = false,
             )
         }
 
@@ -155,7 +154,7 @@ internal class Dilar(context: MangaLoaderContext) :
                 url = "/api/mangas/$mangaId",
                 publicUrl = "https://$domain/mangas/$mangaId",
                 title = manga.getString("title"),
-                altTitles = null,
+                altTitle = null,
                 coverUrl = "https://$domain/uploads/manga/cover/$mangaId/${manga.optString("cover")}",
                 rating = RATING_UNKNOWN,
                 tags = manga.optJSONArray("categories")?.let { cats ->
@@ -165,10 +164,10 @@ internal class Dilar(context: MangaLoaderContext) :
                         }
                     }.toSet()
                 } ?: emptySet(),
-                authors = null,
+                author = null,
                 state = null,
                 source = source,
-                contentRating = ContentRating.SAFE,
+                isNsfw = false,
             )
         }
     }
@@ -200,7 +199,7 @@ internal class Dilar(context: MangaLoaderContext) :
             MangaChapter(
                 id = generateUid(releaseId.toLong()),
                 name = if (title.isBlank()) "Chapter $chapterNum" else title,
-                number = chapterNum.toFloatOrNull() ?: 0f,
+                number = chapterNum.toIntOrNull() ?: 0,
                 volume = 0,
                 url = "/r/$releaseId",
                 scanlator = release.optString("team_name"),
@@ -212,7 +211,7 @@ internal class Dilar(context: MangaLoaderContext) :
 
         manga.copy(
             title = data.getString("title"),
-            altTitles = data.optString("synonyms").takeIf { it.isNotBlank() }?.let { setOf(it) },
+            altTitle = data.optString("synonyms").takeIf { it.isNotBlank() },
             description = data.optString("summary"),
             coverUrl = "https://$domain/uploads/manga/cover/${data.getInt("id")}/${data.optString("cover")}",
             tags = data.optJSONArray("categories")?.let { cats ->
@@ -222,10 +221,10 @@ internal class Dilar(context: MangaLoaderContext) :
                     }
                 }.toSet()
             } ?: manga.tags,
-            authors = setOfNotNull(
+            author = listOfNotNull(
                 data.optString("creator_nick").takeIf { it.isNotBlank() },
                 data.optString("editor_nick").takeIf { it.isNotBlank() }
-            ),
+            ).joinToString(),
             state = when (data.optInt("translation_status")) {
                 1 -> MangaState.ONGOING
                 2 -> MangaState.FINISHED
