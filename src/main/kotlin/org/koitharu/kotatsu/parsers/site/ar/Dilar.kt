@@ -91,8 +91,8 @@ internal class Dilar(context: MangaLoaderContext) :
             val relUrl = "/r/$releaseId"
             MangaChapter(
                 id = generateUid(relUrl),
-                name = if (chapterTitle.isBlank()) "Chapter $chapterNum" else chapterTitle,
-                number = chapterNum.toFloatOrNull()?.toInt() ?: i + 1,
+                title = if (chapterTitle.isBlank()) "Chapter $chapterNum" else chapterTitle,
+                number = chapterNum.toFloatOrNull() ?: (i + 1).toFloat(),
                 volume = 0,
                 url = relUrl,
                 scanlator = release.optString("team_name", null),
