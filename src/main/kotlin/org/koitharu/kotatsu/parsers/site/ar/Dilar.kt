@@ -66,16 +66,16 @@ internal class Dilar(context: MangaLoaderContext) :
 
     // تجاوز دالة التفاصيل
     override suspend fun getDetails(manga: Manga): Manga {
-        val infoUrl = "https://$domain${manga.url}"
-        val chaptersUrl = "https://$domain${manga.url}/releases"
+    val infoUrl = "https://$domain${manga.url}"
+    val chaptersUrl = "https://$domain${manga.url}/releases"
 
-        val infoJson = webClient.httpGet(infoUrl).parseJson()
-        val chaptersJson = webClient.httpGet(chaptersUrl).parseJson()
+    val infoJson = webClient.httpGet(infoUrl).parseJson()
+    val chaptersJson = webClient.httpGet(chaptersUrl).parseJson()
 
-        // الـ API بيرجع "manga" مش "manga_data"
-        val data = infoJson.getJSONObject("manga")
-        val releases = chaptersJson.getJSONArray("releases")
-
+    // تعديل هنا
+    val data = infoJson.optJSONObject("manga") ?: infoJson
+    val releases = chaptersJson.getJSONArray("releases")
+    
         val chapters = (0 until releases.length()).mapNotNull { i ->
             val release = releases.optJSONObject(i) ?: return@mapNotNull null
             
