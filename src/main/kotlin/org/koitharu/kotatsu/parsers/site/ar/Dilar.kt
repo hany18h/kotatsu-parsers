@@ -72,6 +72,7 @@ internal class Dilar(context: MangaLoaderContext) :
         val infoJson = webClient.httpGet(infoUrl).parseJson()
         val chaptersJson = webClient.httpGet(chaptersUrl).parseJson()
 
+        // الـ API بيرجع "manga" مش "manga_data"
         val data = infoJson.getJSONObject("manga")
         val releases = chaptersJson.getJSONArray("releases")
 
