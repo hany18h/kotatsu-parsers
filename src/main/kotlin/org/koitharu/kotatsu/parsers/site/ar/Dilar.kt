@@ -15,9 +15,6 @@ import javax.crypto.spec.SecretKeySpec
 
 /**
  * Dilar - موقع مانجا عربي (API-based)
- * 
- * ملاحظة: هذا الموقع يستخدم API مخصص مع تشفير
- * نستخدم MangaReaderParser كـ base ونتجاوز الدوال المطلوبة
  */
 @MangaSourceParser("DILAR", "Dilar", "ar")
 internal class Dilar(context: MangaLoaderContext) :
@@ -26,7 +23,6 @@ internal class Dilar(context: MangaLoaderContext) :
     override val listUrl = "/api/releases"
     override val datePattern = "yyyy-MM-dd'T'HH:mm:ss"
 
-    // تجاوز دالة القائمة الرئيسية
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         val url = "https://$domain/api/releases?page=$page"
         val json = webClient.httpGet(url).parseJson()
@@ -38,7 +34,6 @@ internal class Dilar(context: MangaLoaderContext) :
             val release = releases.optJSONObject(i) ?: continue
             val manga = release.optJSONObject("manga") ?: continue
             
-            // تخطي الروايات
             if (manga.optBoolean("is_novel", false)) continue
 
             val mangaId = manga.getInt("id")
@@ -64,23 +59,21 @@ internal class Dilar(context: MangaLoaderContext) :
         return mangaMap.values.toList()
     }
 
-    // تجاوز دالة التفاصيل
     override suspend fun getDetails(manga: Manga): Manga {
-    val infoUrl = "https://$domain${manga.url}"
-    val chaptersUrl = "https://$domain${manga.url}/releases"
+        val infoUrl = "https://$domain${manga.url}"
+        val chaptersUrl = "https://$domain${manga.url}/releases"
 
-    val infoJson = webClient.httpGet(infoUrl).parseJson()
-    val chaptersJson = webClient.httpGet(chaptersUrl).parseJson()
+        val infoJson = webClient.httpGet(infoUrl).parseJson()
+        val chaptersJson = webClient.httpGet(chaptersUrl).parseJson()
 
-    // تعديل هنا
-val data = infoJson.optJSONObject("mangaData")
-    ?: infoJson.optJSONObject("manga")
-    ?: infoJson   
+        val data = infoJson.optJSONObject("mangaData")
+            ?: infoJson.optJSONObject("manga")
+            ?: infoJson
+            
         val releases = chaptersJson.getJSONArray("releases")
         val chapters = (0 until releases.length()).mapNotNull { i ->
             val release = releases.optJSONObject(i) ?: return@mapNotNull null
             
-            // تخطي الفصول المدفوعة
             val hasRevLink = release.optBoolean("has_rev_link", false)
             val supportLink = release.optString("support_link", "")
             if (hasRevLink && supportLink.isNotBlank()) return@mapNotNull null
@@ -90,7 +83,9 @@ val data = infoJson.optJSONObject("mangaData")
             val chapterTitle = release.optString("title", "")
             val timestamp = release.optLong("time_stamp", 0)
 
+            // استخدام URL كامل للفصل
             val relUrl = "/r/$releaseId"
+            
             MangaChapter(
                 id = generateUid(relUrl),
                 title = if (chapterTitle.isBlank()) "Chapter $chapterNum" else chapterTitle,
@@ -124,15 +119,16 @@ val data = infoJson.optJSONObject("mangaData")
         )
     }
 
-    // تجاوز دالة الصفحات
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterUrl = "https://$domain${chapter.url}"
         val html = webClient.httpGet(chapterUrl).parseHtml()
 
+        // البحث عن البيانات في الصفحة
         val scriptElement = html.selectFirst(".js-react-on-rails-component")
+        
         if (scriptElement == null) {
-            // fallback للطريقة القديمة
-            val images = html.select("#readerarea img, .rdminimal img")
+            // محاولة fallback: البحث عن الصور مباشرة
+            val images = html.select("#readerarea img, .rdminimal img, .reader-area img")
             if (images.isNotEmpty()) {
                 return images.mapNotNull { img ->
                     val url = img.src() ?: return@mapNotNull null
@@ -144,29 +140,40 @@ val data = infoJson.optJSONObject("mangaData")
                     )
                 }
             }
-            throw Exception("Chapter data not found")
+            throw Exception("Chapter data not found in HTML")
         }
 
         val scriptData = scriptElement.data()
         val root = JSONObject(scriptData)
         
-        // التحقق من وجود readerDataAction
-        if (!root.has("readerDataAction")) {
-            throw Exception("No readerDataAction found in chapter data")
+        // التحقق من البنية المتوقعة
+        val readerDataAction = root.optJSONObject("readerDataAction")
+        if (readerDataAction == null) {
+            // محاولة البحث في مواقع أخرى محتملة
+            val possibleKeys = listOf("props", "data", "initialState", "component")
+            for (key in possibleKeys) {
+                val obj = root.optJSONObject(key)
+                if (obj != null && obj.has("release")) {
+                    return extractPagesFromRelease(obj.getJSONObject("release"))
+                }
+            }
+            throw Exception("No readerDataAction found in chapter data. Available keys: ${root.keys().asSequence().toList()}")
         }
         
-        val readerDataAction = root.getJSONObject("readerDataAction")
-        if (!readerDataAction.has("readerData")) {
-            throw Exception("No readerData found in chapter data")
+        val readerData = readerDataAction.optJSONObject("readerData")
+        if (readerData == null) {
+            throw Exception("No readerData found in readerDataAction")
         }
         
-        val readerData = readerDataAction.getJSONObject("readerData")
-        if (!readerData.has("release")) {
-            throw Exception("No release found in chapter data")
+        val release = readerData.optJSONObject("release")
+        if (release == null) {
+            throw Exception("No release found in readerData")
         }
-        
-        val release = readerData.getJSONObject("release")
 
+        return extractPagesFromRelease(release)
+    }
+    
+    private fun extractPagesFromRelease(release: JSONObject): List<MangaPage> {
         val storageKey = release.getString("storage_key")
         
         // استخدام webp إذا كانت متوفرة
