@@ -51,7 +51,7 @@ internal class Dilar(context: MangaLoaderContext) :
                 publicUrl = "https://$domain/mangas/$mangaId",
                 title = manga.getString("title"),
                 altTitles = emptySet(),
-                coverUrl = "https://$domain/uploads/manga/cover/${manga.getInt("id")}/${manga.optString("cover")}",
+                coverUrl = "https://$domain/uploads/manga/cover/$mangaId/${manga.optString("cover")}",
                 rating = manga.optString("rating", "0").toFloatOrNull()?.div(10) ?: RATING_UNKNOWN,
                 tags = emptySet(),
                 authors = emptySet(),
@@ -126,26 +126,70 @@ val data = infoJson.optJSONObject("mangaData")
 
     // تجاوز دالة الصفحات
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-    val releaseId = chapter.url.substringAfterLast("/")
-    val apiUrl = "https://$domain/api/releases/$releaseId"
+        val chapterUrl = "https://$domain${chapter.url}"
+        val html = webClient.httpGet(chapterUrl).parseHtml()
 
-    val json = webClient.httpGet(apiUrl).parseJson()
-    val pagesArray = json.optJSONArray("pages") ?: return emptyList()
-    val storageKey = json.optString("storage_key", "")
-    val directory = if (json.optJSONArray("webp_pages")?.length() ?: 0 > 0) "hq_webp" else "hq"
+        val scriptElement = html.selectFirst(".js-react-on-rails-component")
+        if (scriptElement == null) {
+            // fallback للطريقة القديمة
+            val images = html.select("#readerarea img, .rdminimal img")
+            if (images.isNotEmpty()) {
+                return images.mapNotNull { img ->
+                    val url = img.src() ?: return@mapNotNull null
+                    MangaPage(
+                        id = generateUid(url),
+                        url = url,
+                        preview = null,
+                        source = source,
+                    )
+                }
+            }
+            throw Exception("Chapter data not found")
+        }
 
-    // الجديد هنا 👇
-    val mangaId = json.optJSONObject("manga")?.optInt("id") ?: 0
+        val scriptData = scriptElement.data()
+        val root = JSONObject(scriptData)
+        
+        // التحقق من وجود readerDataAction
+        if (!root.has("readerDataAction")) {
+            throw Exception("No readerDataAction found in chapter data")
+        }
+        
+        val readerDataAction = root.getJSONObject("readerDataAction")
+        if (!readerDataAction.has("readerData")) {
+            throw Exception("No readerData found in chapter data")
+        }
+        
+        val readerData = readerDataAction.getJSONObject("readerData")
+        if (!readerData.has("release")) {
+            throw Exception("No release found in chapter data")
+        }
+        
+        val release = readerData.getJSONObject("release")
 
-    return (0 until pagesArray.length()).map { i ->
-        val filename = pagesArray.getString(i)
-        val imageUrl = "https://$domain/uploads/releases/$mangaId/$storageKey/$directory/$filename"
+        val storageKey = release.getString("storage_key")
+        
+        // استخدام webp إذا كانت متوفرة
+        val pagesArray = release.optJSONArray("webp_pages")
+            ?: release.optJSONArray("pages")
+            ?: return emptyList()
+        
+        val directory = if (release.has("webp_pages") && release.getJSONArray("webp_pages").length() > 0) {
+            "hq_webp"
+        } else {
+            "hq"
+        }
 
-        MangaPage(
-            id = generateUid(imageUrl),
-            url = imageUrl,
-            preview = null,
-            source = source
-        )
+        return (0 until pagesArray.length()).map { i ->
+            val filename = pagesArray.getString(i)
+            val imageUrl = "https://$domain/uploads/releases/$storageKey/$directory/$filename"
+            
+            MangaPage(
+                id = generateUid(imageUrl),
+                url = imageUrl,
+                preview = null,
+                source = source,
+            )
+        }
     }
 }
