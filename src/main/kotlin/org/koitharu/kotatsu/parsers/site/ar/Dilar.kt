@@ -132,12 +132,14 @@ val data = infoJson.optJSONObject("mangaData")
     val json = webClient.httpGet(apiUrl).parseJson()
     val pagesArray = json.optJSONArray("pages") ?: return emptyList()
     val storageKey = json.optString("storage_key", "")
-
     val directory = if (json.optJSONArray("webp_pages")?.length() ?: 0 > 0) "hq_webp" else "hq"
+
+    // الجديد هنا 👇
+    val mangaId = json.optJSONObject("manga")?.optInt("id") ?: 0
 
     return (0 until pagesArray.length()).map { i ->
         val filename = pagesArray.getString(i)
-        val imageUrl = "https://$domain/uploads/releases/$storageKey/$directory/$filename"
+        val imageUrl = "https://$domain/uploads/releases/$mangaId/$storageKey/$directory/$filename"
 
         MangaPage(
             id = generateUid(imageUrl),
@@ -145,54 +147,5 @@ val data = infoJson.optJSONObject("mangaData")
             preview = null,
             source = source
         )
-    }
-}
-        throw Exception("Chapter data not found")
-        }
-
-        val scriptData = scriptElement.data()
-        val root = JSONObject(scriptData)
-        
-        // التحقق من وجود readerDataAction
-        if (!root.has("readerDataAction")) {
-            throw Exception("No readerDataAction found in chapter data")
-        }
-        
-        val readerDataAction = root.getJSONObject("readerDataAction")
-        if (!readerDataAction.has("readerData")) {
-            throw Exception("No readerData found in chapter data")
-        }
-        
-        val readerData = readerDataAction.getJSONObject("readerData")
-        if (!readerData.has("release")) {
-            throw Exception("No release found in chapter data")
-        }
-        
-        val release = readerData.getJSONObject("release")
-
-        val storageKey = release.getString("storage_key")
-        
-        // استخدام webp إذا كانت متوفرة
-        val pagesArray = release.optJSONArray("webp_pages")
-            ?: release.optJSONArray("pages")
-            ?: return emptyList()
-        
-        val directory = if (release.has("webp_pages") && release.getJSONArray("webp_pages").length() > 0) {
-            "hq_webp"
-        } else {
-            "hq"
-        }
-
-        return (0 until pagesArray.length()).map { i ->
-            val filename = pagesArray.getString(i)
-            val imageUrl = "https://$domain/uploads/releases/$storageKey/$directory/$filename"
-            
-            MangaPage(
-                id = generateUid(imageUrl),
-                url = imageUrl,
-                preview = null,
-                source = source,
-            )
-        }
     }
 }
