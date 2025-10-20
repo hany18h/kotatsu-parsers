@@ -25,6 +25,12 @@ internal class Dilar(context: MangaLoaderContext) :
     override val datePattern = "yyyy-MM-dd'T'HH:mm:ss"
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        // إذا كان هناك بحث، استخدم API البحث المشفر
+        if (!filter.query.isNullOrEmpty()) {
+            return searchAPI(filter.query, page)
+        }
+        
+        // وإلا استخدم API الإصدارات العادي
         val url = "https://$domain/api/releases?page=$page"
         val json = webClient.httpGet(url).parseJson()
 
@@ -60,45 +66,41 @@ internal class Dilar(context: MangaLoaderContext) :
         return mangaMap.values.toList()
     }
 
-    override suspend fun search(query: String, page: Int, filter: MangaListFilter): List<Manga> {
+    private suspend fun searchAPI(query: String, page: Int): List<Manga> {
         val url = "https://$domain/api/mangas/search"
         
-        val body = mapOf(
-            "oneshot" to mapOf("value" to false),
-            "title" to query,
-            "page" to page,
-            "manga_types" to mapOf(
-                "include" to emptyList<Int>(),
-                "exclude" to emptyList<Int>()
-            ),
-            "story_status" to mapOf(
-                "include" to emptyList<Int>(),
-                "exclude" to emptyList<Int>()
-            ),
-            "translation_status" to mapOf(
-                "include" to emptyList<Int>(),
-                "exclude" to emptyList<Int>()
-            ),
-            "categories" to mapOf(
-                "include" to emptyList<Int>(),
-                "exclude" to emptyList<Int>()
-            ),
-            "chapters" to mapOf(
-                "min" to "",
-                "max" to ""
-            ),
-            "dates" to mapOf(
-                "start" to "",
-                "end" to ""
-            )
-        )
+        val bodyJson = JSONObject().apply {
+            put("oneshot", JSONObject().apply { put("value", false) })
+            put("title", query)
+            put("page", page)
+            put("manga_types", JSONObject().apply {
+                put("include", JSONArray())
+                put("exclude", JSONArray())
+            })
+            put("story_status", JSONObject().apply {
+                put("include", JSONArray())
+                put("exclude", JSONArray())
+            })
+            put("translation_status", JSONObject().apply {
+                put("include", JSONArray())
+                put("exclude", JSONArray())
+            })
+            put("categories", JSONObject().apply {
+                put("include", JSONArray())
+                put("exclude", JSONArray())
+            })
+            put("chapters", JSONObject().apply {
+                put("min", "")
+                put("max", "")
+            })
+            put("dates", JSONObject().apply {
+                put("start", "")
+                put("end", "")
+            })
+        }
         
         return try {
-            val response = webClient.httpPost(
-                url,
-                body = body.toJsonString().toByteArray(),
-                headers = mapOf("Content-Type" to "application/json")
-            ).parseJson()
+            val response = webClient.httpPost(url, bodyJson).parseJson()
             
             // فك التشفير
             val encryptedData = response.optString("data", "")
@@ -106,7 +108,8 @@ internal class Dilar(context: MangaLoaderContext) :
                 return emptyList()
             }
             
-            val decryptedJson = decrypt(encryptedData).let { JSONObject(it) }
+            val decryptedString = decrypt(encryptedData)
+            val decryptedJson = JSONObject(decryptedString)
             
             val mangas = mutableListOf<Manga>()
             
