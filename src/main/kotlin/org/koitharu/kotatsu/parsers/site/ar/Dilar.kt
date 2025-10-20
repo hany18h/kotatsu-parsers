@@ -51,7 +51,7 @@ internal class Dilar(context: MangaLoaderContext) :
                 publicUrl = "https://$domain/mangas/$mangaId",
                 title = manga.getString("title"),
                 altTitles = emptySet(),
-                coverUrl = "https://$domain/uploads/manga/cover/$mangaId/${manga.optString("cover")}",
+                coverUrl = "https://$domain/uploads/manga/cover/${data.getInt(\"id\")}/${data.optString(\"cover\")}",
                 rating = manga.optString("rating", "0").toFloatOrNull()?.div(10) ?: RATING_UNKNOWN,
                 tags = emptySet(),
                 authors = emptySet(),
