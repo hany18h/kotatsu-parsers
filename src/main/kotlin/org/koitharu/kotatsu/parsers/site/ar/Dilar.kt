@@ -126,25 +126,28 @@ val data = infoJson.optJSONObject("mangaData")
 
     // تجاوز دالة الصفحات
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val chapterUrl = "https://$domain${chapter.url}"
-        val html = webClient.httpGet(chapterUrl).parseHtml()
+    val releaseId = chapter.url.substringAfterLast("/")
+    val apiUrl = "https://$domain/api/releases/$releaseId"
 
-        val scriptElement = html.selectFirst(".js-react-on-rails-component")
-        if (scriptElement == null) {
-            // fallback للطريقة القديمة
-            val images = html.select("#readerarea img, .rdminimal img")
-            if (images.isNotEmpty()) {
-                return images.mapNotNull { img ->
-                    val url = img.src() ?: return@mapNotNull null
-                    MangaPage(
-                        id = generateUid(url),
-                        url = url,
-                        preview = null,
-                        source = source,
-                    )
-                }
-            }
-            throw Exception("Chapter data not found")
+    val json = webClient.httpGet(apiUrl).parseJson()
+    val pagesArray = json.optJSONArray("pages") ?: return emptyList()
+    val storageKey = json.optString("storage_key", "")
+
+    val directory = if (json.optJSONArray("webp_pages")?.length() ?: 0 > 0) "hq_webp" else "hq"
+
+    return (0 until pagesArray.length()).map { i ->
+        val filename = pagesArray.getString(i)
+        val imageUrl = "https://$domain/uploads/releases/$storageKey/$directory/$filename"
+
+        MangaPage(
+            id = generateUid(imageUrl),
+            url = imageUrl,
+            preview = null,
+            source = source
+        )
+    }
+}
+        throw Exception("Chapter data not found")
         }
 
         val scriptData = scriptElement.data()
