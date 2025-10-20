@@ -123,65 +123,113 @@ internal class Dilar(context: MangaLoaderContext) :
         val chapterUrl = "https://$domain${chapter.url}"
         val html = webClient.httpGet(chapterUrl).parseHtml()
 
-        // البحث عن البيانات في الصفحة
+        // البحث عن جميع الـ scripts التي تحتوي على بيانات React
+        val scripts = html.select("script[type='application/json']")
+        
+        for (script in scripts) {
+            try {
+                val scriptData = script.data()
+                if (scriptData.isBlank()) continue
+                
+                val root = JSONObject(scriptData)
+                
+                // البحث عن release في جميع المستويات الممكنة
+                val release = findReleaseData(root)
+                if (release != null) {
+                    return extractPagesFromRelease(release)
+                }
+            } catch (e: Exception) {
+                // تجاهل وتجربة الـ script التالي
+                continue
+            }
+        }
+        
+        // Fallback: البحث في الـ component القديم
         val scriptElement = html.selectFirst(".js-react-on-rails-component")
+        if (scriptElement != null) {
+            try {
+                val scriptData = scriptElement.data()
+                val root = JSONObject(scriptData)
+                val release = findReleaseData(root)
+                if (release != null) {
+                    return extractPagesFromRelease(release)
+                }
+            } catch (e: Exception) {
+                // تجاهل
+            }
+        }
         
-        if (scriptElement == null) {
-            // محاولة fallback: البحث عن الصور مباشرة
-            val images = html.select("#readerarea img, .rdminimal img, .reader-area img")
-            if (images.isNotEmpty()) {
-                return images.mapNotNull { img ->
-                    val url = img.src() ?: return@mapNotNull null
-                    MangaPage(
-                        id = generateUid(url),
-                        url = url,
-                        preview = null,
-                        source = source,
-                    )
+        // Fallback النهائي: البحث عن الصور مباشرة في HTML
+        val images = html.select("#readerarea img, .rdminimal img, .reader-area img, .chapter-images img")
+        if (images.isNotEmpty()) {
+            return images.mapNotNull { img ->
+                val url = img.src()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                MangaPage(
+                    id = generateUid(url),
+                    url = url,
+                    preview = null,
+                    source = source,
+                )
+            }
+        }
+        
+        throw Exception("Could not find chapter images. Please report this manga.")
+    }
+    
+    // البحث عن بيانات release في أي مستوى من JSON
+    private fun findReleaseData(obj: JSONObject): JSONObject? {
+        // محاولة 1: البحث المباشر
+        if (obj.has("release")) {
+            val release = obj.optJSONObject("release")
+            if (release != null && release.has("storage_key")) {
+                return release
+            }
+        }
+        
+        // محاولة 2: البحث في readerDataAction.readerData.release
+        val readerDataAction = obj.optJSONObject("readerDataAction")
+        if (readerDataAction != null) {
+            val readerData = readerDataAction.optJSONObject("readerData")
+            if (readerData != null) {
+                val release = readerData.optJSONObject("release")
+                if (release != null && release.has("storage_key")) {
+                    return release
                 }
             }
-            throw Exception("Chapter data not found in HTML")
         }
-
-        val scriptData = scriptElement.data()
-        val root = JSONObject(scriptData)
         
-        // التحقق من البنية المتوقعة
-        val readerDataAction = root.optJSONObject("readerDataAction")
-        if (readerDataAction == null) {
-            // محاولة البحث في مواقع أخرى محتملة
-            val possibleKeys = listOf("props", "data", "initialState", "component")
-            for (key in possibleKeys) {
-                val obj = root.optJSONObject(key)
-                if (obj != null && obj.has("release")) {
-                    return extractPagesFromRelease(obj.getJSONObject("release"))
+        // محاولة 3: البحث في props أو data أو component
+        for (key in listOf("props", "data", "component", "initialState")) {
+            val subObj = obj.optJSONObject(key)
+            if (subObj != null) {
+                val foundRelease = findReleaseData(subObj)
+                if (foundRelease != null) {
+                    return foundRelease
                 }
             }
-            throw Exception("No readerDataAction found in chapter data. Available keys: ${root.keys().asSequence().toList()}")
         }
         
-        val readerData = readerDataAction.optJSONObject("readerData")
-        if (readerData == null) {
-            throw Exception("No readerData found in readerDataAction")
-        }
-        
-        val release = readerData.optJSONObject("release")
-        if (release == null) {
-            throw Exception("No release found in readerData")
-        }
-
-        return extractPagesFromRelease(release)
+        return null
     }
     
     private fun extractPagesFromRelease(release: JSONObject): List<MangaPage> {
-        val storageKey = release.getString("storage_key")
+        val storageKey = release.optString("storage_key", "")
+        if (storageKey.isBlank()) {
+            throw Exception("No storage_key found in release data")
+        }
         
-        // استخدام webp إذا كانت متوفرة
-        val pagesArray = release.optJSONArray("webp_pages")
+        // استخدام webp إذا كانت متوفرة، وإلا استخدام pages العادية
+        val pagesArray = release.optJSONArray("webp_pages")?.takeIf { it.length() > 0 }
             ?: release.optJSONArray("pages")
-            ?: return emptyList()
+            ?: throw Exception("No pages found in release data")
         
-        val directory = if (release.has("webp_pages") && release.getJSONArray("webp_pages").length() > 0) {
+        if (pagesArray.length() == 0) {
+            throw Exception("Pages array is empty")
+        }
+        
+        // تحديد المجلد: hq_webp أو hq
+        val directory = if (release.has("webp_pages") && 
+                            release.optJSONArray("webp_pages")?.length() ?: 0 > 0) {
             "hq_webp"
         } else {
             "hq"
