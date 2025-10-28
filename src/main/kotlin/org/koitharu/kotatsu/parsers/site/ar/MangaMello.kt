@@ -24,10 +24,7 @@ internal class Mangamello(context: MangaLoaderContext) :
         SortOrder.POPULARITY,
     )
 
-    override val filterCapabilities: MangaListFilterCapabilities
-        get() = MangaListFilterCapabilities(
-            isSearchSupported = true,
-        )
+    override val isSearchSupported = true
 
     private val baseApiUrl: String
         get() = "https://$domain/api/v1/mangas"
