@@ -10,4 +10,5 @@ internal class AzoraMoon(context: MangaLoaderContext) :
 	MadaraParser(context, MangaParserSource.AZORAMOON, "azoramoon.com", pageSize = 10) {
 	override val tagPrefix = "series-genre/"
 	override val listUrl = "series/"
+	override val selectRelated = "" // تعطيل البحث عن المانجا المشابهة
 }
