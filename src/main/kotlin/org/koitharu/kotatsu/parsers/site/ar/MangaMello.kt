@@ -3,8 +3,8 @@ package org.koitharu.kotatsu.parsers.site.ar
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
-import org.koitharu.kotatsu.parsers.PagedMangaParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
+import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
@@ -15,7 +15,7 @@ import java.util.*
  */
 @MangaSourceParser("MANGAMELLO", "Mangamello", "ar")
 internal class Mangamello(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.MANGAMELLO, pageSize = 40) {
+    PagedMangaParser(context, MangaParserSource.MANGAMELLO, 40) {
 
     override val configKeyDomain = ConfigKey.Domain("mangamello.com")
     
