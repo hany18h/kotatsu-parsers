@@ -138,16 +138,19 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 	override suspend fun getDetails(manga: Manga): Manga {
 		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
 		val mangaUrl = manga.url.toAbsoluteUrl(domain)
-		val maxPageChapterSelect = doc.select(".pagination .page-item a")
+		
+		// تحسين طريقة إيجاد عدد صفحات الفصول
+		val maxPageChapterSelect = doc.select(".pagination .page-item a, .hpage a")
 		var maxPageChapter = 1
-		if (!maxPageChapterSelect.isNullOrEmpty()) {
-			maxPageChapterSelect.map {
-				val i = it.attr("href").substringAfterLast("=").toInt()
-				if (i > maxPageChapter) {
-					maxPageChapter = i
+		if (maxPageChapterSelect.isNotEmpty()) {
+			maxPageChapterSelect.forEach {
+				val pageNum = it.attr("href").substringAfterLast("=").toIntOrNull()
+				if (pageNum != null && pageNum > maxPageChapter) {
+					maxPageChapter = pageNum
 				}
 			}
 		}
+		
 		return manga.copy(
 			state = when (doc.selectFirstOrThrow(".full-list-info:contains(الحالة:) a").text()) {
 				"مستمرة" -> MangaState.ONGOING
@@ -168,15 +171,22 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 					parseChapters(doc)
 				} else {
 					coroutineScope {
-						val result = ArrayList(parseChapters(doc))
-						result.ensureCapacity(result.size * maxPageChapter)
-						(2..maxPageChapter).map { i ->
+						val allChapters = ArrayList(parseChapters(doc))
+						allChapters.ensureCapacity(allChapters.size * maxPageChapter)
+						
+						// جلب باقي الصفحات
+						val additionalChapters = (2..maxPageChapter).map { page ->
 							async {
-								loadChapters(mangaUrl, i)
+								loadChapters(mangaUrl, page)
 							}
 						}.awaitAll()
-							.flattenTo(result)
-						result
+						
+						// إضافة كل الفصول
+						additionalChapters.forEach { chapters ->
+							allChapters.addAll(chapters)
+						}
+						
+						allChapters
 					}
 				}
 			}.reversed(),
@@ -184,33 +194,44 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 	}
 
 	private suspend fun loadChapters(baseUrl: String, page: Int): List<MangaChapter> {
-		return parseChapters(webClient.httpGet("$baseUrl?page=$page").parseHtml().body())
+		val doc = webClient.httpGet("$baseUrl?page=$page").parseHtml()
+		return parseChapters(doc)
 	}
 
 	private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", sourceLocale)
 
 	private fun parseChapters(root: Element): List<MangaChapter> {
-		return root.requireElementById("chapter-contact").select(".eplister ul li")
-			.map { li ->
-				val url = li.selectFirstOrThrow("a").attrAsRelativeUrl("href")
-				MangaChapter(
-					id = generateUid(url),
-					title = li.selectFirstOrThrow(".epl-title").text(),
-					number = url.substringAfterLast('/').toFloatOrNull() ?: 0f,
-					volume = 0,
-					url = url,
-					scanlator = null,
-					uploadDate = dateFormat.parseSafe(li.selectFirstOrThrow(".epl-date").text()),
-					branch = null,
-					source = source,
-				)
-			}
+		// محاولة إيجاد العنصر بطرق متعددة
+		val chapterContainer = root.selectFirst("#chapter-contact") 
+			?: root.selectFirst(".eplister")
+			?: root.selectFirst("ul.clstyle")
+			?: return emptyList()
+		
+		return chapterContainer.select("ul li, li").mapNotNull { li ->
+			val link = li.selectFirst("a") ?: return@mapNotNull null
+			val url = link.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
+			
+			val title = li.selectFirst(".epl-title, .chapternum")?.text() ?: link.text()
+			val dateElement = li.selectFirst(".epl-date, .chapterdate")
+			
+			MangaChapter(
+				id = generateUid(url),
+				title = title,
+				number = url.substringAfterLast('/').toFloatOrNull() ?: 0f,
+				volume = 0,
+				url = url,
+				scanlator = null,
+				uploadDate = dateElement?.text()?.let { dateFormat.parseSafe(it) } ?: 0,
+				branch = null,
+				source = source,
+			)
+		}
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val fullUrl = chapter.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(fullUrl).parseHtml()
-		return doc.select(".image_list img, .image_list canvas").map { img ->
+		return doc.select(".image_list img, .image_list canvas, #readerarea img").map { img ->
 			val url = when {
 				img.hasAttr("src") -> img.requireSrc().toRelativeUrl(domain)
 				else -> img.attrAsRelativeUrl("data-src")
