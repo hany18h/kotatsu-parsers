@@ -11,7 +11,8 @@ import java.text.SimpleDateFormat
 import java.util.*
 
 /**
- * Mangamello - موقع مانجا عربي (API-based)
+ * Mangamello - مع Headers محسّنة
+ * يضيف headers مناسبة للـ API
  */
 @MangaSourceParser("MANGAMELLO", "Mangamello", "ar")
 internal class Mangamello(context: MangaLoaderContext) :
@@ -24,13 +25,11 @@ internal class Mangamello(context: MangaLoaderContext) :
         SortOrder.POPULARITY,
     )
 
-    // إضافة filterCapabilities المطلوبة
     override val filterCapabilities: MangaListFilterCapabilities
         get() = MangaListFilterCapabilities(
             isSearchSupported = true,
         )
 
-    // إضافة getFilterOptions المطلوبة
     override suspend fun getFilterOptions(): MangaListFilterOptions {
         return MangaListFilterOptions()
     }
@@ -38,13 +37,19 @@ internal class Mangamello(context: MangaLoaderContext) :
     private val baseApiUrl: String
         get() = "https://$domain/api/v1/mangas"
 
+    // إضافة Headers مخصصة للـ API
+    private val apiHeaders: Map<String, String>
+        get() = mapOf(
+            "Accept" to "application/json",
+            "Accept-Language" to "ar,en-US;q=0.9,en;q=0.8",
+            "X-Requested-With" to "XMLHttpRequest",
+        )
+
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        // إذا كان هناك بحث
         if (!filter.query.isNullOrEmpty()) {
             return searchManga(filter.query, page)
         }
 
-        // وإلا استخدم الترتيب
         val sortBy = when (order) {
             SortOrder.UPDATED -> "updated_at"
             SortOrder.POPULARITY -> "views"
@@ -52,14 +57,25 @@ internal class Mangamello(context: MangaLoaderContext) :
         }
 
         val url = "$baseApiUrl?sort_by=$sortBy&page=$page"
-        val json = webClient.httpGet(url).parseJson()
+        
+        // استخدم Headers مخصصة
+        val json = webClient.httpGet(url) {
+            apiHeaders.forEach { (key, value) ->
+                header(key, value)
+            }
+        }.parseJson()
 
         return parseMangaList(json)
     }
 
     private suspend fun searchManga(query: String, page: Int): List<Manga> {
         val url = "$baseApiUrl/search?per_page=40&title=${query.urlEncoded()}"
-        val json = webClient.httpGet(url).parseJson()
+        
+        val json = webClient.httpGet(url) {
+            apiHeaders.forEach { (key, value) ->
+                header(key, value)
+            }
+        }.parseJson()
 
         return parseSearchResults(json)
     }
@@ -74,6 +90,7 @@ internal class Mangamello(context: MangaLoaderContext) :
             if (mangaId == 0) continue
 
             val relUrl = "/api/v1/mangas/$mangaId"
+            
             mangaList.add(
                 Manga(
                     id = generateUid(relUrl),
@@ -107,7 +124,6 @@ internal class Mangamello(context: MangaLoaderContext) :
 
             val relUrl = "/api/v1/mangas/$mangaId"
             
-            // استخراج الأنواع (genres)
             val genresArray = item.optJSONArray("genres")
             val tags = mutableSetOf<MangaTag>()
             if (genresArray != null) {
@@ -153,11 +169,19 @@ internal class Mangamello(context: MangaLoaderContext) :
         val mangaId = manga.url.substringAfterLast("/")
         val chaptersUrl = "https://$domain/api/v1/mangas/$mangaId/chapters?per_page=2000"
 
-        val infoJson = webClient.httpGet(infoUrl).parseJson()
-        val chaptersJson = webClient.httpGet(chaptersUrl).parseJson()
+        val infoJson = webClient.httpGet(infoUrl) {
+            apiHeaders.forEach { (key, value) ->
+                header(key, value)
+            }
+        }.parseJson()
+        
+        val chaptersJson = webClient.httpGet(chaptersUrl) {
+            apiHeaders.forEach { (key, value) ->
+                header(key, value)
+            }
+        }.parseJson()
 
         val data = infoJson.optJSONObject("data") ?: infoJson
-
         val chapters = parseChapters(chaptersJson, mangaId)
 
         return manga.copy(
@@ -183,20 +207,16 @@ internal class Mangamello(context: MangaLoaderContext) :
             val chapterId = chapter.optInt("id", 0)
             if (chapterId == 0) continue
 
-            // استخدام order أو title كرقم الفصل
             val chapterNumber = chapter.optDouble("order", 0.0).takeIf { it > 0 }
                 ?: chapter.optString("title", "0").toDoubleOrNull()
                 ?: (i + 1).toDouble()
             
             val chapterTitle = chapter.optString("title", "")
-
             val relUrl = "/api/v1/mangas/$mangaId/chapters/$chapterId?relations=chapterImages"
 
-            // تحويل التاريخ من ISO 8601
             val dateString = chapter.optString("created_at", null)
             val uploadDate = dateString?.let {
                 try {
-                    // صيغة ISO 8601: 2024-01-15T10:30:00.000000Z
                     val format = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
                     format.parse(it.substringBefore("."))?.time ?: 0
                 } catch (e: Exception) {
@@ -219,13 +239,17 @@ internal class Mangamello(context: MangaLoaderContext) :
             )
         }
 
-        // ترتيب الفصول من الأحدث للأقدم
         return chapters.sortedByDescending { it.number }
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterUrl = "https://$domain${chapter.url}"
-        val json = webClient.httpGet(chapterUrl).parseJson()
+        
+        val json = webClient.httpGet(chapterUrl) {
+            apiHeaders.forEach { (key, value) ->
+                header(key, value)
+            }
+        }.parseJson()
 
         val data = json.optJSONObject("data") ?: throw Exception("No chapter data found")
         val imagesArray = data.optJSONArray("chapterImages")
@@ -236,7 +260,6 @@ internal class Mangamello(context: MangaLoaderContext) :
         for (i in 0 until imagesArray.length()) {
             val imageObj = imagesArray.optJSONObject(i) ?: continue
             
-            // استخدام src أو originalSrc (كما في الكود الأصلي)
             val imageUrl = imageObj.optString("src").takeIf { it.isNotBlank() }
                 ?: imageObj.optString("originalSrc").takeIf { it.isNotBlank() }
                 ?: continue
