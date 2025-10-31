@@ -11,7 +11,7 @@ import org.koitharu.kotatsu.parsers.util.requireElementById
 
 @MangaSourceParser("MURIM", "Murim", "ar")
 internal class MangaAiLand(context: MangaLoaderContext) :
-	ZeistMangaParser(context, MangaParserSource.MURIM, "murim.site") {
+	ZeistMangaParser(context, MangaParserSource.MURIM, "www.murim.site") {
 	override val sateOngoing: String = "مستمرة"
 	override val sateFinished: String = "مكتمل"
 	override val sateAbandoned: String = "متروك"
