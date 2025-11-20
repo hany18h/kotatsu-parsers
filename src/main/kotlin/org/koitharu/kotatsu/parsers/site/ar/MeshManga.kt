@@ -7,32 +7,59 @@ import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 
-@MangaSourceParser("MESHMANGA", "MeshManga", "ar")
+@MangaSourceParser(
+    name = "MESHMANGA",
+    title = "MeshManga",
+    locale = "ar"
+)
 class MeshManga(
     context: MangaLoaderContext
 ) : PagedMangaParser(
-    context,
-    MangaParserSource.create("MESHMANGA"),
+    context = context,
+    source = MangaParserSource.MESHMANGA,
     pageSize = 40,
     searchPageSize = 40
 ) {
 
-    private val domain = "meshmanga.com"
+    // مهم للـ AbstractParser
+    override val configKeyDomain = ConfigKey.Domain("meshmanga.com")
 
-    override val availableSortOrders: Set<SortOrder>
-        get() = setOf(SortOrder.UPDATED)
+    // الموقع مفيهوش فلترة، فنعمل capabilities بسيطة
+    override val filterCapabilities: MangaListFilterCapabilities =
+        MangaListFilterCapabilities(
+            isSearchSupported = false,
+            isMultipleTagsSupported = false,
+            isTagsExclusionSupported = false
+        )
 
-    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        val url = "https://$domain/api/series?page=$page"
+    override suspend fun getFilterOptions(): MangaListFilterOptions =
+        MangaListFilterOptions(
+            availableTags = emptySet(),
+            availableStates = emptySet(),
+            availableContentTypes = setOf(ContentType.MANGA)
+        )
+
+    private val apiBase = "https://meshmanga.com/api"
+
+    // --------------------------------------------------------------------
+    // 1. List Page
+    // --------------------------------------------------------------------
+    override suspend fun getListPage(
+        page: Int,
+        order: SortOrder,
+        filter: MangaListFilter
+    ): List<Manga> {
+
+        val url = "$apiBase/series?page=$page"
 
         val raw = webClient.httpGet(url).parseRaw()
         val json = JSONObject(raw)
-        val array = json.getJSONArray("data")
+        val data = json.getJSONArray("data")
 
         val list = ArrayList<Manga>()
 
-        for (i in 0 until array.length()) {
-            val item = array.getJSONObject(i)
+        for (i in 0 until data.length()) {
+            val item = data.getJSONObject(i)
 
             val id = item.getInt("id")
             val title = item.getString("title")
@@ -44,7 +71,7 @@ class MeshManga(
                 Manga(
                     id = generateUid(slug),
                     url = slug,
-                    publicUrl = "https://$domain$slug",
+                    publicUrl = "https://meshmanga.com$slug",
                     title = title,
                     altTitles = emptySet(),
                     coverUrl = cover,
@@ -60,9 +87,12 @@ class MeshManga(
         return list
     }
 
+    // --------------------------------------------------------------------
+    // 2. Manga Details + Chapters
+    // --------------------------------------------------------------------
     override suspend fun getDetails(manga: Manga): Manga {
         val id = manga.url.substringAfter("/series/").toInt()
-        val url = "https://$domain/api/series/$id"
+        val url = "$apiBase/series/$id"
 
         val raw = webClient.httpGet(url).parseRaw()
         val json = JSONObject(raw)
@@ -80,22 +110,21 @@ class MeshManga(
         val chapters = ArrayList<MangaChapter>()
 
         for (i in 0 until chaptersJson.length()) {
-            val ch = chaptersJson.getJSONObject(i)
+            val c = chaptersJson.getJSONObject(i)
 
-            val chId = ch.getInt("id")
-            val chTitle = ch.getString("title")
-
-            val chSlug = "/chapter/$chId"
+            val chId = c.getInt("id")
+            val chTitle = c.getString("title")
+            val slug = "/chapter/$chId"
 
             chapters.add(
                 MangaChapter(
-                    id = generateUid(chSlug),
-                    url = chSlug,
+                    id = generateUid(slug),
                     title = chTitle,
                     number = (i + 1).toFloat(),
                     volume = 0,
+                    url = slug,
                     scanlator = null,
-                    uploadDate = null,
+                    uploadDate = 0L, // مهم علشان مش nullable
                     branch = null,
                     source = source
                 )
@@ -110,30 +139,32 @@ class MeshManga(
         )
     }
 
+    // --------------------------------------------------------------------
+    // 3. Pages (Images)
+    // --------------------------------------------------------------------
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val id = chapter.url.substringAfter("/chapter/").toInt()
-        val url = "https://$domain/api/chapter/$id"
+        val url = "$apiBase/chapter/$id"
 
         val raw = webClient.httpGet(url).parseRaw()
         val json = JSONObject(raw)
 
-        val imgs = json.getJSONArray("pages")
+        val arr = json.getJSONArray("pages")
+        val list = ArrayList<MangaPage>()
 
-        val pages = ArrayList<MangaPage>()
+        for (i in 0 until arr.length()) {
+            val img = arr.getString(i)
 
-        for (i in 0 until imgs.length()) {
-            val image = imgs.getString(i)
-
-            pages.add(
+            list.add(
                 MangaPage(
-                    id = generateUid(image),
-                    url = image,
+                    id = generateUid(img),
+                    url = img,
                     preview = null,
                     source = source
                 )
             )
         }
 
-        return pages
+        return list
     }
 }
