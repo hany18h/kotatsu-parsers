@@ -55,14 +55,14 @@ internal class MeshManga(context: MangaLoaderContext) :
             val json = webClient.httpGet(url).parseJson()
             val results = json.getJSONArray("results")
             
-            (0 until results.length()).mapNotNullToSet { i ->
+            (0 until results.length()).mapNotNull { i ->
                 val genre = results.getJSONObject(i)
                 MangaTag(
                     key = genre.getInt("id").toString(),
                     title = genre.getString("name"),
                     source = source,
                 )
-            }
+            }.toSet()
         } catch (e: Exception) {
             emptySet()
         }
@@ -155,14 +155,14 @@ internal class MeshManga(context: MangaLoaderContext) :
 
         val genres = obj.optJSONArray("genres")
         val tags = if (genres != null) {
-            (0 until genres.length()).mapNotNullToSet { i ->
-                val genre = genres.optJSONObject(i) ?: return@mapNotNullToSet null
+            (0 until genres.length()).mapNotNull { i ->
+                val genre = genres.optJSONObject(i) ?: return@mapNotNull null
                 MangaTag(
                     key = genre.getInt("id").toString(),
                     title = genre.getString("name"),
                     source = source,
                 )
-            }
+            }.toSet()
         } else {
             emptySet()
         }
