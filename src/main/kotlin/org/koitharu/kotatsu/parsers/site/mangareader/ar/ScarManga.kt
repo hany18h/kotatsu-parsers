@@ -8,7 +8,7 @@ import org.koitharu.kotatsu.parsers.model.MangaParserSource
 import org.koitharu.kotatsu.parsers.site.mangareader.MangaReaderParser
 
 @Broken
-@MangaSourceParser("SCARMANGA", "ScarManga", "ar")
+@MangaSourceParser("SCARMANGA", "ScarManga", "en")
 internal class ScarManga(context: MangaLoaderContext) :
 	MangaReaderParser(context, MangaParserSource.SCARMANGA, "scarmanga.com", pageSize = 20, searchPageSize = 10) {
 	override val listUrl = "/series"
