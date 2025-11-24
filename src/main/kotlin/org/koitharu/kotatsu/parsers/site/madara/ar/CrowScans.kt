@@ -185,9 +185,9 @@ internal class CrowScans(context: MangaLoaderContext) :
 			})();
 		""".trimIndent()
 
-		val rawHtml = context.evaluateJs(url, script, 30000L) ?: throw ParseException("Failed to load page", url)
+		val rawHtml = context.evaluateJs(url, script) ?: throw ParseException("Failed to load page", url)
 
-		val html = if (rawHtml.startsWith("\"") && rawHtml.endsWith("\"")) {
+		val html = if (rawHtml is String && rawHtml.startsWith("\"") && rawHtml.endsWith("\"")) {
 			rawHtml.substring(1, rawHtml.length - 1)
 				.replace("\\\"", "\"")
 				.replace("\\n", "\n")
