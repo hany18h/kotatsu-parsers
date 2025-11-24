@@ -1,383 +1,372 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
-import org.json.JSONObject
+import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.json.JSONArray
+import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
+import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
-import org.koitharu.kotatsu.parsers.site.mangareader.MangaReaderParser
-import java.security.MessageDigest
+import java.text.SimpleDateFormat
 import java.util.*
-import javax.crypto.Cipher
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
-/**
- * Dilar - موقع مانجا عربي (API-based)
- */
-@MangaSourceParser("DILAR", "Dilar", "ar")
-internal class Dilar(context: MangaLoaderContext) :
-    MangaReaderParser(context, MangaParserSource.DILAR, "dilar.tube", pageSize = 20, searchPageSize = 10) {
+@MangaSourceParser("DILARTUBE", "Dilar Tube", "ar", ContentType.MANGA)
+internal class DilarTube(context: MangaLoaderContext) :
+    PagedMangaParser(context, MangaParserSource.DILARTUBE, 24) {
 
-    override val listUrl = "/api/releases"
-    override val datePattern = "yyyy-MM-dd'T'HH:mm:ss"
+    override val configKeyDomain = ConfigKey.Domain("v2.dilar.tube")
 
-    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        // إذا كان هناك بحث، استخدم API البحث المشفر
-        if (!filter.query.isNullOrEmpty()) {
-            return searchAPI(filter.query, page)
-        }
-        
-        // وإلا استخدم API الإصدارات العادي
-        val url = "https://$domain/api/releases?page=$page"
-        val json = webClient.httpGet(url).parseJson()
-
-        val releases = json.getJSONArray("releases")
-        val mangaMap = mutableMapOf<Int, Manga>()
-
-        for (i in 0 until releases.length()) {
-            val release = releases.optJSONObject(i) ?: continue
-            val manga = release.optJSONObject("manga") ?: continue
-            
-            if (manga.optBoolean("is_novel", false)) continue
-
-            val mangaId = manga.getInt("id")
-            if (mangaMap.containsKey(mangaId)) continue
-
-            val relUrl = "/api/mangas/$mangaId"
-            mangaMap[mangaId] = Manga(
-                id = generateUid(relUrl),
-                url = relUrl,
-                publicUrl = "https://$domain/mangas/$mangaId",
-                title = manga.getString("title"),
-                altTitles = emptySet(),
-                coverUrl = "https://$domain/uploads/manga/cover/$mangaId/${manga.optString("cover")}",
-                rating = manga.optString("rating", "0").toFloatOrNull()?.div(10) ?: RATING_UNKNOWN,
-                tags = emptySet(),
-                authors = emptySet(),
-                state = null,
-                source = source,
-                contentRating = ContentRating.SAFE,
-            )
-        }
-
-        return mangaMap.values.toList()
+    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+        super.onCreateConfig(keys)
+        keys.add(userAgentKey)
     }
 
-    private suspend fun searchAPI(query: String, page: Int): List<Manga> {
-        val url = "https://$domain/api/mangas/search"
-        
-        val bodyJson = JSONObject().apply {
-            put("oneshot", JSONObject().apply { put("value", false) })
-            put("title", query)
-            put("page", page)
-            put("manga_types", JSONObject().apply {
-                put("include", JSONArray())
-                put("exclude", JSONArray())
-            })
-            put("story_status", JSONObject().apply {
-                put("include", JSONArray())
-                put("exclude", JSONArray())
-            })
-            put("translation_status", JSONObject().apply {
-                put("include", JSONArray())
-                put("exclude", JSONArray())
-            })
-            put("categories", JSONObject().apply {
-                put("include", JSONArray())
-                put("exclude", JSONArray())
-            })
-            put("chapters", JSONObject().apply {
-                put("min", "")
-                put("max", "")
-            })
-            put("dates", JSONObject().apply {
-                put("start", "")
-                put("end", "")
-            })
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val originalRequest = chain.request()
+
+        // Only modify POST requests to the search/filter endpoint
+        if (originalRequest.method == "POST" && originalRequest.url.toString().contains("/api/search/filter")) {
+            val newRequest = originalRequest.newBuilder()
+                .removeHeader("Content-Encoding")
+                .build()
+            return chain.proceed(newRequest)
         }
-        
-        return try {
-            val response = webClient.httpPost(url, bodyJson).parseJson()
-            
-            // فك التشفير
-            val encryptedData = response.optString("data", "")
-            if (encryptedData.isBlank()) {
-                return emptyList()
-            }
-            
-            val decryptedString = decrypt(encryptedData)
-            val decryptedJson = JSONObject(decryptedString)
-            
-            val mangas = mutableListOf<Manga>()
-            
-            val mangasArray = decryptedJson.optJSONArray("mangas") ?: JSONArray()
-            
-            for (i in 0 until mangasArray.length()) {
-                val item = mangasArray.optJSONObject(i) ?: continue
-                
-                // تجاهل الروايات
-                if (item.optBoolean("is_novel", false)) continue
-                
-                val mangaId = item.optInt("id", 0)
-                if (mangaId == 0) continue
-                
-                val relUrl = "/api/mangas/$mangaId"
-                mangas.add(
-                    Manga(
-                        id = generateUid(relUrl),
-                        url = relUrl,
-                        publicUrl = "https://$domain/mangas/$mangaId",
-                        title = item.optString("title", "Unknown"),
-                        altTitles = emptySet(),
-                        coverUrl = item.optString("cover", "")
-                            .let { cover ->
-                                if (cover.startsWith("http")) cover
-                                else "https://$domain/uploads/manga/cover/$mangaId/$cover"
-                            },
-                        rating = item.optString("rating", "0")
-                            .toFloatOrNull()?.div(10) ?: RATING_UNKNOWN,
-                        tags = emptySet(),
-                        authors = emptySet(),
-                        state = null,
+
+        return chain.proceed(originalRequest)
+    }
+
+    override val filterCapabilities: MangaListFilterCapabilities
+        get() = MangaListFilterCapabilities(
+            isSearchSupported = true,
+            isSearchWithFiltersSupported = true,
+            isMultipleTagsSupported = true,
+            isTagsExclusionSupported = true,
+        )
+
+    override val availableSortOrders: Set<SortOrder> = setOf(SortOrder.RELEVANCE)
+
+    override suspend fun getFilterOptions() = MangaListFilterOptions(
+        availableTags = fetchAvailableTags(),
+    )
+
+    private suspend fun fetchAvailableTags(): Set<MangaTag> {
+        val response = webClient.httpGet("https://v2.dilar.tube/api/categories").parseJsonArray()
+        val tags = mutableSetOf<MangaTag>()
+
+        for (i in 0 until response.length()) {
+            val group = response.getJSONObject(i)
+            val groupId = group.optString("id").toIntOrNull() ?: group.optInt("id")
+            val categories = group.getJSONArray("categories")
+
+            // Group 3 is "Style" (Manhwa, etc) -> seriesType
+            // Others -> categories
+            val prefix = if (groupId == 3) "seriesType" else "categories"
+
+            for (j in 0 until categories.length()) {
+                val category = categories.getJSONObject(j)
+                val catId = category.optString("id").toIntOrNull() ?: category.optInt("id")
+                tags.add(
+                    MangaTag(
+                        key = "$prefix:$catId",
+                        title = category.getString("name"),
                         source = source,
-                        contentRating = ContentRating.SAFE,
                     )
                 )
             }
-            
-            mangas
-        } catch (e: Exception) {
-            throw Exception("Search failed: ${e.message}", e)
         }
+        return tags
+    }
+
+    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        // Check if we have any actual filters to apply
+        val hasSearch = !filter.query.isNullOrBlank()
+        val hasTagFilters = filter.tags.isNotEmpty() || filter.tagsExclude.isNotEmpty()
+
+        // Use GET for default listing only (no search, no tags)
+        if (!hasSearch && !hasTagFilters) {
+            val url = "https://v2.dilar.tube/api/series/?page=$page"
+            val response = webClient.httpGet(url).parseJson()
+            val series = response.getJSONArray("series")
+            return (0 until series.length()).map { i ->
+                parseMangaFromJson(series.getJSONObject(i))
+            }
+        }
+
+        // Use POST for search and/or tag filtering
+        val url = "https://v2.dilar.tube/api/search/filter"
+
+        val seriesTypeInclude = mutableListOf<Int>()
+        val seriesTypeExclude = mutableListOf<Int>()
+        val categoriesInclude = mutableListOf<Int>()
+        val categoriesExclude = mutableListOf<Int>()
+
+            filter.tags.forEach { tag ->
+                val parts = tag.key.split(":")
+                if (parts.size == 2) {
+                    val type = parts[0]
+                    val id = parts[1].toIntOrNull() ?: return@forEach
+                    if (type == "seriesType") {
+                        seriesTypeInclude.add(id)
+                    } else if (type == "categories") {
+                        categoriesInclude.add(id)
+                    }
+                }
+            }
+
+            filter.tagsExclude.forEach { tag ->
+                val parts = tag.key.split(":")
+                if (parts.size == 2) {
+                    val type = parts[0]
+                    val id = parts[1].toIntOrNull() ?: return@forEach
+                    if (type == "seriesType") {
+                        seriesTypeExclude.add(id)
+                    } else if (type == "categories") {
+                        categoriesExclude.add(id)
+                    }
+                }
+            }
+
+            // Build JSON payload exactly as shown in working examples
+            val jsonBody = JSONObject()
+
+            // Add query
+            jsonBody.put("query", filter.query ?: "")
+
+            // Add seriesType
+            val seriesTypeObject = JSONObject()
+            val seriesTypeIncludeArray = JSONArray()
+            seriesTypeInclude.forEach { seriesTypeIncludeArray.put(it) }
+            val seriesTypeExcludeArray = JSONArray()
+            seriesTypeExclude.forEach { seriesTypeExcludeArray.put(it) }
+            seriesTypeObject.put("include", seriesTypeIncludeArray)
+            seriesTypeObject.put("exclude", seriesTypeExcludeArray)
+            jsonBody.put("seriesType", seriesTypeObject)
+
+            // Add oneshot
+            jsonBody.put("oneshot", false)
+
+            // Add categories
+            val categoriesObject = JSONObject()
+            val categoriesIncludeArray = JSONArray()
+            categoriesInclude.forEach { categoriesIncludeArray.put(it) }
+            val categoriesExcludeArray = JSONArray()
+            categoriesExclude.forEach { categoriesExcludeArray.put(it) }
+            categoriesObject.put("include", categoriesIncludeArray)
+            categoriesObject.put("exclude", categoriesExcludeArray)
+            jsonBody.put("categories", categoriesObject)
+
+            // Add chapters
+            val chaptersObject = JSONObject()
+            chaptersObject.put("min", "")
+            chaptersObject.put("max", "")
+            jsonBody.put("chapters", chaptersObject)
+
+            // Add dates
+            val datesObject = JSONObject()
+            datesObject.put("start", JSONObject.NULL)
+            datesObject.put("end", JSONObject.NULL)
+            jsonBody.put("dates", datesObject)
+
+            // Add page
+            jsonBody.put("page", page)
+
+        val response = webClient.httpPost(url.toHttpUrl(), jsonBody).parseJson()
+
+        // Parse the response - search/filter endpoint returns "rows", regular endpoint returns "series"
+        val rows = when {
+            response.has("rows") -> response.getJSONArray("rows")
+            response.has("series") -> response.getJSONArray("series")
+            else -> JSONArray() // Empty array if no results
+        }
+
+        return (0 until rows.length()).map { i ->
+            val item = rows.getJSONObject(i)
+            parseMangaFromJson(item)
+        }
+    }
+
+    private fun parseMangaFromJson(json: JSONObject): Manga {
+        val id = json.getInt("id")
+        val title = json.getString("title")
+        val cover = json.optString("cover", "")
+        val summary = json.optString("summary", "")
+
+        // Build cover URL - rollback to original working structure
+        val coverUrl = if (cover.isNotEmpty()) {
+            if (cover.startsWith("http")) {
+                cover
+            } else {
+                val coverName = cover.substringBeforeLast('.') + ".webp"
+                "https://dilar.tube/uploads/manga/cover/$id/large_$coverName"
+            }
+        } else ""
+
+        val rating = json.optString("rating", "0.00").toFloatOrNull()?.div(5f) ?: RATING_UNKNOWN
+
+        // Get alternative titles from synonyms
+        val synonyms = json.optJSONObject("synonyms")
+        val altTitles = mutableSetOf<String>()
+        synonyms?.let { syn ->
+            syn.optString("arabic")?.takeIf { it.isNotEmpty() && it != "null" }?.let { altTitles.add(it) }
+            syn.optString("english")?.takeIf { it.isNotEmpty() && it != "null" }?.let { altTitles.add(it) }
+            syn.optString("japanese")?.takeIf { it.isNotEmpty() && it != "null" }?.let { altTitles.add(it) }
+            syn.optString("alternative")?.takeIf { it.isNotEmpty() && it != "null" }?.let { altTitles.add(it) }
+        }
+
+        val status = json.optString("story_status", "")
+        val state = when (status.lowercase()) {
+            "completed" -> MangaState.FINISHED
+            "ongoing" -> MangaState.ONGOING
+            "hiatus" -> MangaState.PAUSED
+            else -> null
+        }
+
+        return Manga(
+            id = generateUid(id.toLong()),
+            title = title,
+            url = "/series/$id",
+            publicUrl = "https://v2.dilar.tube/series/$id",
+            coverUrl = coverUrl,
+            source = source,
+            rating = rating,
+            altTitles = altTitles,
+            contentRating = ContentRating.SAFE,
+            tags = emptySet(),
+            state = state,
+            authors = emptySet(),
+            largeCoverUrl = null,
+            description = summary.takeIf { it.isNotEmpty() },
+            chapters = null,
+        )
     }
 
     override suspend fun getDetails(manga: Manga): Manga {
-        val infoUrl = "https://$domain${manga.url}"
-        val chaptersUrl = "https://$domain${manga.url}/releases"
+        val id = manga.url.substringAfterLast("/")
+        val url = "https://v2.dilar.tube/api/series/$id"
+        val json = webClient.httpGet(url).parseJson()
 
-        val infoJson = webClient.httpGet(infoUrl).parseJson()
-        val chaptersJson = webClient.httpGet(chaptersUrl).parseJson()
+        val title = json.getString("title")
+        val summary = json.optString("summary").nullIfEmpty()
+        
+        val cover = json.optString("cover").nullIfEmpty()
+        val coverUrl = if (cover != null) {
+            val coverName = cover.substringBeforeLast('.') + ".webp"
+            "https://dilar.tube/uploads/manga/cover/$id/large_$coverName"
+        } else manga.coverUrl
 
-        val data = infoJson.optJSONObject("mangaData")
-            ?: infoJson.optJSONObject("manga")
-            ?: infoJson
-            
-        val releases = chaptersJson.getJSONArray("releases")
-        val chapters = (0 until releases.length()).mapNotNull { i ->
-            val release = releases.optJSONObject(i) ?: return@mapNotNull null
-            
-            val hasRevLink = release.optBoolean("has_rev_link", false)
-            val supportLink = release.optString("support_link", "")
-            if (hasRevLink && supportLink.isNotBlank()) return@mapNotNull null
+        val statusStr = json.optString("story_status")
+        val state = when (statusStr?.lowercase()) {
+            "ongoing" -> MangaState.ONGOING
+            "completed" -> MangaState.FINISHED
+            "hiatus" -> MangaState.ONGOING
+            else -> null
+        }
 
-            val releaseId = release.getInt("id")
-            val chapterNum = release.optString("chapter", "0")
-            val chapterTitle = release.optString("title", "")
-            val timestamp = release.optLong("time_stamp", 0)
+        val authors = mutableSetOf<String>()
+        json.optJSONObject("creator")?.let {
+            authors.add(it.getString("nick"))
+        }
 
-            val relUrl = "/r/$releaseId"
-            
-            MangaChapter(
-                id = generateUid(relUrl),
-                title = if (chapterTitle.isBlank()) "Chapter $chapterNum" else chapterTitle,
-                number = chapterNum.toFloatOrNull() ?: (i + 1).toFloat(),
-                volume = 0,
-                url = relUrl,
-                scanlator = release.optString("team_name", null),
-                uploadDate = timestamp * 1000,
-                branch = null,
-                source = source,
-            )
-        }.reversed()
-
-        val author = listOfNotNull(
-            data.optString("creator_nick", null).takeIf { it?.isNotBlank() == true },
-            data.optString("editor_nick", null).takeIf { it?.isNotBlank() == true }
-        ).joinToString(", ")
+        val tags = mutableSetOf<MangaTag>()
+        val categories = json.optJSONArray("categories")
+        if (categories != null) {
+            for (i in 0 until categories.length()) {
+                val cat = categories.getJSONObject(i)
+                tags.add(MangaTag(
+                    key = cat.getInt("id").toString(),
+                    title = cat.getString("name"),
+                    source = source
+                ))
+            }
+        }
 
         return manga.copy(
-            title = data.optString("title", manga.title),
-            description = data.optString("summary", null),
-            coverUrl = "https://$domain/uploads/manga/cover/${data.getInt("id")}/${data.optString("cover")}",
-            authors = if (author.isNotBlank()) setOf(author) else emptySet(),
-            state = when (data.optInt("translation_status", 0)) {
-                1 -> MangaState.ONGOING
-                2 -> MangaState.FINISHED
-                else -> null
-            },
-            rating = data.optString("rating", "0").toFloatOrNull()?.div(10) ?: manga.rating,
-            chapters = chapters,
+            title = title,
+            description = summary,
+            coverUrl = coverUrl,
+            state = state,
+            authors = authors,
+            tags = tags,
+            chapters = getChapters(id),
         )
+    }
+
+    private suspend fun getChapters(seriesId: String): List<MangaChapter> {
+        val url = "https://v2.dilar.tube/api/series/$seriesId/chapters"
+        val response = webClient.httpGet(url).parseJson()
+        val chaptersJson = response.getJSONArray("chapters")
+        val chapters = mutableListOf<MangaChapter>()
+
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+
+        for (i in 0 until chaptersJson.length()) {
+            val item = chaptersJson.getJSONObject(i)
+            val releases = item.getJSONArray("releases")
+            if (releases.length() == 0) continue
+
+            val release = releases.getJSONObject(0)
+            val releaseId = release.getInt("id")
+            
+            val chapterNum = item.optString("chapter").toFloatOrNull() ?: 0f
+            val volNum = item.optString("volume").toIntOrNull() ?: 0
+            val title = item.optString("title").nullIfEmpty() ?: ""
+            
+            val dateStr = item.optString("created_at")
+            val date = try {
+                dateFormat.parse(dateStr)?.time ?: 0L
+            } catch (e: Exception) {
+                0L
+            }
+
+            chapters.add(
+                MangaChapter(
+                    id = generateUid(releaseId.toString()),
+                    title = title,
+                    number = chapterNum,
+                    volume = volNum,
+                    url = "/api/chapters/$releaseId",
+                    uploadDate = date,
+                    source = source,
+                    scanlator = null,
+                    branch = null
+                )
+            )
+        }
+        return chapters.reversed()
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val chapterUrl = "https://$domain${chapter.url}"
-        val html = webClient.httpGet(chapterUrl).parseHtml()
+        val id = chapter.url.substringAfterLast("/")
+        val url = "https://v2.dilar.tube/api/chapters/$id"
+        val json = webClient.httpGet(url).parseJson()
+        val pagesJson = json.getJSONArray("pages")
+        val storageKey = json.optString("storage_key").nullIfEmpty()
 
-        val scripts = html.select("script[type='application/json']")
-        
-        for (script in scripts) {
-            try {
-                val scriptData = script.data()
-                if (scriptData.isBlank()) continue
-                
-                val root = JSONObject(scriptData)
-                
-                val release = findReleaseData(root)
-                if (release != null) {
-                    return extractPagesFromRelease(release)
-                }
-            } catch (e: Exception) {
-                continue
-            }
-        }
-        
-        val scriptElement = html.selectFirst(".js-react-on-rails-component")
-        if (scriptElement != null) {
-            try {
-                val scriptData = scriptElement.data()
-                val root = JSONObject(scriptData)
-                val release = findReleaseData(root)
-                if (release != null) {
-                    return extractPagesFromRelease(release)
-                }
-            } catch (e: Exception) {
-                // تجاهل
-            }
-        }
-        
-        val images = html.select("#readerarea img, .rdminimal img, .reader-area img, .chapter-images img")
-        if (images.isNotEmpty()) {
-            return images.mapNotNull { img ->
-                val url = img.src()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                MangaPage(
-                    id = generateUid(url),
-                    url = url,
-                    preview = null,
-                    source = source,
-                )
-            }
-        }
-        
-        throw Exception("Could not find chapter images. Please report this manga.")
-    }
-    
-    private fun findReleaseData(obj: JSONObject): JSONObject? {
-        if (obj.has("release")) {
-            val release = obj.optJSONObject("release")
-            if (release != null && release.has("storage_key")) {
-                return release
-            }
-        }
-        
-        val readerDataAction = obj.optJSONObject("readerDataAction")
-        if (readerDataAction != null) {
-            val readerData = readerDataAction.optJSONObject("readerData")
-            if (readerData != null) {
-                val release = readerData.optJSONObject("release")
-                if (release != null && release.has("storage_key")) {
-                    return release
-                }
-            }
-        }
-        
-        for (key in listOf("props", "data", "component", "initialState")) {
-            val subObj = obj.optJSONObject(key)
-            if (subObj != null) {
-                val foundRelease = findReleaseData(subObj)
-                if (foundRelease != null) {
-                    return foundRelease
-                }
-            }
-        }
-        
-        return null
-    }
-    
-    private fun extractPagesFromRelease(release: JSONObject): List<MangaPage> {
-        val storageKey = release.optString("storage_key", "")
-        if (storageKey.isBlank()) {
-            throw Exception("No storage_key found in release data")
-        }
-        
-        val pagesArray = release.optJSONArray("webp_pages")?.takeIf { it.length() > 0 }
-            ?: release.optJSONArray("pages")
-            ?: throw Exception("No pages found in release data")
-        
-        if (pagesArray.length() == 0) {
-            throw Exception("Pages array is empty")
-        }
-        
-        val directory = if (release.has("webp_pages") && 
-                            release.optJSONArray("webp_pages")?.length() ?: 0 > 0) {
-            "hq_webp"
-        } else {
-            "hq"
-        }
-
-        return (0 until pagesArray.length()).map { i ->
-            val filename = pagesArray.getString(i)
-            val imageUrl = "https://$domain/uploads/releases/$storageKey/$directory/$filename"
+        return (0 until pagesJson.length()).map { i ->
+            val page = pagesJson.getJSONObject(i)
+            val imageUrl = page.getString("url")
             
+            val fullUrl = if (imageUrl.startsWith("http")) {
+                imageUrl
+            } else {
+                if (storageKey != null) {
+                    "https://dilar.tube/uploads/releases/$storageKey/hq/$imageUrl"
+                } else {
+                    "https://dilar.tube/uploads/$imageUrl"
+                }
+            }
+
             MangaPage(
-                id = generateUid(imageUrl),
-                url = imageUrl,
+                id = generateUid("$id-$i"),
+                url = fullUrl,
                 preview = null,
-                source = source,
+                source = source
             )
         }
-    }
-
-    // ============ دوال فك التشفير ============
-
-    private fun decrypt(responseData: String): String {
-        try {
-            val enc = responseData.split("|")
-            if (enc.size < 4) {
-                throw Exception("Invalid encrypted data format")
-            }
-            
-            val secretKey = enc[3].sha256().hexStringToByteArray()
-            return enc[0].aesDecrypt(secretKey, enc[2])
-        } catch (e: Exception) {
-            throw Exception("Decryption failed: ${e.message}", e)
-        }
-    }
-
-    private fun String.hexStringToByteArray(): ByteArray {
-        val len = length
-        val data = ByteArray(len / 2)
-        var i = 0
-        while (i < len) {
-            data[i / 2] = (
-                    (Character.digit(this[i], 16) shl 4) +
-                            Character.digit(this[i + 1], 16)
-                    ).toByte()
-            i += 2
-        }
-        return data
-    }
-
-    private fun String.sha256(): String {
-        return MessageDigest
-            .getInstance("SHA-256")
-            .digest(toByteArray())
-            .fold("") { str, it -> str + "%02x".format(it) }
-    }
-
-    private fun String.aesDecrypt(secretKey: ByteArray, ivString: String): String {
-        val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
-        val sk = SecretKeySpec(secretKey, 0, secretKey.size, "AES")
-        
-        val iv = IvParameterSpec(
-            Base64.getDecoder().decode(ivString.toByteArray(Charsets.UTF_8))
-        )
-        
-        c.init(Cipher.DECRYPT_MODE, sk, iv)
-        val byteStr = Base64.getDecoder().decode(toByteArray(Charsets.UTF_8))
-        return String(c.doFinal(byteStr))
     }
 }
