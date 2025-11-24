@@ -29,7 +29,7 @@ private const val CHAPTERS_FIRST_PAGE_SIZE = 120
 private const val CHAPTERS_MAX_PAGE_SIZE = 500
 private const val CHAPTERS_PARALLELISM = 3
 private const val CHAPTERS_MAX_COUNT = 10_000 // strange api behavior, looks like a bug
-private const val LOCALE_FALLBACK = "ar" // تم التغيير من "en" إلى "ar"
+private const val LOCALE_FALLBACK = "en"
 private const val SERVER_DATA = "data"
 private const val SERVER_DATA_SAVER = "data-saver"
 
@@ -218,7 +218,6 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 		val url = buildString {
 			append("https://api.$domain/manga?limit=$PAGE_SIZE&offset=${query.offset}")
 				.append("&includes[]=cover_art&includes[]=author&includes[]=artist&includedTagsMode=AND&excludedTagsMode=OR")
-				.append("&availableTranslatedLanguage[]=ar") // إضافة فلتر اللغة العربية
 
 			var hasContentRating = false
 
@@ -314,9 +313,13 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 		}
 	}
 
-	// تم التبسيط - إرجاع اللغة العربية فقط
 	private suspend fun fetchAvailableLocales(): Set<Locale> {
-		return setOf(Locale("ar"))
+		val head = webClient.httpGet("https://$domain/").parseHtml().head()
+		return head.getElementsByAttributeValue("property", "og:locale:alternate")
+			.mapNotNullToSet { meta ->
+				val raw = meta.attrOrNull("content") ?: return@mapNotNullToSet null
+				Locale(raw.substringBefore('_'), raw.substringAfter('_', ""))
+			}
 	}
 
 	private fun JSONObject.fetchManga(chapters: List<MangaChapter>?): Manga {
@@ -439,7 +442,6 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 			append("&includes[]=scanlation_group&order[volume]=asc&order[chapter]=asc&offset=")
 			append(offset)
 			append("&contentRating[]=safe&contentRating[]=suggestive&contentRating[]=erotica&contentRating[]=pornographic")
-			append("&translatedLanguage[]=ar") // إضافة فلتر اللغة العربية للفصول
 		}
 		val json = webClient.httpGet(url).parseJson()
 		if (json.getString("result") == "ok") {
