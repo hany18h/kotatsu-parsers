@@ -9,6 +9,9 @@ import org.koitharu.kotatsu.parsers.site.mangareader.MangaReaderParser
 @MangaSourceParser("MANGAPRO", "MangaPro", "ar")
 internal class MangaPro(context: MangaLoaderContext) :
 	MangaReaderParser(context, MangaParserSource.MANGAPRO, "prochan.pro", pageSize = 20, searchPageSize = 10) {
+	
+	override val listUrl = "/series"
+	
 	override val filterCapabilities: MangaListFilterCapabilities
 		get() = super.filterCapabilities.copy(
 			isTagsExclusionSupported = false,
