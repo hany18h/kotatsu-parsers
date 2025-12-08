@@ -11,22 +11,24 @@ internal class ThunderScans(context: MangaLoaderContext) :
     MangaReaderParser(
         context,
         MangaParserSource.THUNDERSCANS,
-        "lavascans.com",
+        "lavatoons.com", // 1. تم تصحيح الدومين هنا
         pageSize = 32,
         searchPageSize = 10,
     ) {
 
-    // مهم علشان تعدي Cloudflare
+    // 2. تفعيل الحماية لتجاوز كلاود فلير
     override val isNetShieldProtected = true
 
-    // المسار الرسمي في lavatoons/lavascans
-    override val listUrl = "/manga"
+    // 3. محدد الفصول: أضفت محددات أكثر شمولاً لأن القالب قد يختلف بين المانجات
+    override val selectChapter = "li.wp-manga-chapter, div.eplister ul li, #chapterlist ul li"
 
-    // بعض المواقع بتستخدم الاتنين
-    override val selectChapter =
-        "div.eplister ul li, #chapterlist ul li"
-
-    // دعم ts_reader الجديد
-    override val selectTestScript =
-        "script#ts-reader, script:contains(ts_reader)"
+    // 4. محدد الصور: يدعم الصور المباشرة + السكربت الجديد
+    override val selectPage = ".reading-content img, #readerarea img"
+    override val selectTestScript = "script#ts-reader, script:contains(ts_reader)"
+    
+    // 5. فلترة التاغز (اختياري، كما كان في كودك القديم)
+    override val filterCapabilities: MangaListFilterCapabilities
+        get() = super.filterCapabilities.copy(
+            isTagsExclusionSupported = false,
+        )
 }
