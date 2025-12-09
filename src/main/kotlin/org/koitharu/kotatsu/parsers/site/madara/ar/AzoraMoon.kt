@@ -1,15 +1,10 @@
 package org.koitharu.kotatsu.parsers.site.madara.ar
 
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
-import org.koitharu.kotatsu.parsers.exception.TooManyRequestExceptions
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
-import org.koitharu.kotatsu.parsers.util.mapToSet
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
@@ -19,205 +14,110 @@ internal class AzoraMoon(context: MangaLoaderContext) :
 	override val tagPrefix = "series-genre/"
 	override val listUrl = "series/"
 
-	// Wrapper class to cache both success and failure results
-	private sealed class CacheResult<out T> {
-		data class Success<T>(val data: T) : CacheResult<T>()
-		data class Failure(val exception: Exception) : CacheResult<Nothing>()
-	}
-
-	// PERMANENT caching system - ONE request per action type EVER
-	private val tagCache = ConcurrentHashMap<String, CacheResult<Set<MangaTag>>>()
-	private val filterOptionsCache = ConcurrentHashMap<String, CacheResult<MangaListFilterOptions>>()
-	private val singlePageCache = ConcurrentHashMap<String, CacheResult<List<Manga>>>()
-	private val inProgressRequests = ConcurrentHashMap<String, CompletableDeferred<CacheResult<*>>>()
-	private val requestMutex = Mutex() // Global mutex to prevent concurrent requests
+	// PERMANENT caching system
+	private val singlePageCache = ConcurrentHashMap<String, List<Manga>>()
 	private var lastRequestTime = 0L
-	private val minRequestInterval = 5000L // 5 seconds between ANY requests
-	private val rateLimitErrorDelay = 30000L // Wait 30 seconds after rate limit error
+	private val minRequestInterval = 3000L // 3 seconds between requests
+	private var requestCounter = 0
+	private val maxRequestsPerSession = 5 // Maximum 5 requests per session
 
-	// Rate limiting helper - GLOBAL for all requests
+	// Rate limiting helper with request counter
 	private suspend fun rateLimit() {
-		requestMutex.withLock {
-			val currentTime = System.currentTimeMillis()
-			val timeSinceLastRequest = currentTime - lastRequestTime
-			if (timeSinceLastRequest < minRequestInterval) {
-				val waitTime = minRequestInterval - timeSinceLastRequest
-				println("AzoraMoon: Global rate limiting - waiting ${waitTime}ms")
-				delay(waitTime)
-			}
-			lastRequestTime = System.currentTimeMillis()
+		requestCounter++
+		if (requestCounter > maxRequestsPerSession) {
+			println("AzoraMoon: Maximum request limit reached ($maxRequestsPerSession)")
+			throw Exception("Maximum request limit reached. Please restart the app to make new requests.")
 		}
+		
+		val currentTime = System.currentTimeMillis()
+		val timeSinceLastRequest = currentTime - lastRequestTime
+		if (timeSinceLastRequest < minRequestInterval) {
+			val waitTime = minRequestInterval - timeSinceLastRequest
+			println("AzoraMoon: Waiting ${waitTime}ms before request #$requestCounter")
+			delay(waitTime)
+		}
+		lastRequestTime = System.currentTimeMillis()
+		println("AzoraMoon: Executing request #$requestCounter")
 	}
 
-	// Check if exception is rate limiting related
-	private fun isRateLimitError(e: Exception): Boolean {
-		return e is TooManyRequestExceptions || 
-		       e.message?.lowercase()?.contains("too many") == true ||
-		       e.message?.lowercase()?.contains("rate limit") == true ||
-		       e.message?.lowercase()?.contains("429") == true ||
-		       e.message?.lowercase()?.contains("too man") == true
-	}
-
-	// Helper function for PERMANENT caching - one request per operation EVER
-	@Suppress("UNCHECKED_CAST")
+	// Helper function for PERMANENT caching
 	private suspend inline fun <T> withPermanentCache(
-		cache: ConcurrentHashMap<String, CacheResult<T>>,
+		cache: ConcurrentHashMap<String, T>,
 		key: String,
-		useRateLimit: Boolean = true,
 		crossinline fetcher: suspend () -> T
 	): T {
-		// First check cache WITHOUT lock for performance
+		// If we have cached data, return it immediately
 		val cached = cache[key]
 		if (cached != null) {
-			when (cached) {
-				is CacheResult.Success -> {
-					println("AzoraMoon: Cache HIT for $key")
-					return cached.data
-				}
-				is CacheResult.Failure -> {
-					println("AzoraMoon: Cache FAILURE for $key: ${cached.exception.message}")
-					throw cached.exception
-				}
-			}
+			println("AzoraMoon: Returning cached data for $key")
+			return cached
 		}
 
-		// Use mutex to ensure only ONE request per key at a time
-		return requestMutex.withLock {
-			// Double-check cache after acquiring lock
-			val cachedAfterLock = cache[key]
-			if (cachedAfterLock != null) {
-				when (cachedAfterLock) {
-					is CacheResult.Success -> return@withLock cachedAfterLock.data
-					is CacheResult.Failure -> throw cachedAfterLock.exception
-				}
-			}
+		println("AzoraMoon: Making ONE-TIME request for $key")
 
-			// Check if another coroutine is already making this request
-			val existingRequest = inProgressRequests[key] as? CompletableDeferred<CacheResult<T>>
-			if (existingRequest != null) {
-				println("AzoraMoon: Waiting for in-progress request for $key")
-				val result = existingRequest.await()
-				when (result) {
-					is CacheResult.Success -> return@withLock result.data
-					is CacheResult.Failure -> throw result.exception
-				}
-			}
+		// Apply rate limiting
+		rateLimit()
 
-			// Create new request
-			val deferred = CompletableDeferred<CacheResult<T>>()
-			inProgressRequests[key] = deferred as CompletableDeferred<CacheResult<*>>
-
-			try {
-				println("AzoraMoon: Making ONE-TIME request for $key")
-
-				// Apply global rate limiting
-				if (useRateLimit) {
-					val currentTime = System.currentTimeMillis()
-					val timeSinceLastRequest = currentTime - lastRequestTime
-					if (timeSinceLastRequest < minRequestInterval) {
-						val waitTime = minRequestInterval - timeSinceLastRequest
-						println("AzoraMoon: Rate limiting - waiting ${waitTime}ms")
-						delay(waitTime)
-					}
-					lastRequestTime = System.currentTimeMillis()
-				}
-
-				var retryCount = 0
-				val maxRetries = 1 // Only 1 retry to avoid spam
-
-				while (retryCount <= maxRetries) {
-					try {
-						val data = fetcher()
-						val result = CacheResult.Success(data)
-						cache[key] = result
-						deferred.complete(result)
-						println("AzoraMoon: Successfully cached $key")
-						return@withLock data
-					} catch (e: Exception) {
-						if (isRateLimitError(e)) {
-							retryCount++
-							if (retryCount <= maxRetries) {
-								val waitTime = rateLimitErrorDelay
-								println("AzoraMoon: Rate limit error for $key, waiting ${waitTime}ms before retry $retryCount/$maxRetries")
-								delay(waitTime)
-								lastRequestTime = System.currentTimeMillis() + waitTime // Reset timer
-								continue
-							}
-						}
-						
-						// Cache the failure IMMEDIATELY to prevent any retries
-						val failureResult = CacheResult.Failure(e)
-						cache[key] = failureResult
-						deferred.complete(failureResult)
-						println("AzoraMoon: Cached failure for $key: ${e.message}")
-						throw e
-					}
-				}
-
-				// Should never reach here
-				val finalException = Exception("Max retries exceeded for $key")
-				val finalFailure = CacheResult.Failure(finalException)
-				cache[key] = finalFailure
-				deferred.complete(finalFailure)
-				throw finalException
-			} finally {
-				inProgressRequests.remove(key)
-			}
+		try {
+			val data = fetcher()
+			cache[key] = data
+			println("AzoraMoon: Successfully cached $key")
+			return data
+		} catch (e: Exception) {
+			println("AzoraMoon: Request failed for $key: ${e.message}")
+			throw e
 		}
 	}
 
-	// Override tag fetching with caching and rate limiting (HEAVILY RESTRICTED)
-	override suspend fun fetchAvailableTags(): Set<MangaTag> = withPermanentCache(
-		cache = tagCache,
-		key = "tags",
-		useRateLimit = true
-	) {
-		super.fetchAvailableTags()
+	// Override tag fetching - DISABLED due to extreme rate limiting
+	override suspend fun fetchAvailableTags(): Set<MangaTag> {
+		println("AzoraMoon: Tags fetching is disabled due to rate limiting")
+		return emptySet()
 	}
 
-	// Override filter options with caching (HEAVILY RESTRICTED)
-	override suspend fun getFilterOptions(): MangaListFilterOptions = withPermanentCache(
-		cache = filterOptionsCache,
-		key = "filter_options",
-		useRateLimit = true
-	) {
-		MangaListFilterOptions(
-			availableTags = fetchAvailableTags(),
+	// Override filter options - return minimal options without making requests
+	override suspend fun getFilterOptions(): MangaListFilterOptions {
+		println("AzoraMoon: Returning minimal filter options (no tags)")
+		return MangaListFilterOptions(
+			availableTags = emptySet(),
 			availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED, MangaState.ABANDONED),
 			availableContentRating = EnumSet.of(ContentRating.SAFE, ContentRating.ADULT),
 		)
 	}
 
-	// Generate stable cache key for list pages
-	private fun generateListCacheKey(page: Int, order: SortOrder, filter: MangaListFilter): String {
-		val query = filter.query ?: ""
-		val tags = filter.tags.sortedBy { it.key }.joinToString(",") { it.key }
-		val states = filter.states.sorted().joinToString(",")
-		val contentRating = filter.contentRating?.toString() ?: ""
-		return "list_${page}_${order}_${query}_${tags}_${states}_${contentRating}"
-	}
-
-	// Override list page with VERY LIMITED caching - only allow basic browsing
+	// Override list page with VERY LIMITED caching
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		// Only allow page 1 requests to avoid pagination spam
+		// Only allow page 1 to avoid pagination spam
 		if (page > 1) {
-			println("AzoraMoon: Blocking page $page request - only page 1 allowed")
-			return emptyList() // Return empty instead of making request
+			println("AzoraMoon: Blocking page $page - only page 1 allowed")
+			return emptyList()
 		}
 
-		// Use simplified cache key for basic browsing only
-		val simplifiedKey = if (filter.query.isNullOrEmpty() && filter.tags.isEmpty() && filter.states.isEmpty()) {
-			"basic_list_${order}" // Basic browsing
-		} else {
-			"search_${filter.query ?: ""}_${order}" // Simple search
+		// Simplified cache key - merge similar searches
+		val searchQuery = filter.query?.trim()?.lowercase() ?: ""
+		val simplifiedKey = when {
+			searchQuery.isEmpty() && filter.tags.isEmpty() && filter.states.isEmpty() -> 
+				"basic_list_${order}"
+			searchQuery.length <= 3 -> 
+				"search_short_${order}"
+			else -> {
+				// Group searches by first 2 words
+				val words = searchQuery.split(" ").take(2).joinToString(" ")
+				"search_${words}_${order}"
+			}
 		}
 
 		return withPermanentCache(
 			cache = singlePageCache,
-			key = simplifiedKey,
-			useRateLimit = true
+			key = simplifiedKey
 		) {
-			super.getListPage(1, order, filter) // Always request page 1 only
+			try {
+				super.getListPage(1, order, filter)
+			} catch (e: Exception) {
+				println("AzoraMoon: Failed to fetch page: ${e.message}")
+				// Return cached data from any similar search if available
+				singlePageCache.values.firstOrNull() ?: emptyList()
+			}
 		}
 	}
 }
