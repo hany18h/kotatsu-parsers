@@ -58,15 +58,12 @@ internal class AzoraMoon(context: MangaLoaderContext) :
 		// Apply rate limiting
 		rateLimit()
 
-		try {
-			val data = fetcher()
-			cache[key] = data
-			println("AzoraMoon: Successfully cached $key")
-			return data
-		} catch (e: Exception) {
-			println("AzoraMoon: Request failed for $key: ${e.message}")
-			throw e
-		}
+		// Don't catch exceptions here - let them propagate
+		// Only cache successful results
+		val data = fetcher()
+		cache[key] = data
+		println("AzoraMoon: Successfully cached $key")
+		return data
 	}
 
 	// Override tag fetching - DISABLED due to extreme rate limiting
@@ -115,8 +112,8 @@ internal class AzoraMoon(context: MangaLoaderContext) :
 				super.getListPage(1, order, filter)
 			} catch (e: Exception) {
 				println("AzoraMoon: Failed to fetch page: ${e.message}")
-				// Return cached data from any similar search if available
-				singlePageCache.values.firstOrNull() ?: emptyList()
+				// DON'T cache failed results - throw the exception instead
+				throw e
 			}
 		}
 	}
