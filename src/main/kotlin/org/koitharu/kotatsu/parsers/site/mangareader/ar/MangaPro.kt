@@ -103,11 +103,11 @@ internal class MangaPro(context: MangaLoaderContext) :
         val docs = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
         val pages = mutableListOf<String>()
         
-        // الطريقة 1: استخراج من __NEXT_DATA__ (JSON)
+        // الطريقة 1: استخراج من __NEXT_DATA__ (JSON) - نبحث عن app.prochan.net أولاً
         val nextData = extractNextData(docs)
         val props = nextData?.optJSONObject("props")?.optJSONObject("pageProps")
         
-        // محاولة استخراج من appImages (أفضل جودة وأكثر استقراراً)
+        // محاولة استخراج من appImages (أفضل جودة وأكثر استقراراً من app.prochan.net)
         val appImages = props?.optJSONArray("appImages")
         if (appImages != null && appImages.length() > 0) {
             for (i in 0 until appImages.length()) {
@@ -116,14 +116,14 @@ internal class MangaPro(context: MangaLoaderContext) :
                 // نستخدم mobile version فقط (أكثر استقراراً من cdn2/cdn3)
                 val mobileUrl = imgObj?.optString("mobile")
                 
-                if (!mobileUrl.isNullOrEmpty()) {
+                if (!mobileUrl.isNullOrEmpty() && mobileUrl.contains("app.prochan.net")) {
                     val fullUrl = if (mobileUrl.startsWith("http")) mobileUrl else "https:$mobileUrl"
                     pages.add(fullUrl)
                 }
             }
         }
         
-        // محاولة استخراج من images array
+        // محاولة استخراج من images array - نفضل app.prochan.net
         if (pages.isEmpty()) {
             val images = props?.optJSONArray("images")
             if (images != null && images.length() > 0) {
@@ -133,9 +133,29 @@ internal class MangaPro(context: MangaLoaderContext) :
                         val finalUrl = when {
                             imageUrl.startsWith("http") -> imageUrl
                             imageUrl.startsWith("//") -> "https:$imageUrl"
+                            // نفضل app.prochan.net على cdn
+                            imageUrl.startsWith("/chapters/") -> "https://app.prochan.net$imageUrl"
                             else -> "https://cdn3.prochan.net$imageUrl"
                         }
-                        pages.add(finalUrl)
+                        // نضيف فقط الصور من app.prochan.net إن وجدت
+                        if (finalUrl.contains("app.prochan.net")) {
+                            pages.add(finalUrl)
+                        }
+                    }
+                }
+                
+                // إذا لم نجد صور من app.prochan.net، نستخدم أي صور متاحة
+                if (pages.isEmpty()) {
+                    for (i in 0 until images.length()) {
+                        val imageUrl = images.optString(i)
+                        if (imageUrl.isNotEmpty()) {
+                            val finalUrl = when {
+                                imageUrl.startsWith("http") -> imageUrl
+                                imageUrl.startsWith("//") -> "https:$imageUrl"
+                                else -> "https://cdn3.prochan.net$imageUrl"
+                            }
+                            pages.add(finalUrl)
+                        }
                     }
                 }
             }
@@ -179,25 +199,29 @@ internal class MangaPro(context: MangaLoaderContext) :
             pages.addAll(mobileImages.ifEmpty { desktopImages.ifEmpty { cdnImages } })
         }
         
-        // الطريقة 3: محاولة البحث في script tags (آخر محاولة)
+        // الطريقة 3: محاولة البحث في script tags (آخر محاولة) - نفضل app.prochan.net
         if (pages.isEmpty()) {
+            val foundUrls = mutableSetOf<String>()
+            
             docs.select("script:not([src])").forEach { script ->
                 val scriptContent = script.html()
                 
-                // البحث عن URLs الصور مع tokens
-                val imageUrlPattern = Regex("""https?://(?:app|cdn2|cdn3)\.prochan\.net/[^\s"']+\.avif(?:\?[^\s"']*)?""")
-                val matches = imageUrlPattern.findAll(scriptContent)
+                // البحث عن URLs من app.prochan.net أولاً
+                val appPattern = Regex("""https?://app\.prochan\.net/chapters/[^\s"']+\.avif(?:\?[^\s"']*)?""")
+                appPattern.findAll(scriptContent).forEach { match ->
+                    foundUrls.add(match.value)
+                }
                 
-                val foundUrls = mutableSetOf<String>()
-                matches.forEach { match ->
-                    val url = match.value
-                    val baseId = extractImageBaseId(url)
-                    if (!foundUrls.contains(baseId)) {
-                        foundUrls.add(baseId)
-                        pages.add(url)
+                // إذا لم نجد، ابحث عن cdn2/cdn3
+                if (foundUrls.isEmpty()) {
+                    val cdnPattern = Regex("""https?://(?:cdn2|cdn3)\.prochan\.net/[^\s"']+\.avif(?:\?[^\s"']*)?""")
+                    cdnPattern.findAll(scriptContent).forEach { match ->
+                        foundUrls.add(match.value)
                     }
                 }
             }
+            
+            pages.addAll(foundUrls)
         }
         
         // تحويل إلى MangaPage
@@ -209,15 +233,5 @@ internal class MangaPro(context: MangaLoaderContext) :
                 source = source,
             )
         }
-    }
-    
-    // دالة مساعدة لاستخراج معرف الصورة الأساسي (بدون mobile/desktop suffix)
-    private fun extractImageBaseId(url: String): String {
-        // نستخرج الجزء الفريد من URL (بدون -mobile/-desktop)
-        return url
-            .substringBefore("?")
-            .replace("-mobile.avif", ".avif")
-            .replace("-desktop.avif", ".avif")
-            .substringAfterLast("/")
     }
 }
