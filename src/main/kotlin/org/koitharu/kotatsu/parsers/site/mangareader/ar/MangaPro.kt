@@ -107,18 +107,17 @@ internal class MangaPro(context: MangaLoaderContext) :
         val nextData = extractNextData(docs)
         val props = nextData?.optJSONObject("props")?.optJSONObject("pageProps")
         
-        // محاولة استخراج من appImages
+        // محاولة استخراج من appImages (أفضل جودة وأكثر استقراراً)
         val appImages = props?.optJSONArray("appImages")
         if (appImages != null && appImages.length() > 0) {
             for (i in 0 until appImages.length()) {
                 val imgObj = appImages.optJSONObject(i)
-                // نفضل mobile أولاً للتوافق
-                val mobileUrl = imgObj?.optString("mobile")
-                val desktopUrl = imgObj?.optString("desktop")
                 
-                val finalUrl = mobileUrl?.takeIf { it.isNotEmpty() } ?: desktopUrl
-                if (finalUrl != null && finalUrl.isNotEmpty()) {
-                    val fullUrl = if (finalUrl.startsWith("http")) finalUrl else "https:$finalUrl"
+                // نستخدم mobile version فقط (أكثر استقراراً من cdn2/cdn3)
+                val mobileUrl = imgObj?.optString("mobile")
+                
+                if (!mobileUrl.isNullOrEmpty()) {
+                    val fullUrl = if (mobileUrl.startsWith("http")) mobileUrl else "https:$mobileUrl"
                     pages.add(fullUrl)
                 }
             }
@@ -142,50 +141,42 @@ internal class MangaPro(context: MangaLoaderContext) :
             }
         }
         
-        // الطريقة 2: استخراج من HTML مباشرة
+        // الطريقة 2: استخراج من HTML - نفضل app.prochan.net على cdn2/cdn3
         if (pages.isEmpty()) {
-            val imageMap = mutableMapOf<String, String>()
+            val mobileImages = mutableListOf<String>()
+            val desktopImages = mutableListOf<String>()
+            val cdnImages = mutableListOf<String>()
             
-            // نجمع كل الصور مع تجنب التكرار
+            // نجمع كل الصور حسب المصدر
             docs.select("img").forEach { img ->
                 val src = img.attr("src")
-                val dataSrc = img.attr("data-src") // lazy loading
+                val dataSrc = img.attr("data-src")
                 val actualSrc = src.takeIf { it.isNotEmpty() } ?: dataSrc
                 
                 if (actualSrc.isEmpty() || !actualSrc.contains("prochan.net")) return@forEach
-                
-                // تخطي صور series cards
                 if (actualSrc.contains("series-cards") || actualSrc.contains("image_series")) return@forEach
                 
                 val classes = img.className()
                 
-                // نفضل mobile version (أصغر حجماً وأسرع)
                 when {
-                    // صور mobile من app.prochan.net
-                    ("md:hidden" in classes || "block md:hidden" in classes) && 
-                    actualSrc.contains("app.prochan.net/chapters") -> {
-                        val baseId = extractImageBaseId(actualSrc)
-                        imageMap[baseId] = actualSrc
+                    // صور mobile من app.prochan.net (الأولوية الأعلى)
+                    actualSrc.contains("app.prochan.net/chapters") && 
+                    ("md:hidden" in classes || "block md:hidden" in classes) -> {
+                        mobileImages.add(actualSrc)
                     }
-                    // صور desktop (نستخدمها فقط إذا لم يكن mobile موجود)
-                    ("hidden md:block" in classes || "md:block" in classes) && 
+                    // صور desktop من app.prochan.net
                     actualSrc.contains("app.prochan.net/chapters") -> {
-                        val baseId = extractImageBaseId(actualSrc)
-                        if (!imageMap.containsKey(baseId)) {
-                            imageMap[baseId] = actualSrc
-                        }
+                        desktopImages.add(actualSrc)
                     }
-                    // صور cdn3/cdn2 (بدون mobile/desktop variants)
-                    actualSrc.contains("/chapters/") || actualSrc.matches(Regex(""".*/\d+/\d+/\d+-[a-z0-9]+\.avif.*""")) -> {
-                        val baseId = extractImageBaseId(actualSrc)
-                        if (!imageMap.containsKey(baseId)) {
-                            imageMap[baseId] = actualSrc
-                        }
+                    // صور cdn (آخر خيار)
+                    actualSrc.contains("/chapters/") -> {
+                        cdnImages.add(actualSrc)
                     }
                 }
             }
             
-            pages.addAll(imageMap.values.sortedBy { it })
+            // نفضل mobile، ثم desktop، ثم cdn
+            pages.addAll(mobileImages.ifEmpty { desktopImages.ifEmpty { cdnImages } })
         }
         
         // الطريقة 3: محاولة البحث في script tags (آخر محاولة)
