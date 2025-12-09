@@ -1,6 +1,5 @@
 package org.koitharu.kotatsu.parsers.site.mangareader.ar
 
-import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -8,8 +7,6 @@ import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.site.mangareader.MangaReaderParser
 import org.koitharu.kotatsu.parsers.util.*
-import java.text.SimpleDateFormat
-import java.util.*
 
 @MangaSourceParser("MANGAPRO", "MangaPro", "ar")
 internal class MangaPro(context: MangaLoaderContext) :
@@ -33,6 +30,8 @@ internal class MangaPro(context: MangaLoaderContext) :
             null
         }
     }
+    
+    override fun parseMangaList(docs: Document): List<Manga> {
         return docs.select("div.grid a[href^='/series/']").mapNotNull { a ->
             val href = a.attr("href")
             if (href.isNullOrEmpty()) return@mapNotNull null
@@ -61,25 +60,20 @@ internal class MangaPro(context: MangaLoaderContext) :
     override suspend fun getDetails(manga: Manga): Manga {
         val docs = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
         
-        // استخراج العنوان والوصف
         val title = docs.selectFirst("h1")?.text() ?: manga.title
         val description = docs.select("p.text-muted-foreground, div.description").firstOrNull()?.text()
         
-        // استخراج الفصول من البنية الصحيحة
         val chapters = docs.select("a[href^='/series/'].hover\\:underline")
             .mapNotNull { link ->
                 val href = link.attr("href")
                 if (href.isEmpty()) return@mapNotNull null
                 
-                // التأكد أن الرابط يحتوي على رقم الفصل
                 val urlParts = href.split("/")
                 if (urlParts.size < 6) return@mapNotNull null
                 
-                // استخراج النص من span
                 val chapterTitle = link.selectFirst("span.break-words")?.text() 
                     ?: return@mapNotNull null
                 
-                // استخراج رقم الفصل
                 val chapterNumber = Regex("\\d+").find(chapterTitle)?.value
                     ?.toFloatOrNull() ?: 0f
                 
@@ -107,11 +101,9 @@ internal class MangaPro(context: MangaLoaderContext) :
     
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val docs = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-        
-        // استخراج الصور من HTML مباشرة
         val pages = mutableListOf<MangaPage>()
         
-        // 1. الصور من app.prochan.pro (Next.js optimized images)
+        // 1. صور app.prochan.pro
         docs.select("img[src*='app.prochan.pro']").forEach { img ->
             val src = img.attr("src")
             if (src.isNotEmpty()) {
@@ -126,7 +118,7 @@ internal class MangaPro(context: MangaLoaderContext) :
             }
         }
         
-        // 2. الصور من cdn2.prochan.pro (direct CDN with token)
+        // 2. صور cdn2/cdn3.prochan.pro
         docs.select("img[src*='cdn2.prochan.pro'], img[src*='cdn3.prochan.pro']").forEach { img ->
             val src = img.attr("src")
             if (src.isNotEmpty() && pages.none { it.url.contains(src.substringBefore("?")) }) {
@@ -141,12 +133,11 @@ internal class MangaPro(context: MangaLoaderContext) :
             }
         }
         
-        // 3. Fallback: محاولة استخراج من Next.js JSON
+        // 3. Fallback من JSON
         if (pages.isEmpty()) {
             val nextData = extractNextData(docs)
             val props = nextData?.optJSONObject("props")?.optJSONObject("pageProps")
             
-            // البحث عن الصور من appImages
             val appImages = props?.optJSONArray("appImages")
             if (appImages != null) {
                 for (i in 0 until appImages.length()) {
@@ -154,7 +145,6 @@ internal class MangaPro(context: MangaLoaderContext) :
                     val mobileUrl = imgObj?.optString("mobile")
                     val desktopUrl = imgObj?.optString("desktop")
                     
-                    // نستخدم mobile للتطبيق
                     val finalUrl = mobileUrl?.takeIf { it.isNotEmpty() } ?: desktopUrl
                     if (finalUrl != null && finalUrl.isNotEmpty()) {
                         pages.add(
@@ -169,7 +159,6 @@ internal class MangaPro(context: MangaLoaderContext) :
                 }
             }
             
-            // البحث عن images array أيضاً
             if (pages.isEmpty()) {
                 val images = props?.optJSONArray("images")
                 if (images != null) {
