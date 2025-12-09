@@ -101,7 +101,7 @@ internal class MangaPro(context: MangaLoaderContext) :
     
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val docs = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-        val pages = mutableListOf<MangaPage>()
+        val pages = mutableListOf<String>()
         
         // الطريقة 1: استخراج من __NEXT_DATA__ (JSON)
         val nextData = extractNextData(docs)
@@ -112,19 +112,14 @@ internal class MangaPro(context: MangaLoaderContext) :
         if (appImages != null && appImages.length() > 0) {
             for (i in 0 until appImages.length()) {
                 val imgObj = appImages.optJSONObject(i)
+                // نفضل mobile أولاً للتوافق
                 val mobileUrl = imgObj?.optString("mobile")
                 val desktopUrl = imgObj?.optString("desktop")
                 
                 val finalUrl = mobileUrl?.takeIf { it.isNotEmpty() } ?: desktopUrl
                 if (finalUrl != null && finalUrl.isNotEmpty()) {
-                    pages.add(
-                        MangaPage(
-                            id = generateUid("$finalUrl#$i"),
-                            url = if (finalUrl.startsWith("http")) finalUrl else "https:$finalUrl",
-                            preview = null,
-                            source = source,
-                        )
-                    )
+                    val fullUrl = if (finalUrl.startsWith("http")) finalUrl else "https:$finalUrl"
+                    pages.add(fullUrl)
                 }
             }
         }
@@ -141,15 +136,7 @@ internal class MangaPro(context: MangaLoaderContext) :
                             imageUrl.startsWith("//") -> "https:$imageUrl"
                             else -> "https://cdn3.prochan.net$imageUrl"
                         }
-                        
-                        pages.add(
-                            MangaPage(
-                                id = generateUid("$finalUrl#$i"),
-                                url = finalUrl,
-                                preview = null,
-                                source = source,
-                            )
-                        )
+                        pages.add(finalUrl)
                     }
                 }
             }
@@ -157,47 +144,28 @@ internal class MangaPro(context: MangaLoaderContext) :
         
         // الطريقة 2: استخراج من HTML مباشرة
         if (pages.isEmpty()) {
-            // جمع كل الصور من app.prochan.net و cdn3.prochan.net
-            val allImages = mutableSetOf<String>()
-            
-            // 1. صور app.prochan.net/chapters
+            // 1. صور app.prochan.net/chapters (mobile + desktop)
             docs.select("img[src*='app.prochan.net/chapters']").forEach { img ->
-                var src = img.attr("src")
+                val src = img.attr("src")
                 if (src.isNotEmpty()) {
-                    // إزالة parameters
-                    src = src.substringBefore("?")
-                    allImages.add(src)
+                    pages.add(src)
                 }
             }
             
-            // 2. صور cdn3.prochan.net
+            // 2. صور cdn3.prochan.net (مع tokens)
             docs.select("img[src*='cdn3.prochan.net']").forEach { img ->
-                var src = img.attr("src")
+                val src = img.attr("src")
                 if (src.isNotEmpty()) {
-                    src = src.substringBefore("?")
-                    allImages.add(src)
+                    pages.add(src)
                 }
             }
             
             // 3. صور cdn2.prochan.net
             docs.select("img[src*='cdn2.prochan.net']").forEach { img ->
-                var src = img.attr("src")
+                val src = img.attr("src")
                 if (src.isNotEmpty()) {
-                    src = src.substringBefore("?")
-                    allImages.add(src)
+                    pages.add(src)
                 }
-            }
-            
-            // تحويل إلى MangaPage
-            allImages.forEachIndexed { index, url ->
-                pages.add(
-                    MangaPage(
-                        id = generateUid("$url#$index"),
-                        url = if (url.startsWith("http")) url else "https:$url",
-                        preview = null,
-                        source = source,
-                    )
-                )
             }
         }
         
@@ -207,25 +175,25 @@ internal class MangaPro(context: MangaLoaderContext) :
                 val scriptContent = script.html()
                 
                 // البحث عن URLs الصور في الـ JavaScript
-                val imageUrlPattern = Regex("""https?://(?:app|cdn2|cdn3)\.prochan\.net/[^\s"']+\.(?:avif|jpg|jpeg|png|webp)""")
+                val imageUrlPattern = Regex("""https?://(?:app|cdn2|cdn3)\.prochan\.net/[^\s"']+\.(?:avif|jpg|jpeg|png|webp)(?:\?[^\s"']*)?""")
                 val matches = imageUrlPattern.findAll(scriptContent)
                 
-                matches.forEachIndexed { index, match ->
-                    val url = match.value.substringBefore("?")
-                    if (!pages.any { it.url.contains(url) }) {
-                        pages.add(
-                            MangaPage(
-                                id = generateUid("$url#$index"),
-                                url = url,
-                                preview = null,
-                                source = source,
-                            )
-                        )
-                    }
+                matches.forEach { match ->
+                    pages.add(match.value)
                 }
             }
         }
         
-        return pages.distinctBy { it.url.substringBefore("?") }
+        // تحويل إلى MangaPage وإزالة التكرارات
+        return pages
+            .distinctBy { it.substringBefore("?") }
+            .mapIndexed { index, url ->
+                MangaPage(
+                    id = generateUid("$url#$index"),
+                    url = if (url.startsWith("http")) url else "https:$url",
+                    preview = null,
+                    source = source,
+                )
+            }
     }
 }
