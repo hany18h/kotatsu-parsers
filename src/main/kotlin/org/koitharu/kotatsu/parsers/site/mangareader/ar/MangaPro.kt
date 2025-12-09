@@ -103,11 +103,11 @@ internal class MangaPro(context: MangaLoaderContext) :
         val docs = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
         val pages = mutableListOf<MangaPage>()
         
-        // 1. استخراج من __NEXT_DATA__ أولاً (الأفضل والأدق)
+        // الطريقة 1: استخراج من __NEXT_DATA__ (JSON)
         val nextData = extractNextData(docs)
         val props = nextData?.optJSONObject("props")?.optJSONObject("pageProps")
         
-        // محاولة 1: appImages (الأولوية)
+        // محاولة استخراج من appImages
         val appImages = props?.optJSONArray("appImages")
         if (appImages != null && appImages.length() > 0) {
             for (i in 0 until appImages.length()) {
@@ -129,7 +129,7 @@ internal class MangaPro(context: MangaLoaderContext) :
             }
         }
         
-        // محاولة 2: images array
+        // محاولة استخراج من images array
         if (pages.isEmpty()) {
             val images = props?.optJSONArray("images")
             if (images != null && images.length() > 0) {
@@ -155,47 +155,68 @@ internal class MangaPro(context: MangaLoaderContext) :
             }
         }
         
-        // 3. Fallback: البحث في HTML
+        // الطريقة 2: استخراج من HTML مباشرة
         if (pages.isEmpty()) {
-            // صور app.prochan.net
-            docs.select("img[src*='app.prochan.net']").forEach { img ->
-                val src = img.attr("src")
+            // جمع كل الصور من app.prochan.net و cdn3.prochan.net
+            val allImages = mutableSetOf<String>()
+            
+            // 1. صور app.prochan.net/chapters
+            docs.select("img[src*='app.prochan.net/chapters']").forEach { img ->
+                var src = img.attr("src")
                 if (src.isNotEmpty()) {
-                    pages.add(
-                        MangaPage(
-                            id = generateUid("$src#${pages.size}"),
-                            url = if (src.startsWith("http")) src else "https:$src",
-                            preview = null,
-                            source = source,
-                        )
-                    )
+                    // إزالة parameters
+                    src = src.substringBefore("?")
+                    allImages.add(src)
                 }
             }
             
-            // صور cdn2/cdn3.prochan.net
-            docs.select("img[src*='cdn2.prochan.net'], img[src*='cdn3.prochan.net']").forEach { img ->
-                val src = img.attr("src")
-                if (src.isNotEmpty() && pages.none { it.url.contains(src.substringBefore("?")) }) {
-                    pages.add(
-                        MangaPage(
-                            id = generateUid("$src#${pages.size}"),
-                            url = if (src.startsWith("http")) src else "https:$src",
-                            preview = null,
-                            source = source,
-                        )
-                    )
+            // 2. صور cdn3.prochan.net
+            docs.select("img[src*='cdn3.prochan.net']").forEach { img ->
+                var src = img.attr("src")
+                if (src.isNotEmpty()) {
+                    src = src.substringBefore("?")
+                    allImages.add(src)
                 }
             }
             
-            // Fallback للنطاق القديم .pro (في حالة وجود صور قديمة)
-            if (pages.isEmpty()) {
-                docs.select("img[src*='prochan.pro']").forEach { img ->
-                    val src = img.attr("src").replace("prochan.pro", "prochan.net")
-                    if (src.isNotEmpty()) {
+            // 3. صور cdn2.prochan.net
+            docs.select("img[src*='cdn2.prochan.net']").forEach { img ->
+                var src = img.attr("src")
+                if (src.isNotEmpty()) {
+                    src = src.substringBefore("?")
+                    allImages.add(src)
+                }
+            }
+            
+            // تحويل إلى MangaPage
+            allImages.forEachIndexed { index, url ->
+                pages.add(
+                    MangaPage(
+                        id = generateUid("$url#$index"),
+                        url = if (url.startsWith("http")) url else "https:$url",
+                        preview = null,
+                        source = source,
+                    )
+                )
+            }
+        }
+        
+        // الطريقة 3: محاولة البحث في كل نصوص الـ script tags عن URLs
+        if (pages.isEmpty()) {
+            docs.select("script:not([src])").forEach { script ->
+                val scriptContent = script.html()
+                
+                // البحث عن URLs الصور في الـ JavaScript
+                val imageUrlPattern = Regex("""https?://(?:app|cdn2|cdn3)\.prochan\.net/[^\s"']+\.(?:avif|jpg|jpeg|png|webp)""")
+                val matches = imageUrlPattern.findAll(scriptContent)
+                
+                matches.forEachIndexed { index, match ->
+                    val url = match.value.substringBefore("?")
+                    if (!pages.any { it.url.contains(url) }) {
                         pages.add(
                             MangaPage(
-                                id = generateUid("$src#${pages.size}"),
-                                url = if (src.startsWith("http")) src else "https:$src",
+                                id = generateUid("$url#$index"),
+                                url = url,
                                 preview = null,
                                 source = source,
                             )
