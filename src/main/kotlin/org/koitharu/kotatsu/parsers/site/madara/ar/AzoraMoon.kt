@@ -17,16 +17,18 @@ internal class AzoraMoon(context: MangaLoaderContext) :
 	// PERMANENT caching system
 	private val singlePageCache = ConcurrentHashMap<String, List<Manga>>()
 	private var lastRequestTime = 0L
-	private val minRequestInterval = 3000L // 3 seconds between requests
+	private val minRequestInterval = 10000L // 10 seconds between requests
 	private var requestCounter = 0
-	private val maxRequestsPerSession = 5 // Maximum 5 requests per session
+	private val maxRequestsPerSession = 3 // Maximum 3 requests per session
+	private var failedAttempts = 0
+	private val maxRetries = 2 // Maximum 2 retries per request
 
 	// Rate limiting helper with request counter
 	private suspend fun rateLimit() {
 		requestCounter++
 		if (requestCounter > maxRequestsPerSession) {
 			println("AzoraMoon: Maximum request limit reached ($maxRequestsPerSession)")
-			throw Exception("Maximum request limit reached. Please restart the app to make new requests.")
+			throw Exception("تم الوصول للحد الأقصى من الطلبات. الرجاء إعادة تشغيل التطبيق.")
 		}
 		
 		val currentTime = System.currentTimeMillis()
@@ -40,7 +42,7 @@ internal class AzoraMoon(context: MangaLoaderContext) :
 		println("AzoraMoon: Executing request #$requestCounter")
 	}
 
-	// Helper function for PERMANENT caching
+	// Helper function for PERMANENT caching with retry logic
 	private suspend inline fun <T> withPermanentCache(
 		cache: ConcurrentHashMap<String, T>,
 		key: String,
@@ -55,15 +57,35 @@ internal class AzoraMoon(context: MangaLoaderContext) :
 
 		println("AzoraMoon: Making ONE-TIME request for $key")
 
-		// Apply rate limiting
-		rateLimit()
+		// Try up to maxRetries times
+		var lastException: Exception? = null
+		repeat(maxRetries) { attempt ->
+			try {
+				// Apply rate limiting
+				rateLimit()
+				
+				val data = fetcher()
+				cache[key] = data
+				failedAttempts = 0 // Reset failed attempts on success
+				println("AzoraMoon: Successfully cached $key")
+				return data
+			} catch (e: Exception) {
+				lastException = e
+				failedAttempts++
+				println("AzoraMoon: Attempt ${attempt + 1}/$maxRetries failed for $key: ${e.message}")
+				
+				if (attempt < maxRetries - 1) {
+					// Wait longer before retry
+					val retryDelay = minRequestInterval * (attempt + 1)
+					println("AzoraMoon: Waiting ${retryDelay}ms before retry...")
+					delay(retryDelay)
+				}
+			}
+		}
 
-		// Don't catch exceptions here - let them propagate
-		// Only cache successful results
-		val data = fetcher()
-		cache[key] = data
-		println("AzoraMoon: Successfully cached $key")
-		return data
+		// All retries failed
+		println("AzoraMoon: All retries failed for $key")
+		throw lastException ?: Exception("فشل تحميل البيانات بعد $maxRetries محاولات")
 	}
 
 	// Override tag fetching - DISABLED due to extreme rate limiting
@@ -90,17 +112,14 @@ internal class AzoraMoon(context: MangaLoaderContext) :
 			return emptyList()
 		}
 
-		// Simplified cache key - merge similar searches
+		// Create unique cache key for each search to avoid wrong results
 		val searchQuery = filter.query?.trim()?.lowercase() ?: ""
 		val simplifiedKey = when {
 			searchQuery.isEmpty() && filter.tags.isEmpty() && filter.states.isEmpty() -> 
 				"basic_list_${order}"
-			searchQuery.length <= 3 -> 
-				"search_short_${order}"
 			else -> {
-				// Group searches by first 2 words
-				val words = searchQuery.split(" ").take(2).joinToString(" ")
-				"search_${words}_${order}"
+				// Use exact search query for accurate results
+				"search_${searchQuery}_${order}"
 			}
 		}
 
@@ -108,13 +127,7 @@ internal class AzoraMoon(context: MangaLoaderContext) :
 			cache = singlePageCache,
 			key = simplifiedKey
 		) {
-			try {
-				super.getListPage(1, order, filter)
-			} catch (e: Exception) {
-				println("AzoraMoon: Failed to fetch page: ${e.message}")
-				// DON'T cache failed results - throw the exception instead
-				throw e
-			}
+			super.getListPage(1, order, filter)
 		}
 	}
 }
