@@ -147,41 +147,45 @@ internal class MangaPro(context: MangaLoaderContext) :
             val imageMap = mutableMapOf<String, String>()
             
             // نجمع كل الصور مع تجنب التكرار
-            docs.select("img[src*='prochan.net']").forEach { img ->
+            docs.select("img").forEach { img ->
                 val src = img.attr("src")
-                if (src.isEmpty()) return@forEach
+                val dataSrc = img.attr("data-src") // lazy loading
+                val actualSrc = src.takeIf { it.isNotEmpty() } ?: dataSrc
+                
+                if (actualSrc.isEmpty() || !actualSrc.contains("prochan.net")) return@forEach
+                
+                // تخطي صور series cards
+                if (actualSrc.contains("series-cards") || actualSrc.contains("image_series")) return@forEach
                 
                 val classes = img.className()
                 
                 // نفضل mobile version (أصغر حجماً وأسرع)
-                // ونتجاهل desktop إذا كان mobile موجود
                 when {
                     // صور mobile من app.prochan.net
-                    "md:hidden" in classes && src.contains("app.prochan.net/chapters") -> {
-                        val baseId = extractImageBaseId(src)
-                        imageMap[baseId] = src
+                    ("md:hidden" in classes || "block md:hidden" in classes) && 
+                    actualSrc.contains("app.prochan.net/chapters") -> {
+                        val baseId = extractImageBaseId(actualSrc)
+                        imageMap[baseId] = actualSrc
                     }
                     // صور desktop (نستخدمها فقط إذا لم يكن mobile موجود)
-                    "hidden md:block" in classes && src.contains("app.prochan.net/chapters") -> {
-                        val baseId = extractImageBaseId(src)
+                    ("hidden md:block" in classes || "md:block" in classes) && 
+                    actualSrc.contains("app.prochan.net/chapters") -> {
+                        val baseId = extractImageBaseId(actualSrc)
                         if (!imageMap.containsKey(baseId)) {
-                            imageMap[baseId] = src
+                            imageMap[baseId] = actualSrc
                         }
                     }
-                    // صور cdn3 (عادة تكون صورة واحدة بدون mobile/desktop)
-                    src.contains("cdn3.prochan.net") -> {
-                        val baseId = extractImageBaseId(src)
-                        imageMap[baseId] = src
-                    }
-                    // صور cdn2
-                    src.contains("cdn2.prochan.net") -> {
-                        val baseId = extractImageBaseId(src)
-                        imageMap[baseId] = src
+                    // صور cdn3/cdn2 (بدون mobile/desktop variants)
+                    actualSrc.contains("/chapters/") || actualSrc.matches(Regex(""".*/\d+/\d+/\d+-[a-z0-9]+\.avif.*""")) -> {
+                        val baseId = extractImageBaseId(actualSrc)
+                        if (!imageMap.containsKey(baseId)) {
+                            imageMap[baseId] = actualSrc
+                        }
                     }
                 }
             }
             
-            pages.addAll(imageMap.values)
+            pages.addAll(imageMap.values.sortedBy { it })
         }
         
         // الطريقة 3: محاولة البحث في script tags (آخر محاولة)
