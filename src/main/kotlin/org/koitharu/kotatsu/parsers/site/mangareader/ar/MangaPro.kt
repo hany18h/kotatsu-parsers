@@ -144,56 +144,85 @@ internal class MangaPro(context: MangaLoaderContext) :
         
         // الطريقة 2: استخراج من HTML مباشرة
         if (pages.isEmpty()) {
-            // 1. صور app.prochan.net/chapters (mobile + desktop)
-            docs.select("img[src*='app.prochan.net/chapters']").forEach { img ->
+            val imageMap = mutableMapOf<String, String>()
+            
+            // نجمع كل الصور مع تجنب التكرار
+            docs.select("img[src*='prochan.net']").forEach { img ->
                 val src = img.attr("src")
-                if (src.isNotEmpty()) {
-                    pages.add(src)
+                if (src.isEmpty()) return@forEach
+                
+                val classes = img.className()
+                
+                // نفضل mobile version (أصغر حجماً وأسرع)
+                // ونتجاهل desktop إذا كان mobile موجود
+                when {
+                    // صور mobile من app.prochan.net
+                    "md:hidden" in classes && src.contains("app.prochan.net/chapters") -> {
+                        val baseId = extractImageBaseId(src)
+                        imageMap[baseId] = src
+                    }
+                    // صور desktop (نستخدمها فقط إذا لم يكن mobile موجود)
+                    "hidden md:block" in classes && src.contains("app.prochan.net/chapters") -> {
+                        val baseId = extractImageBaseId(src)
+                        if (!imageMap.containsKey(baseId)) {
+                            imageMap[baseId] = src
+                        }
+                    }
+                    // صور cdn3 (عادة تكون صورة واحدة بدون mobile/desktop)
+                    src.contains("cdn3.prochan.net") -> {
+                        val baseId = extractImageBaseId(src)
+                        imageMap[baseId] = src
+                    }
+                    // صور cdn2
+                    src.contains("cdn2.prochan.net") -> {
+                        val baseId = extractImageBaseId(src)
+                        imageMap[baseId] = src
+                    }
                 }
             }
             
-            // 2. صور cdn3.prochan.net (مع tokens)
-            docs.select("img[src*='cdn3.prochan.net']").forEach { img ->
-                val src = img.attr("src")
-                if (src.isNotEmpty()) {
-                    pages.add(src)
-                }
-            }
-            
-            // 3. صور cdn2.prochan.net
-            docs.select("img[src*='cdn2.prochan.net']").forEach { img ->
-                val src = img.attr("src")
-                if (src.isNotEmpty()) {
-                    pages.add(src)
-                }
-            }
+            pages.addAll(imageMap.values)
         }
         
-        // الطريقة 3: محاولة البحث في كل نصوص الـ script tags عن URLs
+        // الطريقة 3: محاولة البحث في script tags (آخر محاولة)
         if (pages.isEmpty()) {
             docs.select("script:not([src])").forEach { script ->
                 val scriptContent = script.html()
                 
-                // البحث عن URLs الصور في الـ JavaScript
-                val imageUrlPattern = Regex("""https?://(?:app|cdn2|cdn3)\.prochan\.net/[^\s"']+\.(?:avif|jpg|jpeg|png|webp)(?:\?[^\s"']*)?""")
+                // البحث عن URLs الصور مع tokens
+                val imageUrlPattern = Regex("""https?://(?:app|cdn2|cdn3)\.prochan\.net/[^\s"']+\.avif(?:\?[^\s"']*)?""")
                 val matches = imageUrlPattern.findAll(scriptContent)
                 
+                val foundUrls = mutableSetOf<String>()
                 matches.forEach { match ->
-                    pages.add(match.value)
+                    val url = match.value
+                    val baseId = extractImageBaseId(url)
+                    if (!foundUrls.contains(baseId)) {
+                        foundUrls.add(baseId)
+                        pages.add(url)
+                    }
                 }
             }
         }
         
-        // تحويل إلى MangaPage وإزالة التكرارات
-        return pages
-            .distinctBy { it.substringBefore("?") }
-            .mapIndexed { index, url ->
-                MangaPage(
-                    id = generateUid("$url#$index"),
-                    url = if (url.startsWith("http")) url else "https:$url",
-                    preview = null,
-                    source = source,
-                )
-            }
+        // تحويل إلى MangaPage
+        return pages.mapIndexed { index, url ->
+            MangaPage(
+                id = generateUid("$url#$index"),
+                url = if (url.startsWith("http")) url else "https:$url",
+                preview = null,
+                source = source,
+            )
+        }
+    }
+    
+    // دالة مساعدة لاستخراج معرف الصورة الأساسي (بدون mobile/desktop suffix)
+    private fun extractImageBaseId(url: String): String {
+        // نستخرج الجزء الفريد من URL (بدون -mobile/-desktop)
+        return url
+            .substringBefore("?")
+            .replace("-mobile.avif", ".avif")
+            .replace("-desktop.avif", ".avif")
+            .substringAfterLast("/")
     }
 }
