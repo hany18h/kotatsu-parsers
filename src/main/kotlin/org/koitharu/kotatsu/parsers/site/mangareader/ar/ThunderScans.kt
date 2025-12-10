@@ -16,16 +16,20 @@ internal class ThunderScans(context: MangaLoaderContext) :
         searchPageSize = 10,
     ) {
     
-    override val isNetShieldProtected = true
-    
-    // ✅ الحل: المحدد الصحيح بناءً على HTML الفعلي
-    override val selectChapter = "div.eplister ul li a"
-    
-    // محددات الصور
-    override val selectPage = "div.reading-content img, div#readerarea img"
-    
     override val filterCapabilities: MangaListFilterCapabilities
         get() = super.filterCapabilities.copy(
             isTagsExclusionSupported = false,
         )
+    
+    // ✅ تفعيل Cloudflare NetShield
+    override val isNetShieldProtected = true
+    
+    // ✅ محدد الفصول الصحيح من الكود الآخر
+    override val selectChapter = "div.eplister#chapterlist li"
+    
+    // ✅ محدد السكربت - يدعم كل الحالات
+    override val selectTestScript = "script#ts-reader, script:contains(ts_reader.run), script:contains(ts_reader)"
+    
+    // ✅ محدد الصور العادية (fallback)
+    override val selectPage = "div#readerarea img, div.reading-content img"
 }
