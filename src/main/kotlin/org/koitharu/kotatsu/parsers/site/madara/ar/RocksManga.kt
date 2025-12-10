@@ -34,7 +34,7 @@ import java.util.EnumSet
 
 @MangaSourceParser("ROCKSMANGA", "RocksManga", "ar")
 internal class RocksManga(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.ROCKSMANGA, "rockscans.org") {
+	MadaraParser(context, MangaParserSource.ROCKSMANGA, "rocksmanga.com") {
 
 	override val withoutAjax = false
 	override val datePattern = "d MMMM yyyy"
@@ -248,7 +248,8 @@ internal class RocksManga(context: MangaLoaderContext) :
 		return doc.body().select("ul.scroll-sm li.item").mapChapters(reversed = true) { i, li ->
 			val a = li.selectFirstOrThrow("a")
 			val href = a.attr("href").toRelativeUrl(domain)
-			val link = href + stylePage
+			// Don't append stylePage - use the href as-is
+			val link = href
 
 			val chapterText = a.attr("title").takeIf { it.isNotBlank() }
 				?: a.selectFirst("span.contain-zeb")?.text()
@@ -277,21 +278,30 @@ internal class RocksManga(context: MangaLoaderContext) :
 		val fullUrl = chapter.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(fullUrl).parseHtml()
 
-		val pageContainerSelector = "div#ch-images"
-		val imageSelector = "img.preload-image"
+		// Try multiple selectors in order of preference
+		val container = doc.selectFirst("div#ch-images")
+			?: doc.selectFirst("div.reading-content")
+			?: doc.selectFirst("div.pages")
+			?: doc.parseFailed("Page container not found. Tried: div#ch-images, div.reading-content, div.pages")
 
-		val container = doc.selectFirst(pageContainerSelector)
-			?: doc.parseFailed("Page container '$pageContainerSelector' not found on page: $fullUrl")
-
-		val imageElements = container.select(imageSelector)
-
-		if (imageElements.isEmpty()) {
-			doc.parseFailed("No images found with selector '$imageSelector' in container.")
+		// Try multiple image selectors
+		val imageElements = container.select("img.preload-image").ifEmpty {
+			container.select("div.page img").ifEmpty {
+				container.select("img")
+			}
 		}
 
-		return imageElements.map { imgElement ->
-			val absoluteImageUrl = imgElement.requireSrc()
+		if (imageElements.isEmpty()) {
+			doc.parseFailed("No images found in page container at: $fullUrl")
+		}
 
+		return imageElements.mapNotNull { imgElement ->
+			// Try to get image URL from multiple sources
+			val imageUrl = imgElement.attr("data-src").takeIf { it.isNotBlank() }
+				?: imgElement.attr("src").takeIf { it.isNotBlank() }
+				?: return@mapNotNull null
+
+			val absoluteImageUrl = imageUrl.toAbsoluteUrl(domain)
 			val relativeUrl = absoluteImageUrl.toRelativeUrl(domain)
 
 			MangaPage(
