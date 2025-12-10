@@ -120,3 +120,5 @@ internal class MangaPro(context: MangaLoaderContext) :
     // إزالة التكرار
     return pages.distinctBy { it.url.substringBefore("?") }
 }
+
+    }
