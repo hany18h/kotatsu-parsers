@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import okhttp3.Headers
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
@@ -14,7 +15,7 @@ import java.util.*
 
 @MangaSourceParser("MANGAMELLO", "Manga Mello", "ar", ContentType.MANGA)
 internal class MangaMello(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.MANGAMELLO, 20) {
+    PagedMangaParser(context, MangaSource.MANGAMELLO, 20) {
 
     override val configKeyDomain = ConfigKey.Domain("plus.mangamello.com")
 
@@ -38,28 +39,28 @@ internal class MangaMello(context: MangaLoaderContext) :
         )
     )
 
-    // Custom headers for MangaMello API
-    private val apiHeaders = mapOf(
-        "accept" to "application/json",
-        "authorization" to "Bearer null",
-        "content-type" to "application/json",
-        "installer" to "com.google.android.packageinstaller",
-        "user-agent" to "Dart/3.3 (dart:io)",
-        "vsesion" to "1.1.7",
-        "zone" to TimeZone.getDefault().id
-    )
+    override suspend fun getFilterOptions() = MangaListFilterOptions()
 
-    // Image headers
-    private val imageHeaders = mapOf(
-        "referer" to "https://plus.mangamello.com/",
-        "user-agent" to "Dart/3.3 (dart:io)",
-    )
+    // Custom headers for MangaMello API
+    private fun getApiHeaders(): Headers {
+        return Headers.Builder()
+            .add("accept", "application/json")
+            .add("authorization", "Bearer null")
+            .add("content-type", "application/json")
+            .add("installer", "com.google.android.packageinstaller")
+            .add("user-agent", "Dart/3.3 (dart:io)")
+            .add("vsesion", "1.1.7")
+            .add("zone", TimeZone.getDefault().id)
+            .build()
+    }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        val headers = getApiHeaders()
+        
         // Handle search
         if (!filter.query.isNullOrEmpty()) {
             val searchUrl = "https://plus.mangamello.com/api/v1/mangas/search?per_page=40&title=${filter.query.urlEncoded()}"
-            val response = webClient.httpGet(searchUrl, apiHeaders).parseJson()
+            val response = webClient.httpGet(searchUrl, headers).parseJson()
             val results = response.getJSONArray("data")
             return (0 until results.length()).map { i ->
                 parseMangaFromSearchJson(results.getJSONObject(i))
@@ -73,7 +74,7 @@ internal class MangaMello(context: MangaLoaderContext) :
         }
 
         val url = "https://plus.mangamello.com/api/v1/mangas?sort_by=$sortParam&page=$page"
-        val response = webClient.httpGet(url, apiHeaders).parseJson()
+        val response = webClient.httpGet(url, headers).parseJson()
         val results = response.getJSONArray("data")
 
         return (0 until results.length()).map { i ->
@@ -145,11 +146,12 @@ internal class MangaMello(context: MangaLoaderContext) :
 
     override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
         val mangaId = manga.url.substringAfterLast("/")
+        val headers = getApiHeaders()
         val chaptersDeferred = async { getChapters(mangaId) }
 
         // Get manga details
-        val detailUrl = "https://plus.mangamello.com$manga.url"
-        val response = webClient.httpGet(detailUrl, apiHeaders).parseJson()
+        val detailUrl = "https://plus.mangamello.com${manga.url}"
+        val response = webClient.httpGet(detailUrl, headers).parseJson()
         val data = response.getJSONObject("data")
 
         val title = data.optString("title", manga.title)
@@ -177,8 +179,9 @@ internal class MangaMello(context: MangaLoaderContext) :
     }
 
     private suspend fun getChapters(mangaId: String): List<MangaChapter> {
+        val headers = getApiHeaders()
         val chaptersUrl = "https://plus.mangamello.com/api/v1/mangas/$mangaId/chapters?per_page=2000"
-        val response = webClient.httpGet(chaptersUrl, apiHeaders).parseJson()
+        val response = webClient.httpGet(chaptersUrl, headers).parseJson()
         val chaptersArray = response.getJSONArray("data")
 
         val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
@@ -219,8 +222,9 @@ internal class MangaMello(context: MangaLoaderContext) :
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+        val headers = getApiHeaders()
         val fullUrl = "https://plus.mangamello.com${chapter.url}"
-        val response = webClient.httpGet(fullUrl, apiHeaders).parseJson()
+        val response = webClient.httpGet(fullUrl, headers).parseJson()
         val data = response.getJSONObject("data")
         val imagesArray = data.getJSONArray("chapterImages")
 
