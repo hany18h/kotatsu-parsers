@@ -15,7 +15,7 @@ import java.util.*
 
 @MangaSourceParser("MANGAMELLO", "Manga Mello", "ar", ContentType.MANGA)
 internal class MangaMello(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaSource.MANGAMELLO, 20) {
+    PagedMangaParser(context, MangaParserSource.MANGAMELLO, 20) {
 
     override val configKeyDomain = ConfigKey.Domain("plus.mangamello.com")
 
