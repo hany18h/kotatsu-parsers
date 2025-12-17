@@ -11,7 +11,7 @@ import java.util.*
 
 @MangaSourceParser("MANGATIME", "MangaTime", "ar")
 internal class MangaTime(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.MANGATIME, pageSize = 20) {
+    PagedMangaParser(context, MangaParserSource.MANGATIME, 20) {
 
     override val configKeyDomain = ConfigKey.Domain("mangatime.org")
 
@@ -26,16 +26,13 @@ internal class MangaTime(context: MangaLoaderContext) :
         isSearchSupported = true
     )
 
-    // ============================================================
-    // LIST PAGE
-    // ============================================================
     override suspend fun getListPage(
         page: Int,
         order: SortOrder,
         filter: MangaListFilter
     ): List<Manga> {
-        val skip = page * pageSize
-        val limit = skip + pageSize
+        val skip = page * 20
+        val limit = skip + 20
 
         val sortParam = when (order) {
             SortOrder.NEWEST -> "Newest"
@@ -59,9 +56,6 @@ internal class MangaTime(context: MangaLoaderContext) :
         return parseMangaList(doc)
     }
 
-    // ============================================================
-    // PARSE MANGA LIST
-    // ============================================================
     private fun parseMangaList(doc: org.jsoup.nodes.Document): List<Manga> {
         val elements = doc.select("div.UpdatedTitle-module_titleWrapper_2EQIT")
         
@@ -106,9 +100,6 @@ internal class MangaTime(context: MangaLoaderContext) :
         }
     }
 
-    // ============================================================
-    // DETAILS
-    // ============================================================
     override suspend fun getDetails(manga: Manga): Manga {
         val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
 
@@ -160,14 +151,10 @@ internal class MangaTime(context: MangaLoaderContext) :
         )
     }
 
-    // ============================================================
-    // CHAPTERS
-    // ============================================================
     private suspend fun getChapters(
         mangaUrl: String,
         doc: org.jsoup.nodes.Document
     ): List<MangaChapter> {
-        // Parse both "X days ago" and "Nov 8, 2025" formats
         val relativeFormat = SimpleDateFormat("d MMMM، yyyy", Locale("ar"))
         val absoluteFormat = SimpleDateFormat("MMM d, yyyy", Locale.ENGLISH)
         
@@ -175,12 +162,10 @@ internal class MangaTime(context: MangaLoaderContext) :
             val a = li.selectFirstOrThrow("a")
             val href = a.attrAsRelativeUrl("href")
             
-            // Get title from either title attribute or p.title3
             val name = a.attr("title").ifEmpty {
                 li.selectFirst("p.title3")?.text() ?: "Chapter ${i + 1}"
             }
             
-            // Get date text from p.title2
             val dateText = li.selectFirst("p.title2")?.text()
 
             MangaChapter(
@@ -197,16 +182,11 @@ internal class MangaTime(context: MangaLoaderContext) :
         }
     }
 
-    // ============================================================
-    // PAGES
-    // ============================================================
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
         
-        // Select images from chapter-pages div
         return doc.select("#chapter-pages img.chapter-page")
             .mapNotNull { img ->
-                // Get URL from either data-src (lazy load) or src
                 val url = img.attr("data-src").ifEmpty { 
                     img.attr("src") 
                 }.toRelativeUrl(domain)
@@ -222,9 +202,6 @@ internal class MangaTime(context: MangaLoaderContext) :
             }
     }
 
-    // ============================================================
-    // TAGS
-    // ============================================================
     override suspend fun getFilterOptions() = MangaListFilterOptions(
         availableTags = fetchAvailableTags(),
         availableStates = EnumSet.of(
@@ -249,9 +226,6 @@ internal class MangaTime(context: MangaLoaderContext) :
             }
     }
 
-    // ============================================================
-    // DATE PARSER - Enhanced for both formats
-    // ============================================================
     private fun parseChapterDate(
         relativeFormat: java.text.DateFormat,
         absoluteFormat: java.text.DateFormat, 
@@ -262,7 +236,6 @@ internal class MangaTime(context: MangaLoaderContext) :
         val d = date.lowercase().trim()
         
         return when {
-            // Handle "X days ago" format
             d.contains("days ago") || d.contains("day ago") -> {
                 val number = Regex("""\d+""").find(d)?.value?.toIntOrNull() ?: return 0
                 Calendar.getInstance().apply {
@@ -270,7 +243,6 @@ internal class MangaTime(context: MangaLoaderContext) :
                 }.timeInMillis
             }
             
-            // Handle relative time in Arabic
             d.contains("منذ") || d.contains("ago") -> {
                 val number = Regex("""\d+""").find(d)?.value?.toIntOrNull() ?: return 0
                 val cal = Calendar.getInstance()
@@ -285,13 +257,21 @@ internal class MangaTime(context: MangaLoaderContext) :
                 }
             }
             
-            // Handle absolute dates like "Nov 8, 2025"
             d.matches(Regex("""\w{3}\s+\d{1,2},\s+\d{4}""")) -> {
-                absoluteFormat.tryParse(date)
+                try {
+                    absoluteFormat.parse(date)?.time ?: 0
+                } catch (e: Exception) {
+                    0
+                }
             }
             
-            // Fallback to relative format
-            else -> relativeFormat.tryParse(date)
+            else -> {
+                try {
+                    relativeFormat.parse(date)?.time ?: 0
+                } catch (e: Exception) {
+                    0
+                }
+            }
         }
     }
 }
