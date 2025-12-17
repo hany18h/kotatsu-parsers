@@ -1,10 +1,12 @@
-package org.koitharu.kotatsu.parsers.site.madara.ar
-
-import org.koitharu.kotatsu.parsers.MangaLoaderContext
-import org.koitharu.kotatsu.parsers.MangaSourceParser
-import org.koitharu.kotatsu.parsers.model.MangaParserSource
-import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
-
 @MangaSourceParser("MANGALINKNET", "Link-Manga.com", "ar")
 internal class MangaLinkNet(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.MANGALINKNET, "link-manga.com", pageSize = 10)
+    MadaraParser(
+        context,
+        MangaParserSource.MANGALINKNET,
+        "link-manga.com",
+        pageSize = 10
+    ) {
+
+    override val iconUrl =
+        "https://raw.githubusercontent.com/hany18h/kotatsu-parsers/master/src/main/kotlin/org/koitharu/kotatsu/parsers/icons/MangaLink.webp"
+}
