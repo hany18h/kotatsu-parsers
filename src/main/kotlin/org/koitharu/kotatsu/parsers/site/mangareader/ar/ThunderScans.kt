@@ -16,7 +16,7 @@ internal class Lavatoons(context: MangaLoaderContext) :
         searchPageSize = 10,
     ) {
     
-    override val isNetShieldProtected = true
+    override val isNetShieldProtected = false
     
     override val selectChapter = "div.eplister#chapterlist li"
     
