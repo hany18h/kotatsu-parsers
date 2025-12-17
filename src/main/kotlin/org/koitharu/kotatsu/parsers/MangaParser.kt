@@ -43,6 +43,9 @@ public interface MangaParser : Interceptor {
 
 	public val domain: String
 
+    public val iconUrl: String?
+        get() = null
+
 	@Deprecated("Too complex. Use getList with filter instead")
 	public suspend fun getList(query: MangaSearchQuery): List<Manga>
 
