@@ -28,57 +28,45 @@ internal class Lavatoons(context: MangaLoaderContext) :
         val chapterUrl = chapter.url.toAbsoluteUrl(domain)
         val doc = webClient.httpGet(chapterUrl).parseHtml()
         
-        // البحث عن script الذي يحتوي على ts_reader.run
-        val scripts = doc.select("script")
+        // البحث عن script tag الذي يحتوي على ts_reader.run
+        val scriptWithJson = doc.select("script")
+            .map { it.html() }
+            .firstOrNull { it.contains("ts_reader.run") }
+            ?: return emptyList()
         
-        for (script in scripts) {
-            val scriptContent = script.html()
+        // استخراج JSON من ts_reader.run({...});
+        val jsonText = scriptWithJson
+            .substringAfter("ts_reader.run(")
+            .substringBeforeLast(");")
+            .trim()
+            .takeIf { it.startsWith("{") && it.endsWith("}") }
+            ?: return emptyList()
+        
+        return try {
+            // Parse JSON واستخراج الصور
+            val root = JSONObject(jsonText)
+            val sources = root.optJSONArray("sources") ?: return emptyList()
             
-            if (scriptContent.contains("ts_reader.run")) {
-                try {
-                    // استخراج JSON من ts_reader.run({...})
-                    val startIdx = scriptContent.indexOf("ts_reader.run(") + 14
-                    val endIdx = scriptContent.indexOf("});", startIdx)
-                    
-                    if (startIdx > 14 && endIdx > startIdx) {
-                        val jsonText = scriptContent.substring(startIdx, endIdx + 1)
-                        val json = JSONObject(jsonText)
-                        val sources = json.getJSONArray("sources")
-                        
-                        if (sources.length() > 0) {
-                            val images = sources.getJSONObject(0).getJSONArray("images")
-                            val pages = ArrayList<MangaPage>(images.length())
-                            
-                            for (i in 0 until images.length()) {
-                                val url = images.getString(i)
-                                pages.add(
-                                    MangaPage(
-                                        id = generateUid(url),
-                                        url = url,
-                                        preview = null,
-                                        source = source,
-                                    )
-                                )
-                            }
-                            
-                            return pages
-                        }
-                    }
-                } catch (e: Exception) {
-                    // إذا فشل parsing، نحاول الطريقة القديمة
-                }
+            if (sources.length() == 0) return emptyList()
+            
+            val imagesArray = sources.getJSONObject(0).optJSONArray("images") 
+                ?: return emptyList()
+            
+            // تحويل الصور إلى MangaPage
+            (0 until imagesArray.length()).mapNotNull { idx ->
+                val imageUrl = imagesArray.optString(idx).takeIf { it.isNotBlank() }
+                    ?: return@mapNotNull null
+                
+                MangaPage(
+                    id = generateUid(imageUrl),
+                    url = imageUrl,
+                    preview = null,
+                    source = source,
+                )
             }
-        }
-        
-        // fallback: الطريقة القديمة
-        return doc.select("div#readerarea img").map { img ->
-            val url = img.src() ?: img.attr("data-src")
-            MangaPage(
-                id = generateUid(url),
-                url = url,
-                preview = null,
-                source = source,
-            )
+        } catch (e: Exception) {
+            // في حالة الفشل، return empty list
+            emptyList()
         }
     }
 }
