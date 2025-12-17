@@ -83,8 +83,11 @@ public abstract class AbstractMangaParser @InternalParsersApi constructor(
 	 * Parse favicons from the main page of the source`s website
 	 */
 	public override suspend fun getFavicons(): Favicons {
-		return FaviconParser(webClient, domain).parseFavicons()
-	}
+    iconUrl?.let {
+        return Favicons.single(it)
+    }
+    return FaviconParser(webClient, domain).parseFavicons()
+}
 
 	@CallSuper
 	public override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
