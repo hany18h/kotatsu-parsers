@@ -36,7 +36,7 @@ internal class Mangatuk(context: MangaLoaderContext) :
         val chapters = super.loadChapters(mangaUrl, document)
         
         return chapters.map { chapter ->
-            if (chapter.url.contains("#") || chapter.url.endsWith("#")) {
+            if (chapter.url?.contains("#") == true || chapter.url?.endsWith("#") == true) {
                 val chapterNumber = chapter.title.trim()
                 val fixedUrl = "$mangaUrl$chapterNumber/$stylePage"
                 chapter.copy(url = fixedUrl)
