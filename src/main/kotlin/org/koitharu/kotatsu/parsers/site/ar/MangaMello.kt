@@ -18,6 +18,9 @@ internal class MangaMello(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.MANGAMELLO, 20) {
 
     override val configKeyDomain = ConfigKey.Domain("plus.mangamello.com")
+    
+override val iconUrl =
+    "https://raw.githubusercontent.com/hany18h/kotatsu-parsers/master/src/main/kotlin/org/koitharu/kotatsu/parsers/icons/MangamelloPlus.webp"
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
