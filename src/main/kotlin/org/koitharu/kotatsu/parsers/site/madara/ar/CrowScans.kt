@@ -1,206 +1,248 @@
-package org.koitharu.kotatsu.parsers.site.madara.ar
-
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
-import org.koitharu.kotatsu.parsers.MangaLoaderContext
-import org.koitharu.kotatsu.parsers.MangaSourceParser
-import org.koitharu.kotatsu.parsers.exception.ParseException
-import org.koitharu.kotatsu.parsers.model.ContentRating
-import org.koitharu.kotatsu.parsers.model.Manga
-import org.koitharu.kotatsu.parsers.model.MangaChapter
-import org.koitharu.kotatsu.parsers.model.MangaPage
-import org.koitharu.kotatsu.parsers.model.MangaParserSource
-import org.koitharu.kotatsu.parsers.model.MangaState
-import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
-import org.koitharu.kotatsu.parsers.util.attrAsRelativeUrl
-import org.koitharu.kotatsu.parsers.util.generateUid
-import org.koitharu.kotatsu.parsers.util.mapChapters
-import org.koitharu.kotatsu.parsers.util.mapNotNullToSet
-import org.koitharu.kotatsu.parsers.util.parseHtml
-import org.koitharu.kotatsu.parsers.util.requireSrc
-import org.koitharu.kotatsu.parsers.util.selectLast
-import org.koitharu.kotatsu.parsers.util.selectOrThrow
-import org.koitharu.kotatsu.parsers.util.textOrNull
-import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
-import org.koitharu.kotatsu.parsers.util.toRelativeUrl
-import java.text.SimpleDateFormat
+import android.util.Base64
+import java.net.URLDecoder
 
-@MangaSourceParser("CROWSCANS", "Hadess", "ar")
-internal class CrowScans(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.CROWSCANS, "www.hadess.xyz") {
-	override val datePattern = "dd MMMM، yyyy"
+class HadessParser {
+    
+    // 1. استخراج قائمة الفصول
+    fun parseChapterList(html: String): List<SChapter> {
+        val chapters = mutableListOf<SChapter>()
+        val doc = Jsoup.parse(html)
+        
+        // الطريقة 1: من القائمة الرئيسية (الأكثر موثوقية)
+        doc.select("div.list-body-hh a.chapter-link").forEach { link ->
+            val chapterTitle = link.selectFirst("div.chapter-title")?.text()?.trim() ?: ""
+            val chapterUrl = link.attr("abs:href")
+            val dateText = link.selectFirst("div.meta-item")?.text()?.trim() ?: ""
+            
+            if (chapterTitle.isNotEmpty() && chapterUrl.isNotEmpty()) {
+                chapters.add(
+                    SChapter.create().apply {
+                        name = chapterTitle
+                        url = chapterUrl
+                        date_upload = parseDate(dateText)
+                    }
+                )
+            }
+        }
+        
+        // الطريقة 2: من القائمة المنسدلة (كنسخة احتياطية)
+        if (chapters.isEmpty()) {
+            doc.select("div.chapter-list ul li.chapter-item a").forEach { link ->
+                val chapterTitle = link.text().trim()
+                val chapterUrl = link.attr("abs:href")
+                
+                if (chapterTitle.isNotEmpty() && chapterUrl.isNotEmpty()) {
+                    chapters.add(
+                        SChapter.create().apply {
+                            name = chapterTitle
+                            url = chapterUrl
+                            date_upload = 0L
+                        }
+                    )
+                }
+            }
+        }
+        
+        return chapters
+    }
+    
+    // 2. استخراج صور الفصل
+    fun parseChapterImages(html: String): List<Page> {
+        val images = mutableListOf<Page>()
+        val doc = Jsoup.parse(html)
+        
+        // الطريقة 1: استخراج الصور المحمية (Base64)
+        doc.select("div.protected-image-data").forEachIndexed { index, div ->
+            val encodedUrl = div.attr("data-src")
+            
+            if (encodedUrl.isNotEmpty()) {
+                try {
+                    // فك تشفير Base64
+                    val decodedUrl = String(Base64.decode(encodedUrl, Base64.DEFAULT))
+                    
+                    if (decodedUrl.startsWith("http")) {
+                        images.add(Page(index, imageUrl = decodedUrl))
+                    }
+                } catch (e: Exception) {
+                    println("خطأ في فك تشفير الصورة $index: ${e.message}")
+                }
+            }
+        }
+        
+        // الطريقة 2: استخراج الصور العادية (كنسخة احتياطية)
+        if (images.isEmpty()) {
+            doc.select("img.preload-image[data-src], img[data-src]").forEachIndexed { index, img ->
+                val imageUrl = img.attr("abs:data-src").ifEmpty { img.attr("abs:src") }
+                
+                if (imageUrl.startsWith("http")) {
+                    images.add(Page(index, imageUrl = imageUrl))
+                }
+            }
+        }
+        
+        // الطريقة 3: استخراج من figure > img
+        if (images.isEmpty()) {
+            doc.select("figure.page img").forEachIndexed { index, img ->
+                val imageUrl = img.attr("abs:src").ifEmpty { img.attr("abs:data-src") }
+                
+                if (imageUrl.startsWith("http")) {
+                    images.add(Page(index, imageUrl = imageUrl))
+                }
+            }
+        }
+        
+        return images
+    }
+    
+    // 3. تحويل التاريخ العربي إلى timestamp
+    private fun parseDate(dateText: String): Long {
+        return try {
+            // مثال: "29 سبتمبر، 2025"
+            val arabicMonths = mapOf(
+                "يناير" to 1, "فبراير" to 2, "مارس" to 3,
+                "أبريل" to 4, "مايو" to 5, "يونيو" to 6,
+                "يوليو" to 7, "أغسطس" to 8, "سبتمبر" to 9,
+                "أكتوبر" to 10, "نوفمبر" to 11, "ديسمبر" to 12
+            )
+            
+            val parts = dateText.replace("،", "").split(" ")
+            if (parts.size >= 3) {
+                val day = parts[0].toIntOrNull() ?: 1
+                val month = arabicMonths[parts[1]] ?: 1
+                val year = parts[2].toIntOrNull() ?: 2025
+                
+                val calendar = Calendar.getInstance()
+                calendar.set(year, month - 1, day)
+                calendar.timeInMillis
+            } else {
+                0L
+            }
+        } catch (e: Exception) {
+            0L
+        }
+    }
+    
+    // 4. استخراج تفاصيل المانجا
+    fun parseMangaDetails(html: String): SManga {
+        val doc = Jsoup.parse(html)
+        
+        return SManga.create().apply {
+            // العنوان
+            title = doc.selectFirst("h1.manga-title, h1.post-title")?.text()?.trim() ?: ""
+            
+            // الصورة
+            thumbnail_url = doc.selectFirst("div.manga-cover img, img.manga-thumbnail")
+                ?.attr("abs:src") ?: ""
+            
+            // الوصف
+            description = doc.selectFirst("div.manga-description, div.summary")
+                ?.text()?.trim() ?: ""
+            
+            // المؤلف
+            author = doc.selectFirst("div.author-content, span.author")
+                ?.text()?.trim() ?: ""
+            
+            // الفنان
+            artist = doc.selectFirst("div.artist-content, span.artist")
+                ?.text()?.trim() ?: ""
+            
+            // الحالة
+            status = parseStatus(
+                doc.selectFirst("div.post-status span")?.text() ?: ""
+            )
+            
+            // التصنيفات
+            genre = doc.select("div.genres a, span.genre")
+                .joinToString { it.text().trim() }
+        }
+    }
+    
+    private fun parseStatus(statusText: String): Int {
+        return when {
+            statusText.contains("مستمر", ignoreCase = true) -> SManga.ONGOING
+            statusText.contains("مكتمل", ignoreCase = true) -> SManga.COMPLETED
+            statusText.contains("متوقف", ignoreCase = true) -> SManga.ON_HIATUS
+            else -> SManga.UNKNOWN
+        }
+    }
+}
 
-	override suspend fun loadChapters(mangaUrl: String, document: Document): List<MangaChapter> {
-		return parseChapters(document)
-	}
+// Data classes
+data class SChapter(
+    var name: String = "",
+    var url: String = "",
+    var date_upload: Long = 0L
+) {
+    companion object {
+        fun create() = SChapter()
+    }
+}
 
-	override suspend fun getChapters(manga: Manga, doc: Document): List<MangaChapter> {
-		return parseChapters(doc)
-	}
+data class Page(
+    val index: Int,
+    val imageUrl: String? = null
+)
 
-	private fun parseChapters(doc: Document): List<MangaChapter> {
-		val dateFormat = SimpleDateFormat(datePattern, sourceLocale)
-		val chapters = doc.select("a.chapter-link")
+data class SManga(
+    var title: String = "",
+    var thumbnail_url: String = "",
+    var description: String = "",
+    var author: String = "",
+    var artist: String = "",
+    var status: Int = UNKNOWN,
+    var genre: String = ""
+) {
+    companion object {
+        const val UNKNOWN = 0
+        const val ONGOING = 1
+        const val COMPLETED = 2
+        const val ON_HIATUS = 6
+        
+        fun create() = SManga()
+    }
+}
 
-		return chapters.mapChapters(reversed = true) { i, a ->
-			val href = a.attrAsRelativeUrl("href")
-			val title = a.selectFirst(".chapter-title")?.text()?.trim() ?: a.ownText()
-			val dateText = a.selectFirst(".meta-item[time]")?.attr("time")
-				?: a.selectFirst(".meta-item")?.text()
+// مثال على الاستخدام في Extension:
+class HadessExtension {
+    private val parser = HadessParser()
+    
+    fun chapterListParse(response: Response): List<SChapter> {
+        val html = response.body?.string() ?: ""
+        return parser.parseChapterList(html)
+    }
+    
+    fun pageListParse(response: Response): List<Page> {
+        val html = response.body?.string() ?: ""
+        return parser.parseChapterImages(html)
+    }
+    
+    fun mangaDetailsParse(response: Response): SManga {
+        val html = response.body?.string() ?: ""
+        return parser.parseMangaDetails(html)
+    }
+}
 
-			// Extract chapter number from title or URL
-			val chapterNumber = title.toFloatOrNull()
-				?: href.substringBeforeLast("/").substringAfterLast("/").toFloatOrNull()
-				?: (i + 1f)
-
-			MangaChapter(
-				id = generateUid(href),
-				title = "Chapter $title",
-				number = chapterNumber,
-				volume = 0,
-				url = href,
-				uploadDate = parseChapterDate(dateFormat, dateText),
-				source = source,
-				scanlator = null,
-				branch = null
-			)
-		}
-	}
-
-	override suspend fun getDetails(manga: Manga): Manga {
-		val fullUrl = manga.url.toAbsoluteUrl(domain)
-		val doc = captureDocument(fullUrl)
-
-		// Custom description selector for Hadess
-		val desc = doc.selectFirst("div.description div.description-content")?.html()
-			?: doc.select(selectDesc).html()
-
-		val stateDiv = doc.selectFirst(selectState)?.selectLast("div.summary-content")
-		val state = stateDiv?.let {
-			when (it.text().lowercase()) {
-				in ongoing -> MangaState.ONGOING
-				in finished -> MangaState.FINISHED
-				in abandoned -> MangaState.ABANDONED
-				in paused -> MangaState.PAUSED
-				else -> null
-			}
-		}
-		val alt = doc.body().select(selectAlt).firstOrNull()?.tableValue()?.textOrNull()
-		val genres = doc.body().select(selectGenre).mapNotNullToSet { a -> createMangaTag(a) }
-
-		return manga.copy(
-			title = doc.selectFirst("h1")?.textOrNull() ?: manga.title,
-			url = fullUrl.toRelativeUrl(domain),
-			publicUrl = fullUrl,
-			tags = genres,
-			description = desc,
-			altTitles = setOfNotNull(alt),
-			state = state,
-			chapters = parseChapters(doc),
-			contentRating = if (doc.selectFirst(".adult-confirm") != null || isNsfwSource) {
-				ContentRating.ADULT
-			} else {
-				ContentRating.SAFE
-			},
-		)
-	}
-
-	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val fullUrl = chapter.url.toAbsoluteUrl(domain)
-
-		// Use captureDocument since the site has browser checks
-		val doc = captureDocument(fullUrl)
-
-		// Try Hadess custom structure first
-		val customImages = doc.select("img.preload-image[data-src]")
-		if (customImages.isNotEmpty()) {
-			return customImages.map { img ->
-				val imageUrl = img.attr("data-src").ifEmpty { img.attr("src") }
-				val relativeUrl = imageUrl.toRelativeUrl(domain)
-				MangaPage(
-					id = generateUid(relativeUrl),
-					url = relativeUrl,
-					preview = null,
-					source = source,
-				)
-			}
-		}
-
-		// Fallback to standard Madara selectors
-		val root = doc.body().selectFirst(selectBodyPage) ?: throw ParseException(
-			"No image found",
-			fullUrl,
-		)
-
-		return root.select(selectPage).flatMap { div ->
-			div.selectOrThrow("img").map { img ->
-				val url = img.requireSrc().toRelativeUrl(domain)
-				MangaPage(
-					id = generateUid(url),
-					url = url,
-					preview = null,
-					source = source,
-				)
-			}
-		}
-	}
-
-	private suspend fun captureDocument(url: String): Document {
-		val script = """
-			(() => {
-				// Check for different types of content
-				const hasReadingContent = document.querySelector('div.reading-content') !== null ||
-										   document.querySelector('div.page-break') !== null ||
-										   document.querySelectorAll('img.preload-image[data-src]').length > 0 ||
-										   document.querySelector('img[data-src]') !== null;
-
-				const hasMangaList = document.querySelector('div.page-listing-item') !== null ||
-									 document.querySelector('div.page-item-detail') !== null ||
-									 document.querySelector('.wp-manga-item') !== null;
-
-				// For manga details, specifically wait for chapters to load
-				const hasChapters = document.querySelectorAll('a.chapter-link').length > 0;
-				const hasBasicDetails = document.querySelector('div.description') !== null ||
-										document.querySelector('.post-title') !== null;
-
-				// If this is a manga details page, wait for chapters to load
-				if (document.querySelector('#manga-chapters-holder') !== null) {
-					if (hasChapters && hasBasicDetails) {
-						window.stop();
-						const elementsToRemove = document.querySelectorAll('script, iframe, object, embed, style');
-						elementsToRemove.forEach(el => el.remove());
-						return document.documentElement.outerHTML;
-					}
-					return null; // Keep waiting for chapters to load
-				}
-
-				// For other content types, return immediately
-				if (hasReadingContent || hasMangaList || hasBasicDetails) {
-					window.stop();
-					const elementsToRemove = document.querySelectorAll('script, iframe, object, embed, style');
-					elementsToRemove.forEach(el => el.remove());
-					return document.documentElement.outerHTML;
-				}
-				return null;
-			})();
-		""".trimIndent()
-
-		val rawHtml = context.evaluateJs(url, script) ?: throw ParseException("Failed to load page", url)
-
-		val html = if (rawHtml is String && rawHtml.startsWith("\"") && rawHtml.endsWith("\"")) {
-			rawHtml.substring(1, rawHtml.length - 1)
-				.replace("\\\"", "\"")
-				.replace("\\n", "\n")
-				.replace("\\r", "\r")
-				.replace("\\t", "\t")
-				.replace(Regex("""\\u([0-9A-Fa-f]{4})""")) { match ->
-					val hexValue = match.groupValues[1]
-					hexValue.toInt(16).toChar().toString()
-				}
-		} else rawHtml
-
-		return Jsoup.parse(html, url)
-	}
-
-	override suspend fun getRelatedManga(seed: Manga): List<Manga> = emptyList()
+// مثال للاختبار:
+fun main() {
+    val html = """
+        <!-- HTML من الموقع -->
+    """.trimIndent()
+    
+    val parser = HadessParser()
+    
+    // اختبار استخراج الفصول
+    val chapters = parser.parseChapterList(html)
+    println("عدد الفصول: ${chapters.size}")
+    chapters.take(5).forEach {
+        println("${it.name} - ${it.url}")
+    }
+    
+    // اختبار استخراج الصور
+    val images = parser.parseChapterImages(html)
+    println("\nعدد الصور: ${images.size}")
+    images.take(5).forEach {
+        println("صورة ${it.index}: ${it.imageUrl}")
+    }
 }
