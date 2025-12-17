@@ -21,7 +21,10 @@ internal class Waveteamy(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.WAVETEAMY, 50) {
 
     override val configKeyDomain = ConfigKey.Domain("waveteamy.com")
-
+    
+override val iconUrl =
+    "https://raw.githubusercontent.com/hany18h/kotatsu-parsers/master/src/main/kotlin/org/koitharu/kotatsu/parsers/icons/Waveteamy.png"
+        
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
         keys.add(userAgentKey)
