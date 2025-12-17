@@ -11,7 +11,7 @@ import java.text.SimpleDateFormat
 
 @MangaSourceParser("LEKMANGACOM", "LekMangaCom", "ar")
 internal class LekMangaCom(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.LEKMANGACOM, "lekmanga.com") {
+	MadaraParser(context, MangaParserSource.LEKMANGACOM, "lekmanga.site") {
 	override val listUrl = "lekmanga/"
 	override val postReq = true
 
