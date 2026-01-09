@@ -13,7 +13,7 @@ import java.util.*
 internal class MangaTek(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.MANGATEK, pageSize = 24) {
 
-    override val configKeyDomain = ConfigKey.Domain("api.mangatek.com")
+    override val configKeyDomain = ConfigKey.Domain("mangatek.com")
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
@@ -39,7 +39,7 @@ internal class MangaTek(context: MangaLoaderContext) :
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         val url = buildString {
             append("https://")
-            append(domain.replace("api.", ""))
+            append(domain)
             append("/manga-list")
             
             when {
@@ -69,20 +69,22 @@ internal class MangaTek(context: MangaLoaderContext) :
         
         return doc.select("div.grid a.manga-card").mapNotNull { card ->
             val link = card.attr("href")
+            if (link.isEmpty()) return@mapNotNull null
+            
             val slug = link.removePrefix("/manga/")
             
-            // الإصلاح: نختار h3 الموجود داخل div.absolute.bottom-0 فقط
-            val title = card.selectFirst("div.absolute.bottom-0 h3")?.text()?.trim()
-                ?: return@mapNotNull null
+            // الإصلاح: نختار h3 فقط (العنوان الحقيقي)
+            val title = card.selectFirst("h3")?.text()?.trim()
+            if (title.isNullOrEmpty()) return@mapNotNull null
             
-            // إصلاح التقييم: نختار span الذي يحتوي على i.fa-star
-            val ratingText = card.selectFirst("span:has(i.fa-star) span")?.text()
-            val rating = ratingText?.toFloatOrNull()?.div(10) ?: RATING_UNKNOWN
+            // التقييم: نختار span الداخلي اللي جوا span:has(i.fa-star)
+            val ratingElement = card.selectFirst("span:has(i.fa-star) > span:not(:has(i))")
+            val rating = ratingElement?.text()?.toFloatOrNull()?.div(10) ?: RATING_UNKNOWN
             
             Manga(
                 id = generateUid(slug),
                 url = slug,
-                publicUrl = "https://${domain.replace("api.", "")}$link",
+                publicUrl = "https://$domain$link",
                 title = title,
                 coverUrl = card.selectFirst("img")?.src(),
                 altTitles = emptySet(),
@@ -97,7 +99,7 @@ internal class MangaTek(context: MangaLoaderContext) :
     }
 
     override suspend fun getDetails(manga: Manga): Manga {
-        val url = "https://${domain.replace("api.", "")}/manga/${manga.url}"
+        val url = "https://$domain/manga/${manga.url}"
         val doc = webClient.httpGet(url).parseHtml()
         
         // Extract title
@@ -168,7 +170,7 @@ internal class MangaTek(context: MangaLoaderContext) :
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val fullUrl = "https://${domain.replace("api.", "")}${chapter.url}"
+        val fullUrl = "https://$domain${chapter.url}"
         val doc = webClient.httpGet(fullUrl).parseHtml()
         
         return doc.select("div.manga-page img[src], div.manga-page img[data-src]").mapIndexed { index, img ->
