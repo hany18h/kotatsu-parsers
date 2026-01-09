@@ -1,5 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
+import org.json.JSONArray
+import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -100,13 +102,9 @@ internal class MangaTek(context: MangaLoaderContext) :
         val url = "https://$domain/manga/${manga.url}"
         val doc = webClient.httpGet(url).parseHtml()
         
-        // Extract title
         val title = doc.selectFirst("h1")?.text() ?: manga.title
-        
-        // Extract description
         val description = doc.selectFirst("div.grid p, p.text-gray-300")?.text()
         
-        // Extract status
         val statusText = doc.selectFirst("span.border")?.text()
         val state = when {
             statusText?.contains("مستمر") == true -> MangaState.ONGOING
@@ -115,7 +113,6 @@ internal class MangaTek(context: MangaLoaderContext) :
             else -> null
         }
         
-        // Extract tags
         val tags = doc.select("div.flex.gap-2 span.text-gray-300").mapNotNullToSet { tag ->
             val tagName = tag.text().trim()
             if (tagName.isEmpty()) return@mapNotNullToSet null
@@ -126,12 +123,11 @@ internal class MangaTek(context: MangaLoaderContext) :
             )
         }
         
-        // Extract rating
         val ratingText = doc.selectFirst("span:has(i.fa-star)")?.text()
         val rating = ratingText?.replace(Regex("[^0-9.]"), "")?.toFloatOrNull()?.div(10) ?: manga.rating
         
-        // ===== الإصلاح: جلب جميع الفصول من كل الصفحات =====
-        val chapters = fetchAllChapters(manga.url)
+        // ===== الإصلاح: استخدام API =====
+        val chapters = fetchChaptersFromApi(manga.url)
         
         return manga.copy(
             title = title,
@@ -144,52 +140,43 @@ internal class MangaTek(context: MangaLoaderContext) :
     }
 
     /**
-     * جلب جميع الفصول من كل الصفحات
-     * يتعامل مع الـ pagination الخاص بالموقع
+     * جلب الفصول من API الخاص بالموقع
      */
-    private suspend fun fetchAllChapters(mangaSlug: String): List<MangaChapter> {
-        val allChapters = mutableListOf<MangaChapter>()
-        var currentPage = 1
-        var hasMorePages = true
+    private suspend fun fetchChaptersFromApi(mangaSlug: String): List<MangaChapter> {
+        // جلب الصفحة الأولى للحصول على معلومات المانجا
+        val pageUrl = "https://$domain/manga/$mangaSlug"
+        val doc = webClient.httpGet(pageUrl).parseHtml()
         
-        while (hasMorePages) {
-            val pageUrl = "https://$domain/manga/$mangaSlug?page=$currentPage"
-            val doc = webClient.httpGet(pageUrl).parseHtml()
+        // استخراج الـ manga ID من الصفحة
+        // المعلومات موجودة في astro-island component props
+        val scriptContent = doc.select("astro-island[component-url*='MangaChaptersLoader']")
+            .attr("props")
+        
+        if (scriptContent.isEmpty()) {
+            // fallback: جلب الفصول من HTML مباشرة (الصفحة الأولى فقط)
+            return parseChaptersFromHtml(doc)
+        }
+        
+        // تحليل JSON من props
+        return try {
+            val chapters = mutableListOf<MangaChapter>()
             
-            // استخراج الفصول من الصفحة الحالية
-            val chapterElements = doc.select("div.manga-chapter a, div.grid a[href^='/reader/']")
+            // JSON معقد جداً، نستخدم طريقة regex للحصول على الفصول
+            // نبحث عن pattern مثل: "chapter_number":"802"
+            val chapterPattern = """"chapter_number"\s*:\s*\[0,\s*"([^"]+)"\]""".toRegex()
+            val chapterMatches = chapterPattern.findAll(scriptContent)
             
-            if (chapterElements.isEmpty()) {
-                hasMorePages = false
-                break
-            }
-            
-            chapterElements.forEach { element ->
-                val chapterUrl = element.attr("href")
-                if (chapterUrl.isEmpty()) return@forEach
+            chapterMatches.forEach { match ->
+                val chapterNum = match.groupValues[1]
                 
-                val chapterTitle = element.selectFirst("h3")?.text() ?: "Chapter"
-                
-                // استخراج رقم الفصل من العنوان مثل "الفصل 240" أو "Chapter 240"
-                val chapterNumber = chapterTitle
-                    .replace(Regex("[^0-9.]"), "")
-                    .toFloatOrNull() 
-                    ?: allChapters.size.toFloat() + 1f
-                
-                // استخراج التاريخ
-                val dateText = element.selectFirst("span:has(i.fa-calendar-alt)")?.text()
-                    ?: element.selectFirst("p.text-sm")?.text()
-                
-                val uploadDate = parseDate(dateText)
-                
-                allChapters.add(
+                chapters.add(
                     MangaChapter(
-                        id = generateUid(chapterUrl),
-                        title = chapterTitle,
-                        number = chapterNumber,
+                        id = generateUid("$mangaSlug-$chapterNum"),
+                        title = "الفصل $chapterNum",
+                        number = chapterNum.toFloatOrNull() ?: 0f,
                         volume = 0,
-                        url = chapterUrl,
-                        uploadDate = uploadDate,
+                        url = "/reader/$mangaSlug/$chapterNum",
+                        uploadDate = 0L,
                         source = source,
                         scanlator = null,
                         branch = null,
@@ -197,25 +184,41 @@ internal class MangaTek(context: MangaLoaderContext) :
                 )
             }
             
-            // التحقق من وجود صفحة تالية
-            // نفترض أن الموقع يعرض أقصى عدد محدد من الفصول في كل صفحة
-            // إذا كانت عدد الفصول في الصفحة الحالية أقل من الحد الأقصى، فهذا يعني أننا وصلنا للنهاية
-            val chaptersPerPage = 50 // قد تحتاج لتعديل هذا الرقم حسب الموقع
-            
-            if (chapterElements.size < chaptersPerPage) {
-                hasMorePages = false
-            } else {
-                currentPage++
-                
-                // حماية من اللوب اللانهائي (حد أقصى 100 صفحة)
-                if (currentPage > 100) {
-                    hasMorePages = false
-                }
-            }
+            chapters.reversed() // من الأحدث للأقدم
+        } catch (e: Exception) {
+            // في حالة الفشل، نستخدم HTML fallback
+            parseChaptersFromHtml(doc)
         }
-        
-        // ترتيب الفصول من الأحدث للأقدم (أو العكس حسب الموقع)
-        return allChapters.reversed()
+    }
+
+    /**
+     * Fallback: تحليل الفصول من HTML مباشرة
+     */
+    private fun parseChaptersFromHtml(doc: org.jsoup.nodes.Document): List<MangaChapter> {
+        return doc.select("div.manga-chapter a, div.grid a[href^='/reader/']").mapNotNull { element ->
+            val chapterUrl = element.attr("href")
+            if (chapterUrl.isEmpty()) return@mapNotNull null
+            
+            val chapterTitle = element.selectFirst("h3")?.text() ?: "Chapter"
+            val chapterNumber = chapterTitle
+                .replace(Regex("[^0-9.]"), "")
+                .toFloatOrNull() ?: 0f
+            
+            val dateText = element.selectFirst("span:has(i.fa-calendar-alt)")?.text()
+                ?: element.selectFirst("p.text-sm")?.text()
+            
+            MangaChapter(
+                id = generateUid(chapterUrl),
+                title = chapterTitle,
+                number = chapterNumber,
+                volume = 0,
+                url = chapterUrl,
+                uploadDate = parseDate(dateText),
+                source = source,
+                scanlator = null,
+                branch = null,
+            )
+        }.reversed()
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
