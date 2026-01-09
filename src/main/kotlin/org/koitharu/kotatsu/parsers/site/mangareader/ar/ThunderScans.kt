@@ -60,7 +60,8 @@ internal class Lavatoons(context: MangaLoaderContext) :
                     filter.tagsExclude.forEach {
                         append("&")
                         append("genre[]".urlEncoded())
-                        append("=-")
+                        append("=")
+                        append("-")
                         append(it.key)
                     }
 
@@ -98,8 +99,8 @@ internal class Lavatoons(context: MangaLoaderContext) :
         return parseMangaList(webClient.httpGet(url).parseHtml())
     }
     
-    // المحددات الصحيحة من HTML الفعلي
-    override val selectMangaList = "div.manga-list-grid article.legend-card"
+    // المحددات الموحدة للبحث والتصفح
+    override val selectMangaList = "div.magma-grid article.legend-card, div.manga-list-grid article.legend-card"
     override val selectMangaListImg = "img.legend-img"
     override val selectMangaListTitle = "h3.legend-title"
     
@@ -190,19 +191,26 @@ internal class Lavatoons(context: MangaLoaderContext) :
             val ratingText = card.selectFirst("div.legend-rating")?.text()
             val rating = ratingText?.replace(Regex("[^0-9.]"), "")?.toFloatOrNull()?.div(10) ?: RATING_UNKNOWN
             
-            // الحالة من div.legend-ribbon
-            val statusText = card.selectFirst("div.legend-ribbon span")?.text()
+            // الحالة من div.legend-ribbon (في التصفح) أو span.legend-ribbon (في البحث)
+            val ribbonElement = card.selectFirst("div.legend-ribbon span, span.legend-ribbon")
+            val statusText = ribbonElement?.text()
             val state = when {
                 statusText?.contains("مستمر") == true -> MangaState.ONGOING
                 statusText?.contains("مكتمل") == true -> MangaState.FINISHED
+                statusText?.contains("متوقف") == true -> MangaState.PAUSED
                 else -> null
             }
+            
+            // العنوان - بدعم للعناوين بدون رابط في البحث
+            val titleElement = card.selectFirst(selectMangaListTitle)
+            val title = titleElement?.let { 
+                it.selectFirst("a")?.text() ?: it.text()
+            } ?: posterLink.attr("href").substringAfterLast("/").substringBefore("/")
             
             Manga(
                 id = generateUid(relativeUrl),
                 url = relativeUrl,
-                title = card.selectFirst(selectMangaListTitle)?.text() 
-                    ?: posterLink.attr("href").substringAfterLast("/").substringBefore("/"),
+                title = title,
                 altTitles = emptySet(),
                 publicUrl = posterLink.attrAsAbsoluteUrl("href"),
                 rating = rating,
