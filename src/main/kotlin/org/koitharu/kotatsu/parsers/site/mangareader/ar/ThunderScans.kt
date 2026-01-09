@@ -9,6 +9,7 @@ import org.koitharu.kotatsu.parsers.model.MangaPage
 import org.koitharu.kotatsu.parsers.model.MangaParserSource
 import org.koitharu.kotatsu.parsers.site.mangareader.MangaReaderParser
 import org.koitharu.kotatsu.parsers.util.*
+import org.koitharu.kotatsu.parsers.network.UserAgents
 
 @MangaSourceParser("LAVATOONS", "Lavatoons", "ar", ContentType.MANGA)
 internal class Lavatoons(context: MangaLoaderContext) :
@@ -25,7 +26,15 @@ internal class Lavatoons(context: MangaLoaderContext) :
     
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterUrl = chapter.url.toAbsoluteUrl(domain)
-        val doc = webClient.httpGet(chapterUrl).parseHtml()
+        
+        // استخدام httpGet بدون cache للحصول على محتوى جديد دائماً
+        val doc = webClient.httpGet(chapterUrl) {
+            // إزالة If-Modified-Since header لتجنب 304 response
+            headers.remove("If-Modified-Since")
+            // إضافة Cache-Control لفرض طلب جديد
+            header("Cache-Control", "no-cache")
+            header("Pragma", "no-cache")
+        }.parseHtml()
         
         // ===== METHOD 1: Try JSON (ts_reader.run) =====
         val pagesFromJson = tryGetPagesFromJson(doc)
@@ -45,8 +54,8 @@ internal class Lavatoons(context: MangaLoaderContext) :
             return pagesFromAltJson
         }
         
-        // If all methods failed, return empty
-        return emptyList()
+        // If all methods failed, throw exception for debugging
+        throw IllegalStateException("Failed to extract pages from chapter: $chapterUrl")
     }
     
     /**
@@ -96,9 +105,11 @@ internal class Lavatoons(context: MangaLoaderContext) :
         // Try multiple selectors for broader compatibility
         val selectors = listOf(
             "div.reader-area#readerarea img.ts-main-image",
-            "div#readerarea img",
-            "div.reader-area img",
-            "#readerarea img[src]"
+            "div#readerarea img[src]",
+            "div.reader-area img[src]",
+            "#readerarea img",
+            "div.reading-content img",
+            "div[id*=reader] img"
         )
         
         for (selector in selectors) {
@@ -109,7 +120,8 @@ internal class Lavatoons(context: MangaLoaderContext) :
                     val imageUrl = img.attr("src")
                         .ifBlank { img.attr("data-src") }
                         .ifBlank { img.attr("data-lazy-src") }
-                        .takeIf { it.isNotBlank() }
+                        .ifBlank { img.attr("data-original") }
+                        .takeIf { it.isNotBlank() && !it.contains("data:image") }
                         ?: return@mapNotNull null
                     
                     MangaPage(
@@ -141,7 +153,9 @@ internal class Lavatoons(context: MangaLoaderContext) :
             Pair("var images = ", ";"),
             Pair("const images = ", ";"),
             Pair("var pages = ", ";"),
-            Pair("const pages = ", ";")
+            Pair("const pages = ", ";"),
+            Pair("let images = ", ";"),
+            Pair("let pages = ", ";")
         )
         
         for (script in scripts) {
@@ -155,8 +169,12 @@ internal class Lavatoons(context: MangaLoaderContext) :
                     val imagesArray = org.json.JSONArray(jsonText)
                     if (imagesArray.length() > 0) {
                         return (0 until imagesArray.length()).mapNotNull { idx ->
-                            val imageUrl = imagesArray.optString(idx)
-                                .takeIf { it.isNotBlank() }
+                            val imageUrl = when (val item = imagesArray.get(idx)) {
+                                is String -> item
+                                is JSONObject -> item.optString("url")
+                                    .ifBlank { item.optString("src") }
+                                else -> null
+                            }?.takeIf { it.isNotBlank() }
                                 ?: return@mapNotNull null
                             
                             MangaPage(
@@ -188,13 +206,24 @@ internal class Lavatoons(context: MangaLoaderContext) :
         
         val afterPrefix = script.substringAfter(prefix)
         val jsonText = if (suffix.isNotEmpty()) {
-            afterPrefix.substringBefore(suffix)
+            // Handle multiple possible endings
+            var text = afterPrefix
+            for (end in listOf(suffix, "\n", "\r")) {
+                if (text.contains(end)) {
+                    text = text.substringBefore(end)
+                    break
+                }
+            }
+            text
         } else {
             afterPrefix
         }.trim()
         
+        // Remove trailing comma or semicolon if present
+        val cleaned = jsonText.trimEnd(',', ';')
+        
         // Validate it looks like JSON
-        return jsonText.takeIf { 
+        return cleaned.takeIf { 
             (it.startsWith("{") && it.endsWith("}")) || 
             (it.startsWith("[") && it.endsWith("]"))
         }
