@@ -71,15 +71,22 @@ internal class MangaTek(context: MangaLoaderContext) :
             val link = card.attr("href")
             val slug = link.removePrefix("/manga/")
             
+            // الإصلاح: نختار h3 الموجود داخل div.absolute.bottom-0 فقط
+            val title = card.selectFirst("div.absolute.bottom-0 h3")?.text()?.trim()
+                ?: return@mapNotNull null
+            
+            // إصلاح التقييم: نختار span الذي يحتوي على i.fa-star
+            val ratingText = card.selectFirst("span:has(i.fa-star) span")?.text()
+            val rating = ratingText?.toFloatOrNull()?.div(10) ?: RATING_UNKNOWN
+            
             Manga(
                 id = generateUid(slug),
                 url = slug,
                 publicUrl = "https://${domain.replace("api.", "")}$link",
-                title = card.selectFirst("h3, span.text-white")?.text() ?: return@mapNotNull null,
+                title = title,
                 coverUrl = card.selectFirst("img")?.src(),
                 altTitles = emptySet(),
-                rating = card.selectFirst("span:has(i.fa-star)")?.text()
-                    ?.replace(Regex("[^0-9.]"), "")?.toFloatOrNull()?.div(10) ?: RATING_UNKNOWN,
+                rating = rating,
                 tags = emptySet(),
                 authors = emptySet(),
                 state = null,
