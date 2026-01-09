@@ -19,8 +19,8 @@ internal class MangaMello(context: MangaLoaderContext) :
 
     override val configKeyDomain = ConfigKey.Domain("plus.mangamello.com")
     
-override val iconUrl =
-    "https://raw.githubusercontent.com/hany18h/kotatsu-parsers/master/src/main/kotlin/org/koitharu/kotatsu/parsers/icons/MangamelloPlus.webp"
+    override val iconUrl =
+        "https://raw.githubusercontent.com/hany18h/kotatsu-parsers/master/src/main/kotlin/org/koitharu/kotatsu/parsers/icons/MangamelloPlus.webp"
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
@@ -221,7 +221,8 @@ override val iconUrl =
             )
         }
 
-        return chapters.sortedBy { it.number }.reversed()
+        // ✅ الترتيب الصحيح: من الأقدم للأحدث (ascending)
+        return chapters.sortedBy { it.number }
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
