@@ -9,7 +9,7 @@ import org.koitharu.kotatsu.parsers.model.MangaPage
 import org.koitharu.kotatsu.parsers.model.MangaParserSource
 import org.koitharu.kotatsu.parsers.site.mangareader.MangaReaderParser
 import org.koitharu.kotatsu.parsers.util.*
-import org.koitharu.kotatsu.parsers.network.UserAgents
+import okhttp3.Headers
 
 @MangaSourceParser("LAVATOONS", "Lavatoons", "ar", ContentType.MANGA)
 internal class Lavatoons(context: MangaLoaderContext) :
@@ -27,14 +27,14 @@ internal class Lavatoons(context: MangaLoaderContext) :
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterUrl = chapter.url.toAbsoluteUrl(domain)
         
-        // استخدام httpGet بدون cache للحصول على محتوى جديد دائماً
-        val doc = webClient.httpGet(chapterUrl) {
-            // إزالة If-Modified-Since header لتجنب 304 response
-            headers.remove("If-Modified-Since")
-            // إضافة Cache-Control لفرض طلب جديد
-            header("Cache-Control", "no-cache")
-            header("Pragma", "no-cache")
-        }.parseHtml()
+        // إنشاء headers مخصصة لتجنب 304 Not Modified
+        val customHeaders = Headers.Builder()
+            .add("Cache-Control", "no-cache, no-store, must-revalidate")
+            .add("Pragma", "no-cache")
+            .add("Expires", "0")
+            .build()
+        
+        val doc = webClient.httpGet(chapterUrl, customHeaders).parseHtml()
         
         // ===== METHOD 1: Try JSON (ts_reader.run) =====
         val pagesFromJson = tryGetPagesFromJson(doc)
@@ -54,8 +54,8 @@ internal class Lavatoons(context: MangaLoaderContext) :
             return pagesFromAltJson
         }
         
-        // If all methods failed, throw exception for debugging
-        throw IllegalStateException("Failed to extract pages from chapter: $chapterUrl")
+        // If all methods failed, return empty list
+        return emptyList()
     }
     
     /**
