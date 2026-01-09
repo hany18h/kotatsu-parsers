@@ -22,6 +22,82 @@ internal class Lavatoons(context: MangaLoaderContext) :
     // تغيير URL القائمة
     override val listUrl = "/browse-manga"
     
+    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        val url = buildString {
+            append("https://")
+            append(domain)
+
+            when {
+                !filter.query.isNullOrEmpty() -> {
+                    // البحث يستخدم الجذر مباشرة
+                    append("/?s=")
+                    append(filter.query.urlEncoded())
+                    append("&page=")
+                    append(page.toString())
+                }
+
+                else -> {
+                    append(listUrl)
+                    append("/?order=")
+                    append(
+                        when (order) {
+                            SortOrder.ALPHABETICAL -> "title"
+                            SortOrder.ALPHABETICAL_DESC -> "titlereverse"
+                            SortOrder.NEWEST -> "latest"
+                            SortOrder.POPULARITY -> "popular"
+                            SortOrder.UPDATED -> "update"
+                            else -> "update"
+                        },
+                    )
+
+                    filter.tags.forEach {
+                        append("&")
+                        append("genre[]".urlEncoded())
+                        append("=")
+                        append(it.key)
+                    }
+
+                    filter.tagsExclude.forEach {
+                        append("&")
+                        append("genre[]".urlEncoded())
+                        append("=-")
+                        append(it.key)
+                    }
+
+                    if (filter.states.isNotEmpty()) {
+                        filter.states.oneOrThrowIfMany()?.let {
+                            append("&status=")
+                            when (it) {
+                                MangaState.ONGOING -> append("ongoing")
+                                MangaState.FINISHED -> append("completed")
+                                MangaState.PAUSED -> append("hiatus")
+                                else -> append("")
+                            }
+                        }
+                    }
+
+                    filter.types.oneOrThrowIfMany()?.let {
+                        append("&type=")
+                        append(
+                            when (it) {
+                                ContentType.MANGA -> "manga"
+                                ContentType.MANHWA -> "manhwa"
+                                ContentType.MANHUA -> "manhua"
+                                ContentType.COMICS -> "comic"
+                                ContentType.NOVEL -> "novel"
+                                else -> ""
+                            },
+                        )
+                    }
+
+                    append("&page=")
+                    append(page.toString())
+                }
+            }
+        }
+        return parseMangaList(webClient.httpGet(url).parseHtml())
+    }
+    
     // المحددات الصحيحة من HTML الفعلي
     override val selectMangaList = "div.manga-list-grid article.legend-card"
     override val selectMangaListImg = "img.legend-img"
