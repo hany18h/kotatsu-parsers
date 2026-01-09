@@ -15,7 +15,7 @@ internal class Lavatoons(context: MangaLoaderContext) :
     MangaReaderParser(
         context,
         MangaParserSource.LAVATOONS,
-        "lavatoons.com",
+        "lavascans.com",
         pageSize = 20,
         searchPageSize = 10,
     ) {
