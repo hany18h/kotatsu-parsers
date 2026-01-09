@@ -73,11 +73,9 @@ internal class MangaTek(context: MangaLoaderContext) :
             
             val slug = link.removePrefix("/manga/")
             
-            // الإصلاح: نختار h3 فقط (العنوان الحقيقي)
             val title = card.selectFirst("h3")?.text()?.trim()
             if (title.isNullOrEmpty()) return@mapNotNull null
             
-            // التقييم: نختار span الداخلي اللي جوا span:has(i.fa-star)
             val ratingElement = card.selectFirst("span:has(i.fa-star) > span:not(:has(i))")
             val rating = ratingElement?.text()?.toFloatOrNull()?.div(10) ?: RATING_UNKNOWN
             
@@ -132,32 +130,8 @@ internal class MangaTek(context: MangaLoaderContext) :
         val ratingText = doc.selectFirst("span:has(i.fa-star)")?.text()
         val rating = ratingText?.replace(Regex("[^0-9.]"), "")?.toFloatOrNull()?.div(10) ?: manga.rating
         
-        // Extract chapters
-        val chapters = doc.select("div.manga-chapter a, div.grid a[href^='/reader/']").mapChapters(reversed = true) { index, element ->
-            val chapterUrl = element.attr("href")
-            val chapterTitle = element.selectFirst("h3")?.text() ?: "Chapter ${index + 1}"
-            
-            // Extract chapter number from title like "الفصل 240"
-            val chapterNumber = chapterTitle.replace(Regex("[^0-9.]"), "").toFloatOrNull() ?: (index + 1f)
-            
-            // Extract date
-            val dateText = element.selectFirst("span:has(i.fa-calendar-alt)")?.text()
-                ?: element.selectFirst("p.text-sm")?.text()
-            
-            val uploadDate = parseDate(dateText)
-            
-            MangaChapter(
-                id = generateUid(chapterUrl),
-                title = chapterTitle,
-                number = chapterNumber,
-                volume = 0,
-                url = chapterUrl,
-                uploadDate = uploadDate,
-                source = source,
-                scanlator = null,
-                branch = null,
-            )
-        }
+        // ===== الإصلاح: جلب جميع الفصول من كل الصفحات =====
+        val chapters = fetchAllChapters(manga.url)
         
         return manga.copy(
             title = title,
@@ -167,6 +141,81 @@ internal class MangaTek(context: MangaLoaderContext) :
             rating = rating,
             chapters = chapters,
         )
+    }
+
+    /**
+     * جلب جميع الفصول من كل الصفحات
+     * يتعامل مع الـ pagination الخاص بالموقع
+     */
+    private suspend fun fetchAllChapters(mangaSlug: String): List<MangaChapter> {
+        val allChapters = mutableListOf<MangaChapter>()
+        var currentPage = 1
+        var hasMorePages = true
+        
+        while (hasMorePages) {
+            val pageUrl = "https://$domain/manga/$mangaSlug?page=$currentPage"
+            val doc = webClient.httpGet(pageUrl).parseHtml()
+            
+            // استخراج الفصول من الصفحة الحالية
+            val chapterElements = doc.select("div.manga-chapter a, div.grid a[href^='/reader/']")
+            
+            if (chapterElements.isEmpty()) {
+                hasMorePages = false
+                break
+            }
+            
+            chapterElements.forEach { element ->
+                val chapterUrl = element.attr("href")
+                if (chapterUrl.isEmpty()) return@forEach
+                
+                val chapterTitle = element.selectFirst("h3")?.text() ?: "Chapter"
+                
+                // استخراج رقم الفصل من العنوان مثل "الفصل 240" أو "Chapter 240"
+                val chapterNumber = chapterTitle
+                    .replace(Regex("[^0-9.]"), "")
+                    .toFloatOrNull() 
+                    ?: allChapters.size.toFloat() + 1f
+                
+                // استخراج التاريخ
+                val dateText = element.selectFirst("span:has(i.fa-calendar-alt)")?.text()
+                    ?: element.selectFirst("p.text-sm")?.text()
+                
+                val uploadDate = parseDate(dateText)
+                
+                allChapters.add(
+                    MangaChapter(
+                        id = generateUid(chapterUrl),
+                        title = chapterTitle,
+                        number = chapterNumber,
+                        volume = 0,
+                        url = chapterUrl,
+                        uploadDate = uploadDate,
+                        source = source,
+                        scanlator = null,
+                        branch = null,
+                    )
+                )
+            }
+            
+            // التحقق من وجود صفحة تالية
+            // نفترض أن الموقع يعرض أقصى عدد محدد من الفصول في كل صفحة
+            // إذا كانت عدد الفصول في الصفحة الحالية أقل من الحد الأقصى، فهذا يعني أننا وصلنا للنهاية
+            val chaptersPerPage = 50 // قد تحتاج لتعديل هذا الرقم حسب الموقع
+            
+            if (chapterElements.size < chaptersPerPage) {
+                hasMorePages = false
+            } else {
+                currentPage++
+                
+                // حماية من اللوب اللانهائي (حد أقصى 100 صفحة)
+                if (currentPage > 100) {
+                    hasMorePages = false
+                }
+            }
+        }
+        
+        // ترتيب الفصول من الأحدث للأقدم (أو العكس حسب الموقع)
+        return allChapters.reversed()
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
