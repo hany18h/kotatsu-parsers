@@ -20,15 +20,13 @@ internal class Murim(context: MangaLoaderContext) :
 	override val sateFinished: String = "مكتمل"
 	override val sateAbandoned: String = "متروك"
 
-	// Tags موجودة في div.chaptertags
 	override val selectTags = "div.chaptertags a, article div.mt-15 a"
 	
-	// الصور موجودة في div.check-box
+	// تحديث selector الصفحات لدعم data-src و src
 	override val selectPage = "div.check-box img"
 
 	override suspend fun fetchAvailableTags(): Set<MangaTag> {
 		val doc = webClient.httpGet("https://$domain").parseHtml()
-		// الأقسام موجودة في PageList1
 		return doc.selectFirstOrThrow("#PageList1").select("ul li a").mapToSet {
 			MangaTag(
 				key = it.attr("href").substringAfterLast('/').substringBefore('?'),
@@ -41,7 +39,6 @@ internal class Murim(context: MangaLoaderContext) :
 	override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
 		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
 		
-		// استخراج الحالة
 		val state = doc.selectFirst("div.y6x11p:contains(الحالة) .dt") 
 			?: doc.selectFirst("div.y6x11p:contains(Status) .dt")
 		val mangaState = state?.text()?.lowercase().let {
@@ -54,12 +51,9 @@ internal class Murim(context: MangaLoaderContext) :
 			}
 		}
 		
-		// استخراج المؤلف
 		val author = doc.selectFirst("div.y6x11p:contains(الكاتب) .dt") 
 			?: doc.selectFirst("div.y6x11p:contains(Author) .dt")
 		
-		// استخراج الوصف - في صفحة الفصل لا يوجد وصف، نحتاج للذهاب للصفحة الرئيسية
-		// لكن في حالة Murim، الصفحات ليس بها وصف واضح
 		val description = doc.select("div.max-w.pen p").firstOrNull { p ->
 			val text = p.text()
 			text.isNotEmpty() && 
@@ -87,13 +81,11 @@ internal class Murim(context: MangaLoaderContext) :
 	}
 
 	override suspend fun loadChapters(mangaUrl: String, doc: Document): List<MangaChapter> {
-		// محاولة استخراج اسم السلسلة من أماكن متعددة
 		val seriesName = doc.selectFirst("h1.m-0 a[rel='tag']")?.text()
 			?: doc.selectFirst("ol[itemtype*=BreadcrumbList] li:nth-child(2) a span")?.text()
 			?: doc.selectFirst("div.tac a[rel='tag']")?.text()
 			?: doc.selectFirst("h1 a[data]")?.attr("data")
 			?: run {
-				// محاولة أخيرة: البحث في breadcrumb
 				val breadcrumbLinks = doc.select("ol[itemtype*=BreadcrumbList] li a")
 				if (breadcrumbLinks.size >= 2) {
 					breadcrumbLinks[1].text()
@@ -126,7 +118,6 @@ internal class Murim(context: MangaLoaderContext) :
 				.getString("href")
 			val dateText = j.getJSONObject("published").getString("\$t").substringBefore("T")
 			
-			// تجاهل صفحة المانجا الرئيسية
 			val slug = mangaUrl.substringAfterLast('/').substringBefore('?').substringBefore(".html")
 			val slugChapter = href.substringAfterLast('/').substringBefore('?').substringBefore(".html")
 			if (slug == slugChapter) {
@@ -144,6 +135,29 @@ internal class Murim(context: MangaLoaderContext) :
 				scanlator = null,
 				source = source,
 			)
+		}
+	}
+
+	// Override getPages لدعم data-src
+	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
+		
+		return doc.select(selectPage).mapNotNull { img ->
+			// محاولة الحصول على الصورة من data-src أولاً، ثم src
+			val url = img.attr("data-src").ifEmpty { 
+				img.attr("src") 
+			}
+			
+			if (url.isNotEmpty() && url != "data:image/png;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=") {
+				MangaPage(
+					id = generateUid(url),
+					url = url,
+					preview = null,
+					source = source,
+				)
+			} else {
+				null
+			}
 		}
 	}
 }
