@@ -355,26 +355,59 @@ internal class Azoramoon(context: MangaLoaderContext) :
 		return chaptersMap.values.sortedBy { it.number }
 	}
 
-	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val fullUrl = chapter.url.toAbsoluteUrl(domain)
-		val doc = webClient.httpGet(fullUrl).parseHtml()
+    override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+        val fullUrl = chapter.url.toAbsoluteUrl(domain)
+        val doc = webClient.httpGet(fullUrl).parseHtml()
 
-		return doc.select("div.comic-images-wrapper img, div.chapter-images img, img[data-index]")
-			.mapNotNull { img ->
-				val imageUrl = img.attr("data-src").ifEmpty { img.src() }
-				if (imageUrl?.isNotBlank() == true && !imageUrl.startsWith("data:image")) {
-					val finalUrl = imageUrl.toRelativeUrl(domain)
-					MangaPage(
-						id = generateUid(finalUrl),
-						url = finalUrl,
-						preview = null,
-						source = source,
-					)
-				} else {
-					null
-				}
-			}
-			.distinct()
-	}
+        val scripts = doc.select("script:containsData(__next_f.push)")
 
+        for (script in scripts) {
+            val scriptContent = script.data()
+
+            if (!scriptContent.contains("\\\"images\\\":")) {
+                continue
+            }
+
+            val imagesMatch = Regex("""\\\"images\\\":\[([\s\S]*?)\],\\\"""").find(scriptContent)
+
+            if (imagesMatch != null) {
+                val escapedImagesJson = "[${imagesMatch.groupValues[1]}]"
+
+                val imagesJson = escapedImagesJson
+                    .replace("\\\\", "\u0000")
+                    .replace("\\\"", "\"")
+                    .replace("\u0000", "\\")
+
+                try {
+                    val imagesArray = JSONArray(imagesJson)
+                    val pages = mutableListOf<MangaPage>()
+
+                    for (i in 0 until imagesArray.length()) {
+                        val imageObj = imagesArray.getJSONObject(i)
+                        val imageUrl = imageObj.optString("url")
+
+                        if (imageUrl.isNotBlank()) {
+                            pages.add(
+                                MangaPage(
+                                    id = generateUid(imageUrl),
+                                    url = imageUrl,
+                                    preview = null,
+                                    source = source,
+                                )
+                            )
+                        }
+                    }
+
+                    if (pages.isNotEmpty()) {
+                        return pages
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    continue
+                }
+            }
+        }
+
+        throw Exception("Failed to extract chapter images from page")
+    }
 }
