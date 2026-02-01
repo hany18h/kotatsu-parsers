@@ -19,395 +19,397 @@ import java.util.Base64
 import java.util.EnumSet
 
 internal abstract class MangaReaderParser(
-    context: MangaLoaderContext,
-    source: MangaParserSource,
-    domain: String,
-    pageSize: Int,
-    searchPageSize: Int,
+	context: MangaLoaderContext,
+	source: MangaParserSource,
+	domain: String,
+	pageSize: Int,
+	searchPageSize: Int,
 ) : PagedMangaParser(context, source, pageSize, searchPageSize), Interceptor {
 
-    override val configKeyDomain = ConfigKey.Domain(domain)
+	override val configKeyDomain = ConfigKey.Domain(domain)
 
-    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
-        super.onCreateConfig(keys)
-        keys.add(userAgentKey)
-    }
+	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+		super.onCreateConfig(keys)
+		keys.add(userAgentKey)
+	}
 
-    override val availableSortOrders: Set<SortOrder>
-        get() = EnumSet.of(
-            SortOrder.UPDATED,
-            SortOrder.POPULARITY,
-            SortOrder.ALPHABETICAL,
-            SortOrder.ALPHABETICAL_DESC,
-            SortOrder.NEWEST,
-        )
+	override val availableSortOrders: Set<SortOrder>
+		get() = EnumSet.of(
+			SortOrder.UPDATED,
+			SortOrder.POPULARITY,
+			SortOrder.ALPHABETICAL,
+			SortOrder.ALPHABETICAL_DESC,
+			SortOrder.NEWEST,
+		)
 
-    override val filterCapabilities: MangaListFilterCapabilities
-        get() = MangaListFilterCapabilities(
-            isMultipleTagsSupported = true,
-            isTagsExclusionSupported = true,
-            isSearchSupported = true,
-        )
+	override val filterCapabilities: MangaListFilterCapabilities
+		get() = MangaListFilterCapabilities(
+			isMultipleTagsSupported = true,
+			isTagsExclusionSupported = true,
+			isSearchSupported = true,
+		)
 
-    override suspend fun getFilterOptions() = MangaListFilterOptions(
-        availableTags = getOrCreateTagMap().values.toSet(),
-        availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED, MangaState.PAUSED),
-        availableContentTypes = EnumSet.of(
-            ContentType.MANGA,
-            ContentType.MANHWA,
-            ContentType.MANHUA,
-            ContentType.COMICS,
-            ContentType.NOVEL,
-        ),
-    )
+	override suspend fun getFilterOptions() = MangaListFilterOptions(
+		availableTags = getOrCreateTagMap().values.toSet(),
+		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED, MangaState.PAUSED),
+		availableContentTypes = EnumSet.of(
+			ContentType.MANGA,
+			ContentType.MANHWA,
+			ContentType.MANHUA,
+			ContentType.COMICS,
+			ContentType.NOVEL,
+		),
+	)
 
-    protected open val listUrl = "/manga"
-    protected open val datePattern = "MMMM d, yyyy"
-    protected open val isNetShieldProtected = false
+	protected open val listUrl = "/manga"
+	protected open val datePattern = "MMMM d, yyyy"
+	protected open val isNetShieldProtected = false
 
-    protected var tagCache: ArrayMap<String, MangaTag>? = null
-    protected val mutex = Mutex()
+	protected var tagCache: ArrayMap<String, MangaTag>? = null
+	protected val mutex = Mutex()
 
-    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        val url = buildString {
-            append("https://")
-            append(domain)
+	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+		val url = buildString {
+			append("https://")
+			append(domain)
 
-            when {
-                !filter.query.isNullOrEmpty() -> {
-                    append("/page/")
-                    append(page.toString())
-                    append("/?s=")
-                    append(filter.query.urlEncoded())
-                }
+			when {
 
-                else -> {
-                    append(listUrl)
-                    append("/?order=")
-                    append(
-                        when (order) {
-                            SortOrder.ALPHABETICAL -> "title"
-                            SortOrder.ALPHABETICAL_DESC -> "titlereverse"
-                            SortOrder.NEWEST -> "latest"
-                            SortOrder.POPULARITY -> "popular"
-                            SortOrder.UPDATED -> "update"
-                            else -> ""
-                        },
-                    )
+				!filter.query.isNullOrEmpty() -> {
+					append("/page/")
+					append(page.toString())
+					append("/?s=")
+					append(filter.query.urlEncoded())
+				}
 
-                    filter.tags.forEach {
-                        append("&")
-                        append("genre[]".urlEncoded())
-                        append("=")
-                        append(it.key)
-                    }
+				else -> {
+					append(listUrl)
 
-                    filter.tagsExclude.forEach {
-                        append("&")
-                        append("genre[]".urlEncoded())
-                        append("=-")
-                        append(it.key)
-                    }
+					append("/?order=")
+					append(
+						when (order) {
+							SortOrder.ALPHABETICAL -> "title"
+							SortOrder.ALPHABETICAL_DESC -> "titlereverse"
+							SortOrder.NEWEST -> "latest"
+							SortOrder.POPULARITY -> "popular"
+							SortOrder.UPDATED -> "update"
+							else -> ""
+						},
+					)
 
-                    if (filter.states.isNotEmpty()) {
-                        filter.states.oneOrThrowIfMany()?.let {
-                            append("&status=")
-                            when (it) {
-                                MangaState.ONGOING -> append("ongoing")
-                                MangaState.FINISHED -> append("completed")
-                                MangaState.PAUSED -> append("hiatus")
-                                else -> append("")
-                            }
-                        }
-                    }
+					filter.tags.forEach {
+						append("&")
+						append("genre[]".urlEncoded())
+						append("=")
+						append(it.key)
+					}
 
-                    filter.types.oneOrThrowIfMany()?.let {
-                        append("&type=")
-                        append(
-                            when (it) {
-                                ContentType.MANGA -> "manga"
-                                ContentType.MANHWA -> "manhwa"
-                                ContentType.MANHUA -> "manhua"
-                                ContentType.COMICS -> "comic"
-                                ContentType.NOVEL -> "novel"
-                                else -> ""
-                            },
-                        )
-                    }
+					filter.tagsExclude.forEach {
+						append("&")
+						append("genre[]".urlEncoded())
+						append("=-")
+						append(it.key)
+					}
 
-                    append("&page=")
-                    append(page.toString())
-                }
-            }
-        }
-        return parseMangaList(webClient.httpGet(url).parseHtml())
-    }
+					if (filter.states.isNotEmpty()) {
+						filter.states.oneOrThrowIfMany()?.let {
+							append("&status=")
+							when (it) {
+								MangaState.ONGOING -> append("ongoing")
+								MangaState.FINISHED -> append("completed")
+								MangaState.PAUSED -> append("hiatus")
+								else -> append("")
+							}
+						}
+					}
 
-    protected open val selectMangaList = ".postbody .listupd .bs .bsx"
-    protected open val selectMangaListImg = "img.ts-post-image"
-    protected open val selectMangaListTitle = "div.tt"
+					filter.types.oneOrThrowIfMany()?.let {
+						append("&type=")
+						append(
+							when (it) {
+								ContentType.MANGA -> "manga"
+								ContentType.MANHWA -> "manhwa"
+								ContentType.MANHUA -> "manhua"
+								ContentType.COMICS -> "comic"
+								ContentType.NOVEL -> "novel"
+								else -> ""
+							},
+						)
+					}
 
-    protected open fun parseMangaList(docs: Document): List<Manga> {
-        return docs.select(selectMangaList).mapNotNull {
-            val a = it.selectFirst("a") ?: return@mapNotNull null
-            val relativeUrl = a.attrAsRelativeUrl("href")
-            val rating = it.selectFirst(".numscore")?.text()
-                ?.toFloatOrNull()?.div(10) ?: RATING_UNKNOWN
-            Manga(
-                id = generateUid(relativeUrl),
-                url = relativeUrl,
-                title = it.selectFirst(selectMangaListTitle)?.text() ?: a.attr("title"),
-                altTitles = emptySet(),
-                publicUrl = a.attrAsAbsoluteUrl("href"),
-                rating = rating,
-                contentRating = if (isNsfwSource) ContentRating.ADULT else null,
-                coverUrl = it.selectFirst(selectMangaListImg)?.src(),
-                tags = emptySet(),
-                state = null,
-                authors = emptySet(),
-                source = source,
-            )
-        }
-    }
+					append("&page=")
+					append(page.toString())
+				}
+			}
+		}
+		return parseMangaList(webClient.httpGet(url).parseHtml())
+	}
 
-    protected open val selectChapter = "#chapterlist > ul > li"
-    override suspend fun getDetails(manga: Manga): Manga {
-        val docs = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
-        val dateFormat = SimpleDateFormat(datePattern, sourceLocale)
-        val chapters = docs.select(selectChapter).mapChapters(reversed = true) { index, element ->
-            val url = element.selectFirst("a")?.attrAsRelativeUrl("href") ?: return@mapChapters null
-            MangaChapter(
-                id = generateUid(url),
-                title = element.selectFirst(".chapternum")?.textOrNull(),
-                url = url,
-                number = index + 1f,
-                volume = 0,
-                scanlator = null,
-                uploadDate = dateFormat.parseSafe(element.selectFirst(".chapterdate")?.text()),
-                branch = null,
-                source = source,
-            )
-        }
-        return parseInfo(docs, manga, chapters)
-    }
+	protected open val selectMangaList = ".postbody .listupd .bs .bsx"
+	protected open val selectMangaListImg = "img.ts-post-image"
+	protected open val selectMangaListTitle = "div.tt"
 
-    protected open val detailsDescriptionSelector = "div.entry-content"
+	protected open fun parseMangaList(docs: Document): List<Manga> {
+		return docs.select(selectMangaList).mapNotNull {
+			val a = it.selectFirst("a") ?: return@mapNotNull null
+			val relativeUrl = a.attrAsRelativeUrl("href")
+			val rating = it.selectFirst(".numscore")?.text()
+				?.toFloatOrNull()?.div(10) ?: RATING_UNKNOWN
+			Manga(
+				id = generateUid(relativeUrl),
+				url = relativeUrl,
+				title = it.selectFirst(selectMangaListTitle)?.text() ?: a.attr("title"),
+				altTitles = emptySet(),
+				publicUrl = a.attrAsAbsoluteUrl("href"),
+				rating = rating,
+				contentRating = if (isNsfwSource) ContentRating.ADULT else null,
+				coverUrl = it.selectFirst(selectMangaListImg)?.src(),
+				tags = emptySet(),
+				state = null,
+				authors = emptySet(),
+				source = source,
+			)
+		}
+	}
 
-    open suspend fun parseInfo(docs: Document, manga: Manga, chapters: List<MangaChapter>): Manga {
-        val tableMode =
-            docs.selectFirst("div.seriestucontent > div.seriestucontentr") ?: docs.selectFirst("div.seriestucontentr")
-            ?: docs.selectFirst("div.seriestucon")
+	protected open val selectChapter = "#chapterlist > ul > li"
+	override suspend fun getDetails(manga: Manga): Manga {
+		val docs = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
+		val dateFormat = SimpleDateFormat(datePattern, sourceLocale)
+		val chapters = docs.select(selectChapter).mapChapters(reversed = true) { index, element ->
+			val url = element.selectFirst("a")?.attrAsRelativeUrlOrNull("href") ?: return@mapChapters null
+			MangaChapter(
+				id = generateUid(url),
+				title = element.selectFirst(".chapternum")?.textOrNull(),
+				url = url,
+				number = index + 1f,
+				volume = 0,
+				scanlator = null,
+				uploadDate = dateFormat.parseSafe(element.selectFirst(".chapterdate")?.text()),
+				branch = null,
+				source = source,
+			)
+		}
+		return parseInfo(docs, manga, chapters)
+	}
 
-        val tagMap = getOrCreateTagMap()
+	protected open val detailsDescriptionSelector = "div.entry-content"
 
-        val selectTag = if (tableMode != null) {
-            docs.select(".seriestugenre > a")
-        } else {
-            docs.select(".wd-full .mgen > a")
-        }
+	open suspend fun parseInfo(docs: Document, manga: Manga, chapters: List<MangaChapter>): Manga {
+		/// set if is table
+		val tableMode =
+			docs.selectFirst("div.seriestucontent > div.seriestucontentr") ?: docs.selectFirst("div.seriestucontentr")
+			?: docs.selectFirst("div.seriestucon")
 
-        val tags = selectTag.mapNotNullToSet { tagMap[it.text()] }
+		val tagMap = getOrCreateTagMap()
 
-        val stateSelect = if (tableMode != null) {
-            tableMode.selectFirst(".infotable td:contains(Status)")
-                ?: tableMode.selectFirst(".infotable td:contains(Statut)")
-                ?: tableMode.selectFirst(".infotable td:contains(حالة العمل)")
-                ?: tableMode.selectFirst(".infotable td:contains(الحالة)")
-                ?: tableMode.selectFirst(".infotable td:contains(Estado)")
-                ?: tableMode.selectFirst(".infotable td:contains(สถานะ)")
-                ?: tableMode.selectFirst(".infotable td:contains(Stato )")
-                ?: tableMode.selectFirst(".infotable td:contains(Durum)")
-                ?: tableMode.selectFirst(".infotable td:contains(Statüsü)")
-        } else {
-            docs.selectFirst(".tsinfo div:contains(Status)") ?: docs.selectFirst(".tsinfo div:contains(Statut)")
-            ?: docs.selectFirst(".tsinfo div:contains(حالة العمل)") ?: docs.selectFirst(".tsinfo div:contains(Estado)")
-            ?: docs.selectFirst(".tsinfo div:contains(สถานะ)") ?: docs.selectFirst(".tsinfo div:contains(Stato )")
-            ?: docs.selectFirst(".tsinfo div:contains(Durum)") ?: docs.selectFirst(".tsinfo div:contains(Statüsü)")
-            ?: docs.selectFirst(".tsinfo div:contains(Statü)") ?: docs.selectFirst(".tsinfo div:contains(الحالة)")
-        }
+		val selectTag = if (tableMode != null) {
+			docs.select(".seriestugenre > a")
+		} else {
+			docs.select(".wd-full .mgen > a")
+		}
 
-        val state = if (tableMode != null) {
-            stateSelect?.lastElementSibling()
-        } else {
-            stateSelect?.lastElementChild()
-        }
+		val tags = selectTag.mapNotNullToSet { tagMap[it.text()] }
 
-        val mangaState = state?.let {
-            when (it.text()) {
-                "مستمرة", "En curso", "En Curso", "Ongoing", "OnGoing", "On going", "Ativo", "En Cours", "En cours",
-                "En cours \uD83D\uDFE2", "En cours de publication", "Đang tiến hành", "Em lançamento", "em lançamento",
-                "Em Lançamento", "Онгоінг", "Publishing", "Devam Ediyor", "Em Andamento", "In Corso", "Güncel",
-                "Berjalan", "Продолжается", "Updating", "Lançando", "In Arrivo", "Emision", "En emision", "مستمر",
-                "Curso", "En marcha", "Publicandose", "Publicando", "连载中", "Devam ediyor", "Devam Etmekte" ->
-                    MangaState.ONGOING
+		val stateSelect = if (tableMode != null) {
+			tableMode.selectFirst(".infotable td:contains(Status)")
+				?: tableMode.selectFirst(".infotable td:contains(Statut)")
+				?: tableMode.selectFirst(".infotable td:contains(حالة العمل)")
+				?: tableMode.selectFirst(".infotable td:contains(الحالة)")
+				?: tableMode.selectFirst(".infotable td:contains(Estado)")
+				?: tableMode.selectFirst(".infotable td:contains(สถานะ)")
+				?: tableMode.selectFirst(".infotable td:contains(Stato )")
+				?: tableMode.selectFirst(".infotable td:contains(Durum)")
+				?: tableMode.selectFirst(".infotable td:contains(Statüsü)")
 
-                "Completed", "Completo", "Complété", "Fini", "Achevé", "Terminé", "Terminé ⚫", "Tamamlandı",
-                "Đã hoàn thành", "Hoàn Thành", "مكتملة", "Завершено", "Finished", "Finalizado", "Completata",
-                "One-Shot", "Bitti", "Tamat", "Completado", "Concluído", "Concluido", "已完结", "Bitmiş" ->
-                    MangaState.FINISHED
+		} else {
+			docs.selectFirst(".tsinfo div:contains(Status)") ?: docs.selectFirst(".tsinfo div:contains(Statut)")
+			?: docs.selectFirst(".tsinfo div:contains(حالة العمل)") ?: docs.selectFirst(".tsinfo div:contains(Estado)")
+			?: docs.selectFirst(".tsinfo div:contains(สถานะ)") ?: docs.selectFirst(".tsinfo div:contains(Stato )")
+			?: docs.selectFirst(".tsinfo div:contains(Durum)") ?: docs.selectFirst(".tsinfo div:contains(Statüsü)")
+			?: docs.selectFirst(".tsinfo div:contains(Statü)") ?: docs.selectFirst(".tsinfo div:contains(الحالة)")
+		}
 
-                "Canceled", "Cancelled", "Cancelado", "cancellato", "Cancelados", "Dropped", "Discontinued",
-                "abandonné", "Abandonné" ->
-                    MangaState.ABANDONED
+		val state = if (tableMode != null) {
+			stateSelect?.lastElementSibling()
 
-                "Hiatus", "On Hold", "Pausado", "En espera", "En pause", "En Pause", "En attente" ->
-                    MangaState.PAUSED
+		} else {
+			stateSelect?.lastElementChild()
+		}
 
-                else -> null
-            }
-        }
+		val mangaState = state?.let {
+			when (it.text()) {
 
-        val author = tableMode?.selectFirst(".infotable td:contains(Author)")?.lastElementSibling()?.textOrNull()
-            ?: docs.selectFirst(".tsinfo div:contains(Author)")?.lastElementChild()?.textOrNull()
-            ?: docs.selectFirst(".tsinfo div:contains(Auteur)")?.lastElementChild()?.textOrNull()
-            ?: docs.selectFirst(".tsinfo div:contains(Artist)")?.lastElementChild()?.textOrNull()
-            ?: docs.selectFirst(".tsinfo div:contains(Durum)")?.lastElementChild()?.textOrNull()
+				"مستمرة", "En curso", "En Curso", "Ongoing", "OnGoing", "On going", "Ativo", "En Cours", "En cours", "En cours \uD83D\uDFE2",
+				"En cours de publication", "Đang tiến hành", "Em lançamento", "em lançamento", "Em Lançamento", "Онгоінг", "Publishing",
+				"Devam Ediyor", "Em Andamento", "In Corso", "Güncel", "Berjalan", "Продолжается", "Updating", "Lançando", "In Arrivo", "Emision",
+				"En emision", "مستمر", "Curso", "En marcha", "Publicandose", "Publicando", "连载中", "Devam ediyor", "Devam Etmekte",
+					-> MangaState.ONGOING
 
-        val nsfw = docs.selectFirst(".restrictcontainer") != null
-            || docs.selectFirst(".info-right .alr") != null
-            || docs.selectFirst(".postbody .alr") != null
+				"Completed", "Completo", "Complété", "Fini", "Achevé", "Terminé", "Terminé ⚫", "Tamamlandı", "Đã hoàn thành", "Hoàn Thành",
+				"مكتملة", "Завершено", "Finished", "Finalizado", "Completata", "One-Shot", "Bitti", "Tamat", "Completado", "Concluído",
+				"Concluido", "已完结", "Bitmiş",
+					-> MangaState.FINISHED
 
-        val title = docs.selectFirst("h1.entry-title")?.text()
-            ?: docs.selectFirst("h1")?.text()
-            ?: docs.selectFirst(".entry-title")?.text()
-            ?: docs.selectFirst(".seriestucontent h1")?.text()
-            ?: docs.selectFirst(".postbody h1")?.text()
-            ?: docs.selectFirst("title")?.text()?.substringBefore(" - ")?.trim()
-            ?: manga.title
+				"Canceled", "Cancelled", "Cancelado", "cancellato", "Cancelados", "Dropped", "Discontinued", "abandonné", "Abandonné",
+					-> MangaState.ABANDONED
 
-        return manga.copy(
-            title = title,
-            description = docs.selectFirst(detailsDescriptionSelector)?.text(),
-            state = mangaState,
-            authors = setOfNotNull(author),
-            contentRating = if (manga.contentRating == ContentRating.ADULT || nsfw) {
-                ContentRating.ADULT
-            } else {
-                ContentRating.SAFE
-            },
-            tags = tags,
-            chapters = chapters,
-        )
-    }
+				"Hiatus", "On Hold", "Pausado", "En espera", "En pause", "En Pause", "En attente",
+					-> MangaState.PAUSED
 
-    override suspend fun getRelatedManga(seed: Manga): List<Manga> {
-        return parseMangaList(webClient.httpGet(seed.url.toAbsoluteUrl(domain)).parseHtml())
-    }
+				else -> null
+			}
+		}
 
-    protected open val encodedSrc = false
-    protected open val selectScript = "div.wrapper script"
-    protected open val selectPage = "div#readerarea img"
+		val author = tableMode?.selectFirst(".infotable td:contains(Author)")?.lastElementSibling()?.textOrNull()
+			?: docs.selectFirst(".tsinfo div:contains(Author)")?.lastElementChild()?.textOrNull()
+			?: docs.selectFirst(".tsinfo div:contains(Auteur)")?.lastElementChild()?.textOrNull()
+			?: docs.selectFirst(".tsinfo div:contains(Artist)")?.lastElementChild()?.textOrNull()
+			?: docs.selectFirst(".tsinfo div:contains(Durum)")?.lastElementChild()?.textOrNull()
 
-    // التعديل المهم
-    protected open val selectTestScript =
-        "script#ts-reader, script:contains(ts_reader), script:contains(ts_reader.run)"
+		val nsfw = docs.selectFirst(".restrictcontainer") != null
+			|| docs.selectFirst(".info-right .alr") != null
+			|| docs.selectFirst(".postbody .alr") != null
 
-    override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val chapterUrl = chapter.url.toAbsoluteUrl(domain)
-        val docs = webClient.httpGet(chapterUrl).parseHtml()
+		val title = docs.selectFirst("h1.entry-title")?.text()
+			?: docs.selectFirst("h1")?.text()
+			?: docs.selectFirst(".entry-title")?.text()
+			?: docs.selectFirst(".seriestucontent h1")?.text()
+			?: docs.selectFirst(".postbody h1")?.text()
+			?: docs.selectFirst("title")?.text()?.substringBefore(" - ")?.trim()
+			?: manga.title
 
-        val script = docs.select(selectTestScript).firstOrNull()
+		return manga.copy(
+			title = title,
+			description = docs.selectFirst(detailsDescriptionSelector)?.text(),
+			state = mangaState,
+			authors = setOfNotNull(author),
+			contentRating = if (manga.contentRating == ContentRating.ADULT || nsfw) {
+				ContentRating.ADULT
+			} else {
+				ContentRating.SAFE
+			},
+			tags = tags,
+			chapters = chapters,
+		)
+	}
 
-        // fallback الصور العادية
-        if (script == null) {
-            return docs.select(selectPage).map { img ->
-                val url = img.requireSrc().toRelativeUrl(domain)
-                MangaPage(
-                    id = generateUid(url),
-                    url = url,
-                    preview = null,
-                    source = source,
-                )
-            }
-        }
+	override suspend fun getRelatedManga(seed: Manga): List<Manga> {
+		return parseMangaList(webClient.httpGet(seed.url.toAbsoluteUrl(domain)).parseHtml())
+	}
 
-        val raw = when {
-            script.attr("id") == "ts-reader" -> script.html()
-            else -> script.data()
-        }.trim()
+	protected open val encodedSrc = false
+	protected open val selectScript = "div.wrapper script"
+	protected open val selectPage = "div#readerarea img"
 
-        val jsonText = when {
-            raw.contains("ts_reader.run(") ->
-                raw.substringAfter("ts_reader.run(").substringBeforeLast(")")
-            raw.startsWith("{") && raw.endsWith("}") ->
-                raw
-            else ->
-                throw IllegalStateException("ts_reader JSON not found")
-        }.trim()
+	protected open val selectTestScript = "script:containsData(ts_reader)"
+	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+		val docs = webClient.httpGet(chapterUrl).parseHtml()
 
-        val jsonObj = JSONObject(jsonText)
-        val imagesArray = jsonObj.getJSONArray("sources")
-            .getJSONObject(0)
-            .getJSONArray("images")
+		val test = docs.select(selectTestScript)
+		if (test.isNullOrEmpty() and !encodedSrc) {
+			return docs.select(selectPage).map { img ->
+				val url = img.requireSrc().toRelativeUrl(domain)
+				MangaPage(
+					id = generateUid(url),
+					url = url,
+					preview = null,
+					source = source,
+				)
+			}
+		} else {
+			val images = if (encodedSrc) {
+				val script = docs.select(selectScript)
+				var decode = ""
+				for (i in script) {
+					if (i.attr("src").startsWith("data:text/javascript;base64,")) {
+						decode = Base64.getDecoder().decode(i.attr("src").replace("data:text/javascript;base64,", ""))
+							.decodeToString()
+						if (decode.startsWith("ts_reader.run")) {
+							break
+						}
+					}
+				}
+				JSONObject(decode.substringAfter('(').substringBeforeLast(')'))
+					.getJSONArray("sources")
+					.getJSONObject(0)
+					.getJSONArray("images")
 
-        val pages = ArrayList<MangaPage>(imagesArray.length())
+			} else {
+				val script = docs.selectFirstOrThrow(selectTestScript)
+				JSONObject(script.data().substringAfter('(').substringBeforeLast(')'))
+					.getJSONArray("sources")
+					.getJSONObject(0)
+					.getJSONArray("images")
+			}
 
-        for (i in 0 until imagesArray.length()) {
-            val url = imagesArray.getString(i)
-            pages.add(
-                MangaPage(
-                    id = generateUid(url),
-                    url = url,
-                    preview = null,
-                    source = source,
-                )
-            )
-        }
+			val pages = ArrayList<MangaPage>(images.length())
+			for (i in 0 until images.length()) {
+				pages.add(
+					MangaPage(
+						id = generateUid(images.getString(i)),
+						url = images.getString(i),
+						preview = null,
+						source = source,
+					),
+				)
+			}
+			return pages
+		}
+	}
 
-        return pages
-    }
+	protected open suspend fun getOrCreateTagMap(): Map<String, MangaTag> = mutex.withLock {
+		tagCache?.let { return@withLock it }
+		val url = listUrl.toAbsoluteUrl(domain)
+		val tagElements = webClient.httpGet(url).parseHtml().select("ul.genrez > li")
+		val tagMap = ArrayMap<String, MangaTag>(tagElements.size)
+		for (el in tagElements) {
+			tagMap[el.text()] = MangaTag(
+				title = el.textOrNull()?.toTitleCase(sourceLocale) ?: continue,
+				key = el.selectFirst("input")?.attrOrNull("value") ?: continue,
+				source = source,
+			)
+		}
+		tagCache = tagMap
+		return@withLock tagMap
+	}
 
-    protected open suspend fun getOrCreateTagMap(): Map<String, MangaTag> = mutex.withLock {
-        tagCache?.let { return@withLock it }
-        val url = listUrl.toAbsoluteUrl(domain)
-        val tagElements = webClient.httpGet(url).parseHtml().select("ul.genrez > li")
-        val tagMap = ArrayMap<String, MangaTag>(tagElements.size)
-        for (el in tagElements) {
-            tagMap[el.text()] = MangaTag(
-                title = el.textOrNull()?.toTitleCase(sourceLocale) ?: continue,
-                key = el.selectFirst("input")?.attrOrNull("value") ?: continue,
-                source = source,
-            )
-        }
-        tagCache = tagMap
-        return@withLock tagMap
-    }
+	override fun intercept(chain: Interceptor.Chain): Response {
+		val response = chain.proceed(chain.request())
+		if (!isNetShieldProtected) {
+			return response
+		}
+		val contentType = response.mimeType
+		if (
+			contentType?.endsWith("/html") != false &&
+			context.cookieJar.getCookies(domain).none { it.name.contains("NetShield") }
+		) {
+			val cookie = runBlocking { response.copy().parseHtml().getNetShieldCookie() } ?: return response
+			context.cookieJar.insertCookie(domain, cookie)
+			return chain.proceed(response.request.newBuilder().build()).also {
+				response.closeQuietly()
+			}
+		}
+		return response
+	}
 
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val response = chain.proceed(chain.request())
-        if (!isNetShieldProtected) {
-            return response
-        }
-        val contentType = response.mimeType
-        if (
-            contentType?.endsWith("/html") != false &&
-            context.cookieJar.getCookies(domain).none { it.name.contains("NetShield") }
-        ) {
-            val cookie = runBlocking { response.copy().parseHtml().getNetShieldCookie() } ?: return response
-            context.cookieJar.insertCookie(domain, cookie)
-            return chain.proceed(response.request.newBuilder().build()).also {
-                response.closeQuietly()
-            }
-        }
-        return response
-    }
+	private suspend fun Document.getNetShieldCookie(): Cookie? = runCatchingCancellable {
+		val script = select("script").firstNotNullOfOrNull { s ->
+			s.html().takeIf { x -> x.contains("slowAES.decrypt") }
+		} ?: return@runCatchingCancellable null
+		val min = webClient.httpGet("https://$domain/min.js").parseRaw()
+		val res = context.evaluateJs(min + "\n\n" + script.replace(Regex("document.cookie\\s*=\\s*"), "return "))
+		res?.let {
+			Cookie.parse(baseUri().toHttpUrl(), it)
+		}
+	}.getOrNull()
 
-    private suspend fun Document.getNetShieldCookie(): Cookie? = runCatchingCancellable {
-        val script = select("script").firstNotNullOfOrNull { s ->
-            s.html().takeIf { x -> x.contains("slowAES.decrypt") }
-        } ?: return@runCatchingCancellable null
-        val min = webClient.httpGet("https://$domain/min.js").parseRaw()
-        val res = context.evaluateJs(min + "\n\n" + script.replace(Regex("document.cookie\\s*=\\s*"), "return "))
-        res?.let {
-            Cookie.parse(baseUri().toHttpUrl(), it)
-        }
-    }.getOrNull()
-
-    override suspend fun resolveLink(resolver: LinkResolver, link: HttpUrl): Manga? {
-        val mangaSlug = link.pathSegments[1].nullIfEmpty() ?: return null
-        val url = "/manga/$mangaSlug/"
-        return resolver.resolveManga(
-            this, url, generateUid(url),
-        )
-    }
+	override suspend fun resolveLink(resolver: LinkResolver, link: HttpUrl): Manga? {
+		val mangaSlug = link.pathSegments[1].nullIfEmpty() ?: return null
+		val url = "/manga/$mangaSlug/"
+		return resolver.resolveManga(
+			this, url, generateUid(url),
+		)
+	}
 }
