@@ -76,53 +76,59 @@ internal class RocksManga(context: MangaLoaderContext) :
 			append("https://")
 			append(domain)
 
-			if (page > 0) {
-				append("/page/")
-				append(page + 1)
-			}
-
-			append("/?post_type=wp-manga")
-
-			append("&s=")
-			filter.query?.let {
-				append(it.urlEncoded())
-			}
-
-			filter.types.forEach { contentType ->
-				val typeKey = when (contentType) {
-					ContentType.MANGA -> "manga"
-					ContentType.MANHUA -> "manhua"
-					ContentType.MANHWA -> "manhwa"
-					ContentType.COMICS -> "comic"
-					ContentType.ONE_SHOT -> "one-shot"
-					else -> null
+			// For search, use simpler URL structure
+			if (!filter.query.isNullOrEmpty()) {
+				if (page > 0) {
+					append("/page/")
+					append(page + 1)
 				}
-				typeKey?.let {
-					append("&type[]=")
-					append(it)
+				append("/?s=")
+				append(filter.query.urlEncoded())
+			} else {
+				// For browsing without search
+				if (page > 0) {
+					append("/page/")
+					append(page + 1)
 				}
-			}
 
-			filter.states.forEach { state ->
-				val statusKey = when (state) {
-					MangaState.ONGOING -> "on-going"
-					MangaState.FINISHED -> "end"
-					MangaState.PAUSED -> "on-hold"
-					MangaState.UPCOMING -> "upcoming"
-					else -> null
-				}
-				statusKey?.let {
-					append("&status[]=")
-					append(it)
-				}
-			}
+				append("/?post_type=wp-manga")
 
-			append("&sort=")
-			when (order) {
-				SortOrder.ALPHABETICAL -> append("title_az")
-				SortOrder.POPULARITY -> append("most_viewed")
-				SortOrder.UPDATED, SortOrder.NEWEST -> append("recently_added")
-				else -> append("recently_added")
+				filter.types.forEach { contentType ->
+					val typeKey = when (contentType) {
+						ContentType.MANGA -> "manga"
+						ContentType.MANHUA -> "manhua"
+						ContentType.MANHWA -> "manhwa"
+						ContentType.COMICS -> "comic"
+						ContentType.ONE_SHOT -> "one-shot"
+						else -> null
+					}
+					typeKey?.let {
+						append("&type[]=")
+						append(it)
+					}
+				}
+
+				filter.states.forEach { state ->
+					val statusKey = when (state) {
+						MangaState.ONGOING -> "on-going"
+						MangaState.FINISHED -> "end"
+						MangaState.PAUSED -> "on-hold"
+						MangaState.UPCOMING -> "upcoming"
+						else -> null
+					}
+					statusKey?.let {
+						append("&status[]=")
+						append(it)
+					}
+				}
+
+				append("&sort=")
+				when (order) {
+					SortOrder.ALPHABETICAL -> append("title_az")
+					SortOrder.POPULARITY -> append("most_viewed")
+					SortOrder.UPDATED, SortOrder.NEWEST -> append("recently_added")
+					else -> append("recently_added")
+				}
 			}
 		}
 
@@ -138,32 +144,47 @@ internal class RocksManga(context: MangaLoaderContext) :
 	}
 
 	override fun parseMangaList(doc: Document): List<Manga> {
-		val items = doc.select("div.original.card-lg div.unit")
+		// Try both selectors - search results and browse results
+		val items = doc.select("div.original.card-lg div.unit").ifEmpty {
+			doc.select("div.card-body div.unit")
+		}
 
-		return items.map { unit ->
-			val posterLink = unit.selectFirstOrThrow("a.poster")
-			val href = posterLink.attr("href").toRelativeUrl(domain)
+		if (items.isEmpty()) {
+			return emptyList()
+		}
 
-			val img = posterLink.selectFirst("img")
+		return items.mapNotNull { unit ->
+			try {
+				val posterLink = unit.selectFirst("a.poster") ?: return@mapNotNull null
+				val href = posterLink.attr("href").toRelativeUrl(domain)
 
-			val info = unit.selectFirst("div.info")
-			val titleLink = info?.selectFirst("a")
-			val title = titleLink?.text()?.trim() ?: "Unknown"
+				val img = posterLink.selectFirst("img")
 
-			Manga(
-				id = generateUid(href),
-				url = href,
-				publicUrl = href.toAbsoluteUrl(domain),
-				coverUrl = img?.src(),
-				title = title,
-				altTitles = emptySet(),
-				rating = RATING_UNKNOWN,
-				tags = emptySet(),
-				authors = emptySet(),
-				state = null,
-				source = source,
-				contentRating = ContentRating.SAFE,
-			)
+				val info = unit.selectFirst("div.info")
+				val titleLink = info?.selectFirst("a")
+				val title = titleLink?.text()?.trim() ?: posterLink.attr("title").trim()
+
+				if (title.isEmpty() || href.isEmpty()) {
+					return@mapNotNull null
+				}
+
+				Manga(
+					id = generateUid(href),
+					url = href,
+					publicUrl = href.toAbsoluteUrl(domain),
+					coverUrl = img?.src(),
+					title = title,
+					altTitles = emptySet(),
+					rating = RATING_UNKNOWN,
+					tags = emptySet(),
+					authors = emptySet(),
+					state = null,
+					source = source,
+					contentRating = ContentRating.SAFE,
+				)
+			} catch (e: Exception) {
+				null
+			}
 		}
 	}
 
@@ -248,7 +269,6 @@ internal class RocksManga(context: MangaLoaderContext) :
 		return doc.body().select("ul.scroll-sm li.item").mapChapters(reversed = true) { i, li ->
 			val a = li.selectFirstOrThrow("a")
 			val href = a.attr("href").toRelativeUrl(domain)
-			// Don't append stylePage - use the href as-is
 			val link = href
 
 			val chapterText = a.attr("title").takeIf { it.isNotBlank() }
@@ -282,7 +302,7 @@ internal class RocksManga(context: MangaLoaderContext) :
 		val container = doc.selectFirst("div#ch-images")
 			?: doc.selectFirst("div.reading-content")
 			?: doc.selectFirst("div.pages")
-			?: doc.parseFailed("Page container not found. Tried: div#ch-images, div.reading-content, div.pages")
+			?: doc.parseFailed("Page container not found")
 
 		// Try multiple image selectors
 		val imageElements = container.select("img.preload-image").ifEmpty {
@@ -292,7 +312,7 @@ internal class RocksManga(context: MangaLoaderContext) :
 		}
 
 		if (imageElements.isEmpty()) {
-			doc.parseFailed("No images found in page container at: $fullUrl")
+			doc.parseFailed("No images found in page container")
 		}
 
 		return imageElements.mapNotNull { imgElement ->
