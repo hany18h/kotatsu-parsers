@@ -5,7 +5,6 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONObject
-import org.jsoup.Jsoup
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -24,16 +23,10 @@ internal class Waveteamy(context: MangaLoaderContext) :
     
     override val iconUrl =
         "https://raw.githubusercontent.com/hany18h/kotatsu-parsers/master/src/main/kotlin/org/koitharu/kotatsu/parsers/icons/Waveteamy.png"
-        
-    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
-        super.onCreateConfig(keys)
-        keys.add(userAgentKey)
-    }
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
 
-        // Remove Content-Encoding header to avoid issues
         if (originalRequest.method == "POST") {
             val newRequest = originalRequest.newBuilder()
                 .removeHeader("Content-Encoding")
@@ -581,13 +574,7 @@ internal class Waveteamy(context: MangaLoaderContext) :
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val url = "https://$domain${chapter.url}"
         
-        // CRITICAL FIX: Don't send Content-Encoding header
-        val headers = Headers.Builder()
-            .add("User-Agent", userAgentKey.value)
-            .add("Referer", "https://$domain/")
-            .build()
-        
-        val doc = webClient.httpGet(url, headers).parseHtml()
+        val doc = webClient.httpGet(url).parseHtml()
 
         val allScripts = doc.select("script")
         val scriptContent = allScripts.find { script ->
@@ -622,7 +609,6 @@ internal class Waveteamy(context: MangaLoaderContext) :
             return imagePath
         }
 
-        // JWT token format check
         if (imagePath.contains(".") && imagePath.matches(Regex("^[A-Za-z0-9_=-]+\\.[A-Za-z0-9_=-]+$"))) {
             return "https://wcloud.site/$imagePath"
         }
