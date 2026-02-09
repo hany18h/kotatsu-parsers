@@ -68,10 +68,10 @@ internal class Waveteamy(context: MangaLoaderContext) :
         val doc = webClient.httpGet(url).parseHtml()
         
         // استخراج البيانات من الصفحة الرئيسية
-        val scripts = doc.select("script")
+        val scripts = doc.select("script:not([src])")
         val scriptContent = scripts.find { script ->
             val html = script.html()
-            html.contains("initialData") && html.contains("chapters")
+            html.contains("\"chapters\":[") && html.contains("\"postId\":")
         }?.html()
 
         if (scriptContent == null) {
@@ -86,64 +86,41 @@ internal class Waveteamy(context: MangaLoaderContext) :
     }
 
     private fun extractMangaListFromScript(scriptContent: String): List<Manga> {
-        // البحث عن initialData.chapters في النص
-        val chaptersStart = scriptContent.indexOf("\"chapters\":[")
-        if (chaptersStart == -1) return emptyList()
-
-        val arrayStart = chaptersStart + "\"chapters\":".length
+        // البحث عن بيانات initialData في صيغة Next.js
+        // الصيغة: "initialData":{"chapters":[...]}
+        val dataPattern = """"initialData":\{[^}]*"chapters":\[([^\]]+(?:\][^\]]*\[)*[^\]]*)\]""".toRegex()
+        val match = dataPattern.find(scriptContent) ?: return emptyList()
         
-        // البحث عن نهاية المصفوفة
-        var depth = 0
-        var inString = false
-        var escape = false
-        var arrayEnd = arrayStart
-
-        for (i in arrayStart until scriptContent.length) {
-            val char = scriptContent[i]
-
-            when {
-                escape -> escape = false
-                char == '\\' -> escape = true
-                char == '"' && !escape -> inString = !inString
-                !inString -> {
-                    when (char) {
-                        '[' -> depth++
-                        ']' -> {
-                            depth--
-                            if (depth == 0) {
-                                arrayEnd = i + 1
-                                break
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (depth != 0) return emptyList()
-
-        val chaptersJson = scriptContent.substring(arrayStart, arrayEnd)
-            .replace("\\\"", "\"")
-            .replace("\\\\", "\\")
-
-        val chaptersArray = org.json.JSONArray(chaptersJson)
+        // استخراج محتوى chapters array
+        val chaptersContent = match.groupValues[1]
         
-        return (0 until chaptersArray.length()).mapNotNull { i ->
+        // تحليل كل عنصر في المصفوفة
+        val itemPattern = """\{([^}]+)\}""".toRegex()
+        val items = itemPattern.findAll(chaptersContent)
+        
+        return items.mapNotNull { itemMatch ->
             try {
-                val item = chaptersArray.getJSONObject(i)
+                val itemContent = itemMatch.groupValues[1]
                 
-                // تصفية المحتوى للبالغين - تجاهل أي عمل يحتوي على كلمات مفتاحية مشبوهة
-                val title = item.optString("title", "")
-                val imageUrl = item.optString("imageUrl", "")
+                // استخراج الحقول
+                val postId = """"postId":(\d+)""".toRegex().find(itemContent)?.groupValues?.get(1)?.toLongOrNull()
+                val title = """"title":"([^"]+)"""".toRegex().find(itemContent)?.groupValues?.get(1)
+                val imageUrl = """"imageUrl":"([^"]+)"""".toRegex().find(itemContent)?.groupValues?.get(1)
+                val ratingValue = """"ratingValue":"([^"]+)"""".toRegex().find(itemContent)?.groupValues?.get(1)
+                val genre = """"genre":"([^"]+)"""".toRegex().find(itemContent)?.groupValues?.get(1)
+                val statusValue = """"statusValue":(\d+)""".toRegex().find(itemContent)?.groupValues?.get(1)?.toIntOrNull()
                 
-                // قائمة الكلمات المفتاحية للمحتوى غير المناسب
+                if (postId == null || title == null || imageUrl == null) {
+                    return@mapNotNull null
+                }
+                
+                // تصفية المحتوى للبالغين
                 val suspiciousKeywords = listOf(
                     "adult", "18+", "hentai", "ecchi", "mature",
                     "nsfw", "xxx", "porn", "sex", "breast",
-                    "nude", "naked", "ero"
+                    "nude", "naked", "ero", "boob"
                 )
                 
-                // فحص العنوان والصورة
                 val titleLower = title.lowercase()
                 val imageLower = imageUrl.lowercase()
                 
@@ -151,53 +128,48 @@ internal class Waveteamy(context: MangaLoaderContext) :
                     titleLower.contains(it) || imageLower.contains(it)
                 }
                 
-                // تجاهل المحتوى المشبوه
                 if (isSuspicious) {
-                    null
-                } else {
-                    parseMangaFromChapterItem(item)
+                    return@mapNotNull null
                 }
+                
+                // تحويل التقييم
+                val rating = ratingValue?.toFloatOrNull()?.div(2f) ?: RATING_UNKNOWN
+                
+                // تحويل الحالة
+                val state = when (statusValue) {
+                    0 -> MangaState.ONGOING
+                    1 -> MangaState.FINISHED
+                    2 -> MangaState.PAUSED
+                    else -> MangaState.ONGOING
+                }
+                
+                // تحويل الأنواع
+                val genres = genre?.split(",")?.mapNotNull { 
+                    val trimmed = it.trim()
+                    if (trimmed.isNotEmpty()) MangaTag(key = trimmed, title = trimmed, source = source) else null
+                }?.toSet() ?: emptySet()
+                
+                Manga(
+                    id = generateUid(postId),
+                    title = title,
+                    url = "/series/$postId",
+                    publicUrl = "https://$domain/series/$postId",
+                    coverUrl = resolveCover(imageUrl),
+                    source = source,
+                    rating = rating,
+                    altTitles = emptySet(),
+                    contentRating = ContentRating.SAFE,
+                    tags = genres,
+                    state = state,
+                    authors = emptySet(),
+                    largeCoverUrl = null,
+                    description = null,
+                    chapters = null,
+                )
             } catch (e: Exception) {
                 null
             }
-        }
-    }
-
-    private fun parseMangaFromChapterItem(json: JSONObject): Manga {
-        val id = json.getLong("postId")
-        val title = json.getString("title")
-        val cover = json.getString("imageUrl")
-        val rating = json.optString("ratingValue", "0").toFloatOrNull()?.div(2f) ?: RATING_UNKNOWN
-        val statusVal = json.optInt("statusValue")
-        val state = when (statusVal) {
-            0 -> MangaState.ONGOING
-            1 -> MangaState.FINISHED
-            2 -> MangaState.PAUSED
-            else -> MangaState.ONGOING
-        }
-        
-        val genres = json.optString("genre", "").split(",").mapNotNull { 
-            val trimmed = it.trim()
-            if (trimmed.isNotEmpty()) MangaTag(key = trimmed, title = trimmed, source = source) else null
-        }.toSet()
-
-        return Manga(
-            id = generateUid(id),
-            title = title,
-            url = "/series/$id",
-            publicUrl = "https://$domain/series/$id",
-            coverUrl = resolveCover(cover),
-            source = source,
-            rating = rating,
-            altTitles = emptySet(),
-            contentRating = ContentRating.SAFE,
-            tags = genres,
-            state = state,
-            authors = emptySet(),
-            largeCoverUrl = null,
-            description = null,
-            chapters = null,
-        )
+        }.toList()
     }
 
     private suspend fun getSearch(query: String, page: Int): List<Manga> {
@@ -291,6 +263,23 @@ internal class Waveteamy(context: MangaLoaderContext) :
         }
 
         return "https://$domain/$path"
+    }
+
+    private fun resolveImageUrl(path: String): String {
+        // إذا كان URL كامل
+        if (path.startsWith("http")) return path
+        
+        // إذا كان base64 encoded path (eyJ...)
+        if (path.matches(Regex("^[A-Za-z0-9+/=]+\\.[a-f0-9]+$"))) {
+            return "https://wcloud.site/$path"
+        }
+        
+        // إذا كان مسار عادي
+        if (path.startsWith("projects/") || path.startsWith("series/")) {
+            return "https://wcloud.site/$path"
+        }
+        
+        return "https://wcloud.site/$path"
     }
 
     override suspend fun getDetails(manga: Manga): Manga {
@@ -662,7 +651,7 @@ internal class Waveteamy(context: MangaLoaderContext) :
         val url = "https://$domain${chapter.url}"
         val doc = webClient.httpGet(url).parseHtml()
 
-        val allScripts = doc.select("script")
+        val allScripts = doc.select("script:not([src])")
         val scriptContent = allScripts.find { script ->
             val html = script.html()
             html.contains("currentChapter") && html.contains("images")
@@ -679,15 +668,9 @@ internal class Waveteamy(context: MangaLoaderContext) :
         }
 
         return images.mapIndexed { i, imagePath ->
-            val imageUrl = if (imagePath.startsWith("http")) {
-                imagePath
-            } else {
-                "https://wcloud.site/$imagePath"
-            }
-
             MangaPage(
                 id = generateUid("${chapter.id}-$i"),
-                url = imageUrl,
+                url = resolveImageUrl(imagePath),
                 preview = null,
                 source = source
             )
@@ -695,6 +678,20 @@ internal class Waveteamy(context: MangaLoaderContext) :
     }
 
     private fun extractImagesFromScript(scriptContent: String): List<String> {
+        // البحث عن currentChapter.images في الصيغة المضمنة
+        // الصيغة قد تكون مع escape: \"images\":[\"] أو بدون: "images":["
+        
+        // محاولة الصيغة العادية أولاً
+        val normalPattern = """"images":\[([^\]]+)\]""".toRegex()
+        val normalMatch = normalPattern.find(scriptContent)
+        
+        if (normalMatch != null) {
+            val imagesContent = normalMatch.groupValues[1]
+            val imagePattern = """"([^"]+)"""".toRegex()
+            return imagePattern.findAll(imagesContent).map { it.groupValues[1] }.toList()
+        }
+        
+        // محاولة الصيغة مع escape characters
         val currentChapterStart = scriptContent.indexOf("\\\"currentChapter\\\":{")
         if (currentChapterStart == -1) return emptyList()
 
@@ -733,11 +730,15 @@ internal class Waveteamy(context: MangaLoaderContext) :
             .replace("\\\"", "\"")
             .replace("\\\\", "\\")
 
-        val currentChapter = JSONObject(currentChapterJson)
-        val imagesArray = currentChapter.optJSONArray("images") ?: return emptyList()
+        try {
+            val currentChapter = JSONObject(currentChapterJson)
+            val imagesArray = currentChapter.optJSONArray("images") ?: return emptyList()
 
-        return (0 until imagesArray.length()).map { i ->
-            imagesArray.getString(i)
+            return (0 until imagesArray.length()).map { i ->
+                imagesArray.getString(i)
+            }
+        } catch (e: Exception) {
+            return emptyList()
         }
     }
 }
