@@ -52,15 +52,14 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
                 .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
                 .build(),
         )
-        // إصلاح Content-Type الغلط
         val contentType = response.header("Content-Type") ?: ""
         if (contentType.contains("octet-stream")) {
-            val url = request.url.toString()
+            val path = request.url.encodedPath  // <-- هذا التغيير المهم
             val fixedType = when {
-                url.endsWith(".avif") -> "image/avif"
-                url.endsWith(".webp") -> "image/webp"
-                url.endsWith(".jpg") || url.endsWith(".jpeg") -> "image/jpeg"
-                url.endsWith(".png") -> "image/png"
+                path.endsWith(".avif") -> "image/avif"
+                path.endsWith(".webp") -> "image/webp"
+                path.endsWith(".jpg") || path.endsWith(".jpeg") -> "image/jpeg"
+                path.endsWith(".png") -> "image/png"
                 else -> "image/jpeg"
             }
             response.newBuilder()
