@@ -199,27 +199,43 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	// نحفظ URL المرجع بصيغة: prochan-page://{chapterId}/{index}/{imagePath}
 	// ثم في getPageUrl نجلب token جديد في كل مرة
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val parts     = chapter.url.split("/").filter { it.isNotEmpty() }
-		val chapterId = parts.getOrNull(4) ?: return emptyList()
+    val parts     = chapter.url.split("/").filter { it.isNotEmpty() }
+    val chapterId = parts.getOrNull(4) ?: return emptyList()
 
-		val json   = webClient.httpGet("https://$domain/api/public/chapters/$chapterId").parseJson()
-		val images = json.optJSONArray("images") ?: run {
-			json.optJSONObject("metadata")?.optJSONArray("images")
-		} ?: return emptyList()
+    val json    = webClient.httpGet("https://$domain/api/public/chapters/$chapterId").parseJson()
+    val cdnPath = json.optString("cdn_path").takeIf { it.isNotEmpty() } ?: "cdn2"
+    val images  = json.optJSONArray("images") 
+        ?: json.optJSONObject("metadata")?.optJSONArray("images") 
+        ?: return emptyList()
+    val meta    = json.optJSONObject("metadata") ?: JSONObject()
+    val maps    = meta.optJSONArray("maps") ?: JSONArray()
 
-		return (0 until images.length()).mapNotNull { i ->
-			val imagePath = images.optString(i).takeIf { it.isNotEmpty() } ?: return@mapNotNull null
-			// نحفظ مرجع داخلي فقط، بدون token
-			MangaPage(
-				id      = generateUid("${chapter.id}-$i"),
-				url     = "prochan-page://$chapterId/$i$imagePath",
-				preview = null,
-				source  = source,
-			)
-		}
-	}
+    return (0 until images.length()).mapNotNull { i ->
+        val imagePath = images.optString(i).takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+        val token     = maps.optJSONObject(i)?.optString("token")
+        
+        val finalUrl = buildString {
+            append("https://")
+            append(cdnPath)
+            append(".prochan.pro")
+            append(imagePath)
+            if (!token.isNullOrEmpty()) {
+                append("?token=")
+                append(token)
+            }
+        }
+        
+        MangaPage(
+            id      = generateUid("${chapter.id}-$i"),
+            url     = finalUrl,
+            preview = null,
+            source  = source,
+        )
+    }
+}
 
-	override suspend fun getPageUrl(page: MangaPage): String {
+// getPageUrl تصبح بسيطة جداً
+override suspend fun getPageUrl(page: MangaPage): String = page.url {
 		// prochan-page://{chapterId}/{index}/{imagePath}
 		val raw       = page.url
 		val chapterId = raw.removePrefix("prochan-page://").substringBefore("/")
