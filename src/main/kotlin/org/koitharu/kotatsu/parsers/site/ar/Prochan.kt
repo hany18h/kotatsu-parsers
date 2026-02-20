@@ -53,14 +53,29 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
                 .build(),
         )
         val contentType = response.header("Content-Type") ?: ""
-        if (contentType.contains("octet-stream")) {
-            val path = request.url.encodedPath  // <-- هذا التغيير المهم
+        if (contentType.contains("octet-stream") || contentType.isEmpty()) {
+            // استخدم المسار فقط بدون query parameters
+            val path = request.url.encodedPath.lowercase()
             val fixedType = when {
                 path.endsWith(".avif") -> "image/avif"
                 path.endsWith(".webp") -> "image/webp"
                 path.endsWith(".jpg") || path.endsWith(".jpeg") -> "image/jpeg"
                 path.endsWith(".png") -> "image/png"
-                else -> "image/jpeg"
+                path.endsWith(".gif") -> "image/gif"
+                else -> {
+                    // كشف الصيغة من أول بايتات الملف (magic bytes)
+                    val body = response.body
+                    if (body != null) {
+                        val source = body.source()
+                        source.request(16)
+                        val bytes = source.buffer.snapshot().toByteArray()
+                        val detected = detectImageType(bytes)
+                        return response.newBuilder()
+                            .header("Content-Type", detected)
+                            .build()
+                    }
+                    "image/jpeg"
+                }
             }
             response.newBuilder()
                 .header("Content-Type", fixedType)
@@ -70,6 +85,30 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
         }
     } else {
         chain.proceed(request)
+    }
+}
+
+private fun detectImageType(bytes: ByteArray): String {
+    if (bytes.size < 4) return "image/jpeg"
+    return when {
+        // JPEG: FF D8 FF
+        bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() -> "image/jpeg"
+        // PNG: 89 50 4E 47
+        bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() 
+            && bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte() -> "image/png"
+        // GIF: 47 49 46
+        bytes[0] == 0x47.toByte() && bytes[1] == 0x49.toByte() 
+            && bytes[2] == 0x46.toByte() -> "image/gif"
+        // WEBP: RIFF....WEBP
+        bytes[0] == 0x52.toByte() && bytes[1] == 0x49.toByte() 
+            && bytes[2] == 0x46.toByte() && bytes[3] == 0x46.toByte()
+            && bytes.size >= 12 && bytes[8] == 0x57.toByte() 
+            && bytes[9] == 0x45.toByte() && bytes[10] == 0x42.toByte() 
+            && bytes[11] == 0x50.toByte() -> "image/webp"
+        // AVIF: ....ftypavif أو ftypavis
+        bytes.size >= 12 && bytes[4] == 0x66.toByte() && bytes[5] == 0x74.toByte()
+            && bytes[6] == 0x79.toByte() && bytes[7] == 0x70.toByte() -> "image/avif"
+        else -> "image/jpeg"
     }
 }
 
