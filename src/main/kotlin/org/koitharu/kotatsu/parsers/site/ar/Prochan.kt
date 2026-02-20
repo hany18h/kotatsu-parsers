@@ -2,7 +2,6 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import okhttp3.Headers
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONArray
@@ -44,30 +43,22 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	// ─────────────────────────────────────────────
-	// INTERCEPTOR — fix image requests
+	// INTERCEPTOR — add Referer for CDN images
 	// ─────────────────────────────────────────────
 
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
-		val url = request.url.toString()
-
-		// Add proper headers for image requests from CDN
-		if (url.contains("cdn3.prochan.pro") ||
-			url.contains("app.prochan.pro") ||
-			url.endsWith(".avif") ||
-			url.endsWith(".webp") ||
-			url.endsWith(".jpg") ||
-			url.endsWith(".png")
-		) {
-			val newRequest = request.newBuilder()
-				.header("Referer", "https://prochan.pro/")
-				.header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
-				.header("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
-				.build()
-			return chain.proceed(newRequest)
+		val host = request.url.host
+		return if (host.contains("prochan")) {
+			chain.proceed(
+				request.newBuilder()
+					.header("Referer", "https://prochan.pro/")
+					.header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+					.build(),
+			)
+		} else {
+			chain.proceed(request)
 		}
-
-		return chain.proceed(request)
 	}
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions()
@@ -161,14 +152,16 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	// ─────────────────────────────────────────────
 
 	private suspend fun fetchChapters(mangaUrl: String): List<MangaChapter> {
+		// mangaUrl = /series/{type}/{id}/{slug}
 		val parts = mangaUrl.split("/").filter { it.isNotEmpty() }
 		if (parts.size < 3) return emptyList()
 
 		val type = parts[1]
 		val id   = parts[2]
 
-		val url  = "https://$domain/api/public/$type/$id/chapters?page=1&limit=2000&order=asc"
-		val json = webClient.httpGet(url).parseJson()
+		val json = webClient.httpGet(
+			"https://$domain/api/public/$type/$id/chapters?page=1&limit=2000&order=asc",
+		).parseJson()
 		val data = json.optJSONArray("data") ?: return emptyList()
 
 		return data.mapJSONNotNull { item ->
@@ -200,74 +193,49 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	// ─────────────────────────────────────────────
-	// PAGES
+	// PAGES  ← الحل الجديد باستخدام API مع tokens
 	// ─────────────────────────────────────────────
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val doc        = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-		val scriptData = collectNextScripts(doc)
+		// chapter.url = /series/{type}/{id}/{slug}/{chapterId}/{chapterNumber}
+		val parts     = chapter.url.split("/").filter { it.isNotEmpty() }
+		val chapterId = parts.getOrNull(4) ?: return emptyList()
 
-		val pages = parseAppImages(scriptData, chapter)
-		if (pages.isNotEmpty()) return pages
+		// API: /api/public/chapters/{chapterId}
+		// يرجع: cdn_path, images[], metadata.maps[].token
+		val json      = webClient.httpGet("https://$domain/api/public/chapters/$chapterId").parseJson()
+		val cdnPath   = json.optString("cdn_path", "cdn3")  // "cdn3" أو "cdn2"
+		val cdnHost   = "https://$cdnPath.prochan.pro"
 
-		// Fallback: direct <img alt="page N"> (first few pages only)
-		return doc.select("img[alt^='page']")
-			.filterNot { it.attr("src").contains("-mobile.") }
-			.mapIndexed { i, img ->
-				MangaPage(
-					id      = generateUid("${chapter.id}-$i"),
-					url     = img.attr("src"),
-					preview = null,
-					source  = source,
-				)
-			}
-	}
+		val images    = json.optJSONArray("images") ?: run {
+			// fallback: images inside metadata
+			json.optJSONObject("metadata")?.optJSONArray("images")
+		} ?: return emptyList()
 
-	/**
-	 * Extract full-resolution page URLs from the appImages JSON array
-	 * that Next.js embeds in its streaming script chunks.
-	 * Format: [{"desktop":"https://...avif","mobile":"https://...avif"}, ...]
-	 *
-	 * The desktop URL points to the complete image (not the CDN stripe tiles
-	 * that are only used for visual rendering on the web page).
-	 */
-	private fun parseAppImages(scriptData: String, chapter: MangaChapter): List<MangaPage> {
-		val patterns = listOf(
-			// Unescaped JSON inside __NEXT_DATA__
-			Regex(""""appImages"\s*:\s*(\[\s*\{.+?\}\s*\])""", RegexOption.DOT_MATCHES_ALL),
-			// Escaped JSON inside __next_f.push string literals
-			Regex("""\\\"appImages\\\"\s*:\s*(\[.+?\])""", RegexOption.DOT_MATCHES_ALL),
-		)
+		val meta      = json.optJSONObject("metadata") ?: JSONObject()
+		val maps      = meta.optJSONArray("maps") ?: JSONArray()
 
-		for (pattern in patterns) {
-			val match = pattern.find(scriptData) ?: continue
-			val rawJson = match.groupValues[1]
-				.replace("\\\"", "\"")
-				.replace("\\/", "/")
+		return (0 until images.length()).mapNotNull { i ->
+			val imagePath = images.optString(i).takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+			val token     = maps.optJSONObject(i)?.optString("token")
 
-			val pages = try {
-				val arr = JSONArray(rawJson)
-				arr.mapJSONNotNull { item ->
-					if (item !is JSONObject) return@mapJSONNotNull null
-					// desktop = full image, mobile = smaller version
-					val url = item.optString("desktop").takeIf { it.isNotEmpty() }
-						?: item.optString("mobile").takeIf { it.isNotEmpty() }
-						?: return@mapJSONNotNull null
-					MangaPage(
-						id      = generateUid("${chapter.id}-$url"),
-						url     = url,
-						preview = null,
-						source  = source,
-					)
+			// URL النهائي: https://cdn3.prochan.pro/590/35103/image.avif?token=...
+			val url = buildString {
+				append(cdnHost)
+				append(imagePath)
+				if (!token.isNullOrEmpty()) {
+					append("?token=")
+					append(token)
 				}
-			} catch (e: Exception) {
-				continue
 			}
 
-			if (pages.isNotEmpty()) return pages
+			MangaPage(
+				id      = generateUid("${chapter.id}-$i"),
+				url     = url,
+				preview = null,
+				source  = source,
+			)
 		}
-
-		return emptyList()
 	}
 
 	// ─────────────────────────────────────────────
