@@ -304,61 +304,46 @@ internal abstract class MangaReaderParser(
 
 	protected open val selectTestScript = "script:containsData(ts_reader)"
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
-		val docs = webClient.httpGet(chapterUrl).parseHtml()
+    val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+    val docs = webClient.httpGet(chapterUrl).parseHtml()
 
-		val test = docs.select(selectTestScript)
-		if (test.isNullOrEmpty() and !encodedSrc) {
-			return docs.select(selectPage).map { img ->
-				val url = img.requireSrc().toRelativeUrl(domain)
-				MangaPage(
-					id = generateUid(url),
-					url = url,
-					preview = null,
-					source = source,
-				)
-			}
-		} else {
-			val images = if (encodedSrc) {
-				val script = docs.select(selectScript)
-				var decode = ""
-				for (i in script) {
-					if (i.attr("src").startsWith("data:text/javascript;base64,")) {
-						decode = Base64.getDecoder().decode(i.attr("src").replace("data:text/javascript;base64,", ""))
-							.decodeToString()
-						if (decode.startsWith("ts_reader.run")) {
-							break
-						}
-					}
-				}
-				JSONObject(decode.substringAfter('(').substringBeforeLast(')'))
-					.getJSONArray("sources")
-					.getJSONObject(0)
-					.getJSONArray("images")
+    val script = docs.select("script:containsData(ts_reader)").firstOrNull()
 
-			} else {
-				val script = docs.selectFirstOrThrow(selectTestScript)
-				JSONObject(script.data().substringAfter('(').substringBeforeLast(')'))
-					.getJSONArray("sources")
-					.getJSONObject(0)
-					.getJSONArray("images")
-			}
+    if (script != null) {
+        val data = script.data()
+        // استخراج JSON من ts_reader.run({...}) بشكل دقيق
+        val jsonString = data.substringAfter("ts_reader.run(").substringBeforeLast(")")
+        
+        val images = JSONObject(jsonString)
+            .getJSONArray("sources")
+            .getJSONObject(0)
+            .getJSONArray("images")
 
-			val pages = ArrayList<MangaPage>(images.length())
-			for (i in 0 until images.length()) {
-				pages.add(
-					MangaPage(
-						id = generateUid(images.getString(i)),
-						url = images.getString(i),
-						preview = null,
-						source = source,
-					),
-				)
-			}
-			return pages
-		}
-	}
+        val pages = ArrayList<MangaPage>(images.length())
+        for (i in 0 until images.length()) {
+            pages.add(
+                MangaPage(
+                    id = generateUid(images.getString(i)),
+                    url = images.getString(i),
+                    preview = null,
+                    source = source,
+                )
+            )
+        }
+        return pages
+    }
 
+    // fallback: استخراج الصور مباشرة من HTML
+    return docs.select("div#readerarea img").map { img ->
+        val url = img.requireSrc().toRelativeUrl(domain)
+        MangaPage(
+            id = generateUid(url),
+            url = url,
+            preview = null,
+            source = source,
+        )
+    }
+}
 	protected open suspend fun getOrCreateTagMap(): Map<String, MangaTag> = mutex.withLock {
 		tagCache?.let { return@withLock it }
 		val url = listUrl.toAbsoluteUrl(domain)
