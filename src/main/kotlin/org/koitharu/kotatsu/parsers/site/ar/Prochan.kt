@@ -61,11 +61,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 					path.endsWith(".jpg") || path.endsWith(".jpeg") -> "image/jpeg"
 					path.endsWith(".png") -> "image/png"
 					path.endsWith(".gif") -> "image/gif"
-					else -> {
-						val peek = response.peekBody(16)
-						val bytes = peek.bytes()
-						detectImageType(bytes)
-					}
+					else -> "image/jpeg"
 				}
 				response.newBuilder()
 					.header("Content-Type", fixedType)
@@ -75,31 +71,6 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			}
 		} else {
 			chain.proceed(request)
-		}
-	}
-
-	private fun detectImageType(bytes: ByteArray): String {
-		if (bytes.size < 4) return "image/jpeg"
-		return when {
-			bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte()
-				-> "image/jpeg"
-			bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte()
-				&& bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte()
-				-> "image/png"
-			bytes[0] == 0x47.toByte() && bytes[1] == 0x49.toByte()
-				&& bytes[2] == 0x46.toByte()
-				-> "image/gif"
-			bytes[0] == 0x52.toByte() && bytes[1] == 0x49.toByte()
-				&& bytes[2] == 0x46.toByte() && bytes[3] == 0x46.toByte()
-				&& bytes.size >= 12
-				&& bytes[8] == 0x57.toByte() && bytes[9] == 0x45.toByte()
-				&& bytes[10] == 0x42.toByte() && bytes[11] == 0x50.toByte()
-				-> "image/webp"
-			bytes.size >= 8
-				&& bytes[4] == 0x66.toByte() && bytes[5] == 0x74.toByte()
-				&& bytes[6] == 0x79.toByte() && bytes[7] == 0x70.toByte()
-				-> "image/avif"
-			else -> "image/jpeg"
 		}
 	}
 
@@ -230,24 +201,11 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val images = json.optJSONArray("images")
 			?: json.optJSONObject("metadata")?.optJSONArray("images")
 			?: return emptyList()
-		val meta = json.optJSONObject("metadata") ?: JSONObject()
-		val maps = meta.optJSONArray("maps") ?: JSONArray()
 
 		val result = mutableListOf<MangaPage>()
 		for (i in 0 until images.length()) {
 			val imagePath = images.optString(i).takeIf { it.isNotEmpty() } ?: continue
-			val token = maps.optJSONObject(i)?.optString("token")
-
-			val finalUrl = buildString {
-				append("https://")
-				append(cdnPath)
-				append(".prochan.pro")
-				append(imagePath)
-				if (!token.isNullOrEmpty()) {
-					append("?token=")
-					append(token)
-				}
-			}
+			val finalUrl = "https://$cdnPath.prochan.pro$imagePath"
 
 			result.add(
 				MangaPage(
