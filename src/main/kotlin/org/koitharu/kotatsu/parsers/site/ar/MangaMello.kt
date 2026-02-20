@@ -3,6 +3,8 @@ package org.koitharu.kotatsu.parsers.site.ar
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import okhttp3.Headers
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
@@ -15,10 +17,10 @@ import java.util.*
 
 @MangaSourceParser("MANGAMELLO", "Manga Mello", "ar", ContentType.MANGA)
 internal class MangaMello(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.MANGAMELLO, 20) {
+    PagedMangaParser(context, MangaParserSource.MANGAMELLO, 20), Interceptor {
 
     override val configKeyDomain = ConfigKey.Domain("plus.mangamello.com")
-    
+
     override val iconUrl =
         "https://raw.githubusercontent.com/hany18h/kotatsu-parsers/master/src/main/kotlin/org/koitharu/kotatsu/parsers/icons/MangamelloPlus.webp"
 
@@ -44,7 +46,6 @@ internal class MangaMello(context: MangaLoaderContext) :
 
     override suspend fun getFilterOptions() = MangaListFilterOptions()
 
-    // Custom headers for MangaMello API
     private fun getApiHeaders(): Headers {
         return Headers.Builder()
             .add("accept", "application/json")
@@ -57,12 +58,34 @@ internal class MangaMello(context: MangaLoaderContext) :
             .build()
     }
 
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val url = request.url.toString()
+
+        if (url.contains("azoramoon.com") ||
+            url.contains("/wp-content/uploads/") ||
+            url.endsWith(".jpeg") ||
+            url.endsWith(".jpg") ||
+            url.endsWith(".png") ||
+            url.endsWith(".webp")
+        ) {
+            val newRequest = request.newBuilder()
+                .header("Referer", "https://plus.mangamello.com/")
+                .header("User-Agent", "Dart/3.3 (dart:io)")
+                .header("Accept", "image/webp,image/apng,image/*,*/*;q=0.8")
+                .build()
+            return chain.proceed(newRequest)
+        }
+
+        return chain.proceed(request)
+    }
+
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         val headers = getApiHeaders()
-        
-        // Handle search
+
         if (!filter.query.isNullOrEmpty()) {
-            val searchUrl = "https://plus.mangamello.com/api/v1/mangas/search?per_page=40&title=${filter.query.urlEncoded()}"
+            val searchUrl =
+                "https://plus.mangamello.com/api/v1/mangas/search?per_page=40&title=${filter.query.urlEncoded()}"
             val response = webClient.httpGet(searchUrl, headers).parseJson()
             val results = response.getJSONArray("data")
             return (0 until results.length()).map { i ->
@@ -70,7 +93,6 @@ internal class MangaMello(context: MangaLoaderContext) :
             }
         }
 
-        // Handle listing with sort
         val sortParam = when (order) {
             SortOrder.POPULARITY -> "views"
             else -> "updated_at"
@@ -115,7 +137,6 @@ internal class MangaMello(context: MangaLoaderContext) :
         val averageRate = json.optString("average_rate", "0").toFloatOrNull() ?: 0f
         val normalizedRating = if (averageRate > 0) averageRate / 10f else RATING_UNKNOWN
 
-        // Parse genres if available
         val tags = mutableSetOf<MangaTag>()
         val genresArray = json.optJSONArray("genres")
         if (genresArray != null) {
@@ -152,7 +173,6 @@ internal class MangaMello(context: MangaLoaderContext) :
         val headers = getApiHeaders()
         val chaptersDeferred = async { getChapters(mangaId) }
 
-        // Get manga details
         val detailUrl = "https://plus.mangamello.com${manga.url}"
         val response = webClient.httpGet(detailUrl, headers).parseJson()
         val data = response.getJSONObject("data")
@@ -160,8 +180,7 @@ internal class MangaMello(context: MangaLoaderContext) :
         val title = data.optString("title", manga.title)
         val summary = data.optString("summary", "").nullIfEmpty()
         val imageUrl = data.optString("img", manga.coverUrl)
-        val year = data.optString("year", "").nullIfEmpty()
-        
+
         val isCompleted = data.optInt("is_completed", 0)
         val state = when (isCompleted) {
             1 -> MangaState.FINISHED
@@ -221,7 +240,6 @@ internal class MangaMello(context: MangaLoaderContext) :
             )
         }
 
-        // ✅ الترتيب الصحيح: من الأقدم للأحدث (ascending)
         return chapters.sortedBy { it.number }
     }
 
