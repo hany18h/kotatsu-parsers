@@ -196,45 +196,50 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	// PAGES  ← الحل الجديد باستخدام API مع tokens
 	// ─────────────────────────────────────────────
 
+	// نحفظ URL المرجع بصيغة: prochan-page://{chapterId}/{index}/{imagePath}
+	// ثم في getPageUrl نجلب token جديد في كل مرة
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		// chapter.url = /series/{type}/{id}/{slug}/{chapterId}/{chapterNumber}
 		val parts     = chapter.url.split("/").filter { it.isNotEmpty() }
 		val chapterId = parts.getOrNull(4) ?: return emptyList()
 
-		// API: /api/public/chapters/{chapterId}
-		// يرجع: cdn_path, images[], metadata.maps[].token
-		val json      = webClient.httpGet("https://$domain/api/public/chapters/$chapterId").parseJson()
-		val cdnPath   = json.optString("cdn_path", "cdn3")  // "cdn3" أو "cdn2"
-		val cdnHost   = "https://$cdnPath.prochan.pro"
-
-		val images    = json.optJSONArray("images") ?: run {
-			// fallback: images inside metadata
+		val json   = webClient.httpGet("https://$domain/api/public/chapters/$chapterId").parseJson()
+		val images = json.optJSONArray("images") ?: run {
 			json.optJSONObject("metadata")?.optJSONArray("images")
 		} ?: return emptyList()
 
-		val meta      = json.optJSONObject("metadata") ?: JSONObject()
-		val maps      = meta.optJSONArray("maps") ?: JSONArray()
-
 		return (0 until images.length()).mapNotNull { i ->
 			val imagePath = images.optString(i).takeIf { it.isNotEmpty() } ?: return@mapNotNull null
-			val token     = maps.optJSONObject(i)?.optString("token")
-
-			// URL النهائي: https://cdn3.prochan.pro/590/35103/image.avif?token=...
-			val url = buildString {
-				append(cdnHost)
-				append(imagePath)
-				if (!token.isNullOrEmpty()) {
-					append("?token=")
-					append(token)
-				}
-			}
-
+			// نحفظ مرجع داخلي فقط، بدون token
 			MangaPage(
 				id      = generateUid("${chapter.id}-$i"),
-				url     = url,
+				url     = "prochan-page://$chapterId/$i$imagePath",
 				preview = null,
 				source  = source,
 			)
+		}
+	}
+
+	override suspend fun getPageUrl(page: MangaPage): String {
+		// prochan-page://{chapterId}/{index}/{imagePath}
+		val raw       = page.url
+		val chapterId = raw.removePrefix("prochan-page://").substringBefore("/")
+		val rest      = raw.removePrefix("prochan-page://$chapterId/") // "{index}/{imagePath}"
+		val pageIndex = rest.substringBefore("/").toIntOrNull() ?: 0
+		val imagePath = "/" + rest.substringAfter("/")
+
+		val json    = webClient.httpGet("https://$domain/api/public/chapters/$chapterId").parseJson()
+		val cdnPath = json.optString("cdn_path", "cdn3")
+		val meta    = json.optJSONObject("metadata") ?: JSONObject()
+		val maps    = meta.optJSONArray("maps") ?: JSONArray()
+		val token   = maps.optJSONObject(pageIndex)?.optString("token")
+
+		return buildString {
+			append("https://$cdnPath.prochan.pro")
+			append(imagePath)
+			if (!token.isNullOrEmpty()) {
+				append("?token=")
+				append(token)
+			}
 		}
 	}
 
