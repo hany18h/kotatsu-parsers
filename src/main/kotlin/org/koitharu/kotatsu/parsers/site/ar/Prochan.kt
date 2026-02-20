@@ -2,6 +2,9 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import okhttp3.Headers
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
@@ -21,7 +24,8 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	context,
 	source = MangaParserSource.PROCHAN,
 	pageSize = 18,
-) {
+), Interceptor {
+
 	override val configKeyDomain = ConfigKey.Domain("prochan.pro")
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
@@ -39,6 +43,33 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 	}
 
+	// ─────────────────────────────────────────────
+	// INTERCEPTOR — fix image requests
+	// ─────────────────────────────────────────────
+
+	override fun intercept(chain: Interceptor.Chain): Response {
+		val request = chain.request()
+		val url = request.url.toString()
+
+		// Add proper headers for image requests from CDN
+		if (url.contains("cdn3.prochan.pro") ||
+			url.contains("app.prochan.pro") ||
+			url.endsWith(".avif") ||
+			url.endsWith(".webp") ||
+			url.endsWith(".jpg") ||
+			url.endsWith(".png")
+		) {
+			val newRequest = request.newBuilder()
+				.header("Referer", "https://prochan.pro/")
+				.header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+				.header("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
+				.build()
+			return chain.proceed(newRequest)
+		}
+
+		return chain.proceed(request)
+	}
+
 	override suspend fun getFilterOptions() = MangaListFilterOptions()
 
 	// ─────────────────────────────────────────────
@@ -54,10 +85,10 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			append("&sort=")
 			append(
 				when (order) {
-					SortOrder.UPDATED    -> "latest_chapter"
-					SortOrder.POPULARITY -> "popular"
+					SortOrder.UPDATED      -> "latest_chapter"
+					SortOrder.POPULARITY   -> "popular"
 					SortOrder.ALPHABETICAL -> "az"
-					else                 -> "latest_chapter"
+					else                   -> "latest_chapter"
 				},
 			)
 			if (!filter.query.isNullOrEmpty()) {
@@ -70,7 +101,6 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val data = json.optJSONArray("data") ?: return emptyList()
 
 		return data.mapJSONNotNull { item ->
-			// Skip text-only novels
 			if (item.optString("type") == "novel") return@mapJSONNotNull null
 
 			val id       = item.optInt("id")
@@ -113,20 +143,15 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	// ─────────────────────────────────────────────
 
 	override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
-		val doc             = webClient.httpGet(manga.publicUrl).parseHtml()
+		val doc              = webClient.httpGet(manga.publicUrl).parseHtml()
 		val chaptersDeferred = async { fetchChapters(manga.url) }
-		val scriptData      = collectNextScripts(doc)
-
-		val description = parseStringField(scriptData, "description")
-		val altTitles   = parseAltTitles(scriptData)
-		val tags        = parseTags(scriptData)
-		val authors     = parseAuthors(scriptData)
+		val scriptData       = collectNextScripts(doc)
 
 		manga.copy(
-			description = description,
-			altTitles   = altTitles,
-			tags        = tags,
-			authors     = authors,
+			description = parseStringField(scriptData, "description"),
+			altTitles   = parseAltTitles(scriptData),
+			tags        = parseTags(scriptData),
+			authors     = parseAuthors(scriptData),
 			chapters    = chaptersDeferred.await(),
 		)
 	}
@@ -136,15 +161,13 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	// ─────────────────────────────────────────────
 
 	private suspend fun fetchChapters(mangaUrl: String): List<MangaChapter> {
-		// mangaUrl = /series/{type}/{id}/{slug}
 		val parts = mangaUrl.split("/").filter { it.isNotEmpty() }
 		if (parts.size < 3) return emptyList()
 
-		val type = parts[1]   // manhwa / manga / manhua
-		val id   = parts[2]   // numeric id
+		val type = parts[1]
+		val id   = parts[2]
 
-		// API works on both prochan.pro and prochan.net — use same domain
-		val url = "https://$domain/api/public/$type/$id/chapters?page=1&limit=2000&order=asc"
+		val url  = "https://$domain/api/public/$type/$id/chapters?page=1&limit=2000&order=asc"
 		val json = webClient.httpGet(url).parseJson()
 		val data = json.optJSONArray("data") ?: return emptyList()
 
@@ -163,15 +186,15 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			val chapterUrl = "$mangaUrl/$chapterId/$chapterNumber"
 
 			MangaChapter(
-				id          = generateUid(chapterUrl),
-				title       = chapterTitle,
-				number      = chapterNum,
-				volume      = 0,
-				url         = chapterUrl,
-				scanlator   = null,
-				uploadDate  = uploadDate,
-				branch      = null,
-				source      = source,
+				id         = generateUid(chapterUrl),
+				title      = chapterTitle,
+				number     = chapterNum,
+				volume     = 0,
+				url        = chapterUrl,
+				scanlator  = null,
+				uploadDate = uploadDate,
+				branch     = null,
+				source     = source,
 			)
 		}
 	}
@@ -184,11 +207,10 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val doc        = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
 		val scriptData = collectNextScripts(doc)
 
-		// Primary: parse the appImages JSON array embedded by Next.js
 		val pages = parseAppImages(scriptData, chapter)
 		if (pages.isNotEmpty()) return pages
 
-		// Fallback: grab the few full <img alt="page N"> elements
+		// Fallback: direct <img alt="page N"> (first few pages only)
 		return doc.select("img[alt^='page']")
 			.filterNot { it.attr("src").contains("-mobile.") }
 			.mapIndexed { i, img ->
@@ -202,15 +224,19 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	/**
-	 * Parse the `appImages` array that Next.js embeds in streaming script chunks.
-	 * Each entry is {"desktop": "https://...", "mobile": "https://..."}.
-	 * The desktop URL is the full-resolution image (no stripe splitting).
+	 * Extract full-resolution page URLs from the appImages JSON array
+	 * that Next.js embeds in its streaming script chunks.
+	 * Format: [{"desktop":"https://...avif","mobile":"https://...avif"}, ...]
+	 *
+	 * The desktop URL points to the complete image (not the CDN stripe tiles
+	 * that are only used for visual rendering on the web page).
 	 */
 	private fun parseAppImages(scriptData: String, chapter: MangaChapter): List<MangaPage> {
-		// The array may appear with or without escaped quotes inside JS string literals
 		val patterns = listOf(
+			// Unescaped JSON inside __NEXT_DATA__
 			Regex(""""appImages"\s*:\s*(\[\s*\{.+?\}\s*\])""", RegexOption.DOT_MATCHES_ALL),
-			Regex("""\\\"appImages\\\"\s*:\s*(\[.+?\])""",     RegexOption.DOT_MATCHES_ALL),
+			// Escaped JSON inside __next_f.push string literals
+			Regex("""\\\"appImages\\\"\s*:\s*(\[.+?\])""", RegexOption.DOT_MATCHES_ALL),
 		)
 
 		for (pattern in patterns) {
@@ -219,11 +245,11 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 				.replace("\\\"", "\"")
 				.replace("\\/", "/")
 
-			return try {
+			val pages = try {
 				val arr = JSONArray(rawJson)
 				arr.mapJSONNotNull { item ->
 					if (item !is JSONObject) return@mapJSONNotNull null
-					// Prefer desktop, fall back to mobile
+					// desktop = full image, mobile = smaller version
 					val url = item.optString("desktop").takeIf { it.isNotEmpty() }
 						?: item.optString("mobile").takeIf { it.isNotEmpty() }
 						?: return@mapJSONNotNull null
@@ -237,16 +263,17 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			} catch (e: Exception) {
 				continue
 			}
+
+			if (pages.isNotEmpty()) return pages
 		}
 
 		return emptyList()
 	}
 
 	// ─────────────────────────────────────────────
-	// HELPERS — Next.js data extraction
+	// HELPERS
 	// ─────────────────────────────────────────────
 
-	/** Concatenate all Next.js script chunks into one searchable string. */
 	private fun collectNextScripts(doc: Document): String = buildString {
 		doc.selectFirst("script#__NEXT_DATA__")?.let { append(it.data()) }
 		doc.select("script:containsData(__next_f.push)").forEach { append(it.data()) }
@@ -261,7 +288,8 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			?.replace("\\\\", "\\")
 
 	private fun parseAltTitles(data: String): Set<String> {
-		val match = Regex("\"altTitles\"\\s*:\\s*(\\[[^\\]]*\\])").find(data) ?: return emptySet()
+		val match = Regex("\"altTitles\"\\s*:\\s*(\\[[^\\]]*\\])").find(data)
+			?: return emptySet()
 		return try {
 			JSONArray(match.groupValues[1]).mapJSONToSet { it as String }
 		} catch (e: Exception) {
@@ -291,6 +319,8 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	private fun parseAuthors(data: String): Set<String> =
 		Regex("\"(?:author|artist)\"\\s*:\\s*\"([^\"]+)\"")
 			.findAll(data)
-			.mapNotNull { it.groupValues[1].trim().takeIf { v -> v.isNotEmpty() && v != "null" } }
+			.mapNotNull {
+				it.groupValues[1].trim().takeIf { v -> v.isNotEmpty() && v != "null" }
+			}
 			.toSet()
 }
