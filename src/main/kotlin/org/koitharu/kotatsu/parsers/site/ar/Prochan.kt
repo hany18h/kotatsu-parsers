@@ -43,19 +43,36 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	override fun intercept(chain: Interceptor.Chain): Response {
-		val request = chain.request()
-		val host = request.url.host
-		return if (host.contains("prochan")) {
-			chain.proceed(
-				request.newBuilder()
-					.header("Referer", "https://prochan.pro/")
-					.header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
-					.build(),
-			)
-		} else {
-			chain.proceed(request)
-		}
-	}
+    val request = chain.request()
+    val host = request.url.host
+    return if (host.contains("prochan")) {
+        val response = chain.proceed(
+            request.newBuilder()
+                .header("Referer", "https://prochan.pro/")
+                .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+                .build(),
+        )
+        // إصلاح Content-Type الغلط
+        val contentType = response.header("Content-Type") ?: ""
+        if (contentType.contains("octet-stream")) {
+            val url = request.url.toString()
+            val fixedType = when {
+                url.endsWith(".avif") -> "image/avif"
+                url.endsWith(".webp") -> "image/webp"
+                url.endsWith(".jpg") || url.endsWith(".jpeg") -> "image/jpeg"
+                url.endsWith(".png") -> "image/png"
+                else -> "image/jpeg"
+            }
+            response.newBuilder()
+                .header("Content-Type", fixedType)
+                .build()
+        } else {
+            response
+        }
+    } else {
+        chain.proceed(request)
+    }
+}
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions()
 
