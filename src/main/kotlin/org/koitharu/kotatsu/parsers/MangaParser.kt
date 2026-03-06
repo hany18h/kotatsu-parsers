@@ -80,6 +80,15 @@ public interface MangaParser : Interceptor {
 
 	public suspend fun getRelatedManga(seed: Manga): List<Manga>
 
+	/**
+	 * Fetch the content of a novel chapter as HTML.
+	 * Only novel parsers should override this method.
+	 * @return [NovelChapterContent] with HTML and embedded images, or null if not a novel source.
+	 */
+	public suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
+		return null
+	}
+
 	public fun getRequestHeaders(): Headers
 
 	/**
