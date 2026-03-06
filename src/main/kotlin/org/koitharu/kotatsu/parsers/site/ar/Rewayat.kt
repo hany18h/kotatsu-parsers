@@ -1,12 +1,12 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
-import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
+import org.koitharu.kotatsu.parsers.util.json.*
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.*
@@ -46,16 +46,13 @@ internal class Rewayat(context: MangaLoaderContext) :
     private suspend fun fetchAvailableTags(): Set<MangaTag> {
         val json = webClient.httpGet("https://$apiDomain/api/genres/").parseJson()
         val results = json.getJSONArray("results")
-        val tags = linkedSetOf<MangaTag>()
-        for (i in 0 until results.length()) {
-            val obj = results.getJSONObject(i)
-            tags += MangaTag(
+        return results.mapJSONToSet { obj ->
+            MangaTag(
                 title = obj.getString("name"),
                 key = obj.getInt("id").toString(),
                 source = source,
             )
         }
-        return tags
     }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
@@ -99,31 +96,28 @@ internal class Rewayat(context: MangaLoaderContext) :
         }
 
         val json = webClient.httpGet(url).parseJson()
-        val results = json.getJSONArray("results")
-        return List(results.length()) { i -> parseNovelItem(results.getJSONObject(i)) }
-    }
-
-    private fun parseNovelItem(obj: JSONObject): Manga {
-        val slug = obj.getString("slug")
-        val url = "/novel/$slug"
-        return Manga(
-            id = generateUid(url),
-            title = obj.getStringOrNull("arabic") ?: obj.getString("english"),
-            altTitles = setOfNotNull(obj.getStringOrNull("english")),
-            url = url,
-            publicUrl = "https://$domain$url",
-            rating = obj.optDouble("rating", 0.0).toFloat() / 5f,
-            contentRating = ContentRating.SAFE,
-            coverUrl = obj.getStringOrNull("poster_url"),
-            tags = emptySet(),
-            state = when (obj.getStringOrNull("status")) {
-                "ongoing"   -> MangaState.ONGOING
-                "completed" -> MangaState.FINISHED
-                else        -> null
-            },
-            authors = setOfNotNull(obj.getStringOrNull("author")),
-            source = source,
-        )
+        return json.getJSONArray("results").mapJSON { obj ->
+            val slug = obj.getString("slug")
+            val novelUrl = "/novel/$slug"
+            Manga(
+                id = generateUid(novelUrl),
+                title = obj.getStringOrNull("arabic") ?: obj.getString("english"),
+                altTitles = setOfNotNull(obj.getStringOrNull("english")),
+                url = novelUrl,
+                publicUrl = "https://$domain$novelUrl",
+                rating = obj.getFloatOrDefault("rating", 0f) / 5f,
+                contentRating = ContentRating.SAFE,
+                coverUrl = obj.getStringOrNull("poster_url"),
+                tags = emptySet(),
+                state = when (obj.getStringOrNull("status")) {
+                    "ongoing"   -> MangaState.ONGOING
+                    "completed" -> MangaState.FINISHED
+                    else        -> null
+                },
+                authors = setOfNotNull(obj.getStringOrNull("author")),
+                source = source,
+            )
+        }
     }
 
     override suspend fun getDetails(manga: Manga): Manga {
@@ -132,24 +126,17 @@ internal class Rewayat(context: MangaLoaderContext) :
 
         val chapters = fetchAllChapters(slug)
 
-        val genres = json.optJSONArray("genres")
-        val tags = if (genres != null) {
-            (0 until genres.length()).mapToSet { i ->
-                val g = genres.getJSONObject(i)
-                MangaTag(
-                    title = g.getString("name"),
-                    key = g.getInt("id").toString(),
-                    source = source,
-                )
-            }
-        } else emptySet()
+        val tags = json.optJSONArray("genres")?.mapJSONToSet { g ->
+            MangaTag(
+                title = g.getString("name"),
+                key = g.getInt("id").toString(),
+                source = source,
+            )
+        } ?: emptySet()
 
-        val contributors = json.optJSONArray("contributors")
-        val authors = if (contributors != null) {
-            (0 until contributors.length()).mapNotNullToSet { i ->
-                contributors.getJSONObject(i).getStringOrNull("name")
-            }
-        } else manga.authors
+        val authors = json.optJSONArray("contributors")?.mapJSONNotNullToSet { c ->
+            c.getStringOrNull("name")
+        } ?: manga.authors
 
         return manga.copy(
             title = json.getStringOrNull("arabic") ?: json.getString("english"),
@@ -157,7 +144,7 @@ internal class Rewayat(context: MangaLoaderContext) :
             description = json.getStringOrNull("synopsis"),
             coverUrl = json.getStringOrNull("poster_url") ?: manga.coverUrl,
             largeCoverUrl = json.getStringOrNull("poster_url"),
-            rating = json.optDouble("rating", 0.0).toFloat() / 5f,
+            rating = json.getFloatOrDefault("rating", 0f) / 5f,
             state = when (json.getStringOrNull("status")) {
                 "ongoing"   -> MangaState.ONGOING
                 "completed" -> MangaState.FINISHED
@@ -179,11 +166,10 @@ internal class Rewayat(context: MangaLoaderContext) :
             val json = webClient.httpGet(url).parseJson()
             val results = json.getJSONArray("results")
 
-            for (i in 0 until results.length()) {
-                val obj = results.getJSONObject(i)
+            results.mapJSONTo(chapters) { obj ->
                 val number = obj.getInt("number")
                 val chapterUrl = "/novel/$novelSlug/$number"
-                chapters += MangaChapter(
+                MangaChapter(
                     id = generateUid(chapterUrl),
                     title = obj.getStringOrNull("title") ?: "الفصل $number",
                     number = number.toFloat(),
@@ -191,7 +177,7 @@ internal class Rewayat(context: MangaLoaderContext) :
                     url = chapterUrl,
                     scanlator = null,
                     uploadDate = obj.getStringOrNull("created_at")?.let {
-                        runCatching { dateFormat.parse(it)?.time }.getOrNull()
+                        runCatching { dateFormat.parse(it)?.time ?: 0L }.getOrDefault(0L)
                     } ?: 0L,
                     branch = null,
                     source = source,
@@ -229,9 +215,8 @@ internal class Rewayat(context: MangaLoaderContext) :
         ).parseJson()
 
         val title = json.getStringOrNull("title") ?: chapter.title ?: ""
-        val body = json.getStringOrNull("body") ?: return NovelChapterContent(
-            html = buildErrorHtml("محتوى الفصل غير متاح"),
-        )
+        val body = json.getStringOrNull("body")
+            ?: return NovelChapterContent(html = buildErrorHtml("محتوى الفصل غير متاح"))
 
         return NovelChapterContent(
             html = buildChapterHtml(title, body),
