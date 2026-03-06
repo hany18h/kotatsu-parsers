@@ -107,7 +107,7 @@ internal class Rewayat(context: MangaLoaderContext) :
                 publicUrl = "https://$domain$novelUrl",
                 rating = obj.getFloatOrDefault("rating", 0f) / 5f,
                 contentRating = ContentRating.SAFE,
-                coverUrl = obj.getStringOrNull("poster_url"),
+                coverUrl = obj.getStringOrNull("poster_url")?.toCoverUrl(),
                 tags = emptySet(),
                 state = when (obj.getStringOrNull("status")) {
                     "ongoing"   -> MangaState.ONGOING
@@ -119,6 +119,10 @@ internal class Rewayat(context: MangaLoaderContext) :
             )
         }
     }
+
+    // poster_url يأتي كـ relative path مثل /media/novel/... يحتاج domain الـ API
+    private fun String.toCoverUrl() =
+        if (startsWith("http")) this else "https://$apiDomain$this"
 
     override suspend fun getDetails(manga: Manga): Manga {
         val slug = manga.url.substringAfterLast("/")
@@ -142,8 +146,8 @@ internal class Rewayat(context: MangaLoaderContext) :
             title = json.getStringOrNull("arabic") ?: json.getString("english"),
             altTitles = setOfNotNull(json.getStringOrNull("english")),
             description = json.getStringOrNull("synopsis"),
-            coverUrl = json.getStringOrNull("poster_url") ?: manga.coverUrl,
-            largeCoverUrl = json.getStringOrNull("poster_url"),
+            coverUrl = json.getStringOrNull("poster_url")?.toCoverUrl() ?: manga.coverUrl,
+            largeCoverUrl = json.getStringOrNull("poster_url")?.toCoverUrl(),
             rating = json.getFloatOrDefault("rating", 0f) / 5f,
             state = when (json.getStringOrNull("status")) {
                 "ongoing"   -> MangaState.ONGOING
@@ -215,25 +219,30 @@ internal class Rewayat(context: MangaLoaderContext) :
         ).parseJson()
 
         val title = json.getStringOrNull("title") ?: chapter.title ?: ""
-        val body = json.getStringOrNull("body")
+
+        // content هو array of arrays من فقرات HTML
+        val contentArray = json.optJSONArray("content")
             ?: return NovelChapterContent(html = buildErrorHtml("محتوى الفصل غير متاح"))
 
+        // جمع كل الفقرات من كل الـ arrays الداخلية
+        val paragraphs = mutableListOf<String>()
+        for (i in 0 until contentArray.length()) {
+            val innerArray = contentArray.optJSONArray(i) ?: continue
+            for (j in 0 until innerArray.length()) {
+                val para = innerArray.optString(j, "").trim()
+                if (para.isNotEmpty()) paragraphs.add(para)
+            }
+        }
+
         return NovelChapterContent(
-            html = buildChapterHtml(title, body),
+            html = buildChapterHtml(title, paragraphs),
             images = emptyList(),
         )
     }
 
     // ─── HTML builders ───────────────────────────────────────────────────────
 
-    private fun buildChapterHtml(title: String, rawBody: String): String {
-        val paragraphs = rawBody
-            .replace("\r\n", "\n")
-            .replace("\r", "\n")
-            .split(Regex("\n{2,}"))
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-
+    private fun buildChapterHtml(title: String, paragraphs: List<String>): String {
         return buildString {
             append("<!DOCTYPE html><html dir=\"rtl\"><head>")
             append("<meta charset=\"utf-8\"/>")
@@ -244,11 +253,16 @@ internal class Rewayat(context: MangaLoaderContext) :
             append("h1{font-size:1.3rem;border-bottom:1px solid #ddd;")
             append("padding-bottom:8px;margin-bottom:20px;}")
             append("p{margin-bottom:1.3rem;}")
+            append("img{max-width:100%;height:auto;display:block;margin:8px auto;}")
             append("</style></head><body>")
             if (title.isNotBlank()) append("<h1>$title</h1>")
+            // كل فقرة هي HTML جاهز من الـ API — نضيفها مباشرة
             paragraphs.forEach { para ->
-                val lines = para.split("\n").joinToString("<br/>") { it.trim() }
-                append("<p>$lines</p>")
+                if (!para.trimStart().startsWith("<")) {
+                    append("<p>$para</p>")
+                } else {
+                    append(para)
+                }
             }
             append("</body></html>")
         }
