@@ -10,6 +10,10 @@ import org.koitharu.kotatsu.parsers.util.json.*
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 @MangaSourceParser("REWAYAT", "نادي الروايات", "ar", ContentType.NOVEL)
 internal class Rewayat(context: MangaLoaderContext) :
@@ -161,16 +165,17 @@ internal class Rewayat(context: MangaLoaderContext) :
     }
 
     private suspend fun fetchAllChapters(novelSlug: String): List<MangaChapter> {
-        val chapters = mutableListOf<MangaChapter>()
-        var page = 1
         val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+        val baseUrl = "https://$apiDomain/api/chapters/$novelSlug/?ordering=number"
 
-        while (true) {
-            val url = "https://$apiDomain/api/chapters/$novelSlug/?ordering=number&page=$page"
-            val json = webClient.httpGet(url).parseJson()
-            val results = json.getJSONArray("results")
+        // جلب الصفحة الأولى لمعرفة العدد الكلي
+        val firstJson = webClient.httpGet("$baseUrl&page=1").parseJson()
+        val totalCount = firstJson.getInt("count")
+        val chapterPageSize = firstJson.getJSONArray("results").length().takeIf { it > 0 } ?: 10
+        val totalPages = (totalCount + chapterPageSize - 1) / chapterPageSize
 
-            results.mapJSONTo(chapters) { obj ->
+        fun parseChapters(results: org.json.JSONArray): List<MangaChapter> =
+            results.mapJSON { obj ->
                 val number = obj.getInt("number")
                 val chapterUrl = "/novel/$novelSlug/$number"
                 MangaChapter(
@@ -180,7 +185,7 @@ internal class Rewayat(context: MangaLoaderContext) :
                     volume = 0,
                     url = chapterUrl,
                     scanlator = null,
-                    uploadDate = obj.getStringOrNull("created_at")?.let {
+                    uploadDate = obj.getStringOrNull("date")?.let {
                         runCatching { dateFormat.parse(it)?.time ?: 0L }.getOrDefault(0L)
                     } ?: 0L,
                     branch = null,
@@ -188,11 +193,27 @@ internal class Rewayat(context: MangaLoaderContext) :
                 )
             }
 
-            if (json.isNull("next")) break
-            page++
+        if (totalPages <= 1) {
+            return parseChapters(firstJson.getJSONArray("results"))
         }
 
-        return chapters
+        // جلب باقي الصفحات بالتوازي
+        val allChapters = Array<List<MangaChapter>>(totalPages) { emptyList() }
+        allChapters[0] = parseChapters(firstJson.getJSONArray("results"))
+
+        coroutineScope {
+            val jobs = (2..totalPages).map { page ->
+                async(Dispatchers.IO) {
+                    val json = webClient.httpGet("$baseUrl&page=$page").parseJson()
+                    page to parseChapters(json.getJSONArray("results"))
+                }
+            }
+            for ((page, chapters) in jobs.awaitAll()) {
+                allChapters[page - 1] = chapters
+            }
+        }
+
+        return allChapters.flatMap { it }
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
