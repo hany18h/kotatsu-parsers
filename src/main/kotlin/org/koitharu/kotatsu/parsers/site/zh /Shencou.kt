@@ -1,21 +1,21 @@
-package org.skepsun.kototoro.parsers.site.zh
+package org.koitharu.kotatsu.parsers.site.zh
 
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
-import org.skepsun.kototoro.parsers.MangaLoaderContext
-import org.skepsun.kototoro.parsers.MangaParserAuthProvider
-import org.skepsun.kototoro.parsers.MangaParserCredentialsAuthProvider
-import org.skepsun.kototoro.parsers.MangaSourceParser
-import org.skepsun.kototoro.parsers.config.ConfigKey
-import org.skepsun.kototoro.parsers.core.PagedMangaParser
-import org.skepsun.kototoro.parsers.exception.AuthRequiredException
-import org.skepsun.kototoro.parsers.model.*
-import org.skepsun.kototoro.parsers.network.CloudFlareHelper
-import org.skepsun.kototoro.parsers.network.UserAgents
-import org.skepsun.kototoro.parsers.util.*
+import org.koitharu.kotatsu.parsers.MangaLoaderContext
+import org.koitharu.kotatsu.parsers.MangaParserAuthProvider
+import org.koitharu.kotatsu.parsers.MangaParserCredentialsAuthProvider
+import org.koitharu.kotatsu.parsers.MangaSourceParser
+import org.koitharu.kotatsu.parsers.config.ConfigKey
+import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.AuthRequiredException
+import org.koitharu.kotatsu.parsers.model.*
+import org.koitharu.kotatsu.parsers.network.CloudFlareHelper
+import org.koitharu.kotatsu.parsers.network.UserAgents
+import org.koitharu.kotatsu.parsers.util.*
 import java.net.URLEncoder
 import java.util.EnumSet
 
