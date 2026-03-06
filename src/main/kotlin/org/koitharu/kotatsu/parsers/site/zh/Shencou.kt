@@ -1,10 +1,9 @@
 package org.koitharu.kotatsu.parsers.site.zh
 
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.Response
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaParserAuthProvider
 import org.koitharu.kotatsu.parsers.MangaSourceParser
@@ -49,30 +48,14 @@ internal class Shencou(context: MangaLoaderContext) :
             MangaTag("全部", "class:0", source),
             MangaTag("电击文库", "class:1", source),
             MangaTag("富士见文库", "class:2", source),
-            MangaTag("角川文库", "class:3", source),
-            MangaTag("MFJ文库", "class:4", source),
-            MangaTag("Fami通文库", "class:5", source),
-            MangaTag("GA文库", "class:6", source),
-            MangaTag("HJ文库", "class:7", source),
-            MangaTag("一迅社", "class:8", source),
-            MangaTag("集英社", "class:9", source),
-            MangaTag("少女文库", "class:10", source),
-            MangaTag("SF文库", "class:11", source),
-            MangaTag("讲谈社", "class:12", source)
+            MangaTag("角川文库", "class:3", source)
         )
 
         val rankTags = linkedSetOf(
             MangaTag("默认", "sort:default", source),
             MangaTag("总排行榜", "sort:allvisit", source),
-            MangaTag("总推荐榜", "sort:allvote", source),
             MangaTag("月排行榜", "sort:monthvisit", source),
-            MangaTag("月推荐榜", "sort:monthvote", source),
-            MangaTag("周排行榜", "sort:weekvisit", source),
-            MangaTag("周推荐榜", "sort:weekvote", source),
-            MangaTag("最新入库", "sort:postdate", source),
-            MangaTag("最近更新", "sort:lastupdate", source),
-            MangaTag("总收藏榜", "sort:goodnum", source),
-            MangaTag("字数排行", "sort:size", source)
+            MangaTag("最近更新", "sort:lastupdate", source)
         )
 
         return MangaListFilterOptions(
@@ -80,12 +63,14 @@ internal class Shencou(context: MangaLoaderContext) :
         )
     }
 
-    override fun getRequestHeaders() = super.getRequestHeaders().newBuilder()
-        .set("User-Agent", userAgentKey.defaultValue)
-        .add("Referer", "https://$domain/")
-        .build()
+    override fun getRequestHeaders() =
+        super.getRequestHeaders().newBuilder()
+            .set("User-Agent", userAgentKey.defaultValue)
+            .add("Referer", "https://$domain/")
+            .build()
 
     override fun intercept(chain: Interceptor.Chain): Response {
+
         val request = chain.request()
 
         if (request.header("Referer") != null) {
@@ -116,7 +101,7 @@ internal class Shencou(context: MangaLoaderContext) :
             }
 
             val url =
-                "https://$domain/modules/article/search.php?searchtype=articlename&searchkey=$encodedQuery&page=$page"
+                "https://$domain/modules/article/search.php?searchkey=$encodedQuery&page=$page"
 
             val response = webClient.httpGet(url, getRequestHeaders())
 
@@ -148,11 +133,13 @@ internal class Shencou(context: MangaLoaderContext) :
 
         val rows = doc.select("table tr")
 
-        rows.drop(1).forEach { tr ->
+        rows.drop(1).forEach { tr: Element ->
 
             val a = tr.selectFirst("a") ?: return@forEach
 
-            val href = a.attrAsAbsoluteUrlOrNull("href")?.toRelativePath() ?: return@forEach
+            val href =
+                a.attrAsAbsoluteUrlOrNull("href")?.toRelativePath()
+                    ?: return@forEach
 
             list += Manga(
                 id = generateUid(href),
@@ -176,11 +163,13 @@ internal class Shencou(context: MangaLoaderContext) :
 
         val list = mutableListOf<Manga>()
 
-        doc.select("table tr").drop(1).forEach { tr ->
+        doc.select("table tr").drop(1).forEach { tr: Element ->
 
             val a = tr.selectFirst("a") ?: return@forEach
 
-            val href = a.attrAsAbsoluteUrlOrNull("href")?.toRelativePath() ?: return@forEach
+            val href =
+                a.attrAsAbsoluteUrlOrNull("href")?.toRelativePath()
+                    ?: return@forEach
 
             list += Manga(
                 id = generateUid(href),
@@ -206,18 +195,10 @@ internal class Shencou(context: MangaLoaderContext) :
 
         val response = webClient.httpGet(url, getRequestHeaders())
 
-        if (CloudFlareHelper.checkResponseForProtection(response)
-            != CloudFlareHelper.PROTECTION_NOT_DETECTED
-        ) {
-            context.requestBrowserAction(this, url)
-        }
-
         val doc = response.parseHtml()
 
-        val desc = doc.body().text()
-
         return manga.copy(
-            description = desc
+            description = doc.body().text()
         )
     }
 
@@ -227,9 +208,7 @@ internal class Shencou(context: MangaLoaderContext) :
 
         val response = webClient.httpGet(url, getRequestHeaders())
 
-        val doc = response.parseHtml()
-
-        val html = doc.body().html()
+        val html = response.parseHtml().body().html()
 
         return listOf(
             MangaPage(
@@ -244,15 +223,17 @@ internal class Shencou(context: MangaLoaderContext) :
     override val authUrl: String = "https://$domain/login.php"
 
     override suspend fun isAuthorized(): Boolean {
+
         return context.cookieJar.getCookies(domain)
             .any { it.name == "jieqiUserInfo" }
     }
 
     override suspend fun getUsername(): String {
 
-        val cookie = context.cookieJar.getCookies(domain)
-            .find { it.name == "jieqiUserInfo" }
-            ?.value ?: throw AuthRequiredException(source)
+        val cookie =
+            context.cookieJar.getCookies(domain)
+                .find { it.name == "jieqiUserInfo" }
+                ?.value ?: throw AuthRequiredException(source)
 
         return cookie
     }
@@ -260,13 +241,17 @@ internal class Shencou(context: MangaLoaderContext) :
     override suspend fun getPageUrl(page: MangaPage): String = page.url
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+
         super.onCreateConfig(keys)
+
         keys.add(userAgentKey)
     }
 
     private fun generateCoverUrl(mangaUrl: String): String {
 
-        val id = Regex("(\\d+)").find(mangaUrl)?.groupValues?.get(1) ?: return ""
+        val id =
+            Regex("(\\d+)").find(mangaUrl)?.groupValues?.get(1)
+                ?: return ""
 
         val iid = id.toInt() / 1000
 
@@ -274,6 +259,7 @@ internal class Shencou(context: MangaLoaderContext) :
     }
 
     private fun String.toRelativePath(): String {
+
         return this.replace(
             Regex("^https?://(www\\.)?shencou\\.com/?"),
             "/"
@@ -281,7 +267,10 @@ internal class Shencou(context: MangaLoaderContext) :
     }
 
     private fun String.toDataUrl(context: MangaLoaderContext): String {
-        val encoded = context.encodeBase64(toByteArray(Charsets.UTF_8))
+
+        val encoded =
+            context.encodeBase64(toByteArray(Charsets.UTF_8))
+
         return "data:text/html;base64,$encoded"
     }
 }
