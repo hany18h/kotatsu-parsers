@@ -25,9 +25,9 @@ internal class MangaSwat(context: MangaLoaderContext) :
     private val configKeyPassword = ConfigKey.Password()
 
     // Token cache
-    private var accessToken: String? = null
-    private var refreshToken: String? = null
-    private var tokenExpiry: Long = 0L
+    @Volatile private var accessToken: String? = null
+    @Volatile private var refreshToken: String? = null
+    @Volatile private var tokenExpiry: Long = 0L
     private val tokenMutex = Mutex()
 
     // ─── Config ────────────────────────────────────────────────────────────────
@@ -40,50 +40,62 @@ internal class MangaSwat(context: MangaLoaderContext) :
 
     // ─── Auth ──────────────────────────────────────────────────────────────────
 
-    private suspend fun getValidToken(): String? = tokenMutex.withLock {
+    private suspend fun getValidToken(): String? {
+        // Fast path - return cached token without lock
         val now = System.currentTimeMillis()
-
-        // 1. Return cached access token if still valid
         val cached = accessToken
         if (cached != null && now < tokenExpiry) {
-            return@withLock cached
+            return cached
         }
 
-        // 2. Try refresh token
-        val refresh = refreshToken
-        if (refresh != null) {
+        // Slow path - need to refresh or login
+        return tokenMutex.withLock {
+            // Double check after acquiring lock
+            val now2 = System.currentTimeMillis()
+            val cached2 = accessToken
+            if (cached2 != null && now2 < tokenExpiry) {
+                return@withLock cached2
+            }
+
+            // Try refresh token first
+            val refresh = refreshToken
+            if (refresh != null) {
+                try {
+                    val response = webClient.httpPost(
+                        "https://appswat.com/v2/api/v1/token/refresh/",
+                        mapOf("refresh" to refresh),
+                    ).parseJson()
+                    val newToken = response.getString("access")
+                    accessToken = newToken
+                    tokenExpiry = now2 + (14 * 60 * 1000L)
+                    return@withLock newToken
+                } catch (e: Exception) {
+                    refreshToken = null
+                    accessToken = null
+                }
+            }
+
+            // Login with username/password
+            val username = config[configKeyUsername].orEmpty()
+            val password = config[configKeyPassword].orEmpty()
+            if (username.isEmpty() || password.isEmpty()) return@withLock null
+
             try {
                 val response = webClient.httpPost(
-                    "https://appswat.com/v2/api/v1/token/refresh/",
-                    mapOf("refresh" to refresh),
+                    "https://appswat.com/v2/api/v1/token/",
+                    mapOf(
+                        "username" to username,
+                        "password" to password,
+                    ),
                 ).parseJson()
-                accessToken = response.getString("access")
-                tokenExpiry = now + (14 * 60 * 1000L)
-                return@withLock accessToken
+                val newToken = response.getString("access")
+                accessToken = newToken
+                refreshToken = response.getString("refresh")
+                tokenExpiry = now2 + (14 * 60 * 1000L)
+                newToken
             } catch (e: Exception) {
-                refreshToken = null
+                null
             }
-        }
-
-        // 3. Login with username/password from config
-        val username = config[configKeyUsername].orEmpty()
-        val password = config[configKeyPassword].orEmpty()
-        if (username.isEmpty() || password.isEmpty()) return@withLock null
-
-        return@withLock try {
-            val response = webClient.httpPost(
-                "https://appswat.com/v2/api/v1/token/",
-                mapOf(
-                    "username" to username,
-                    "password" to password,
-                ),
-            ).parseJson()
-            accessToken = response.getString("access")
-            refreshToken = response.getString("refresh")
-            tokenExpiry = now + (14 * 60 * 1000L)
-            accessToken
-        } catch (e: Exception) {
-            null
         }
     }
 
@@ -217,11 +229,12 @@ internal class MangaSwat(context: MangaLoaderContext) :
 
     override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
         val seriesId = manga.url.substringAfter("/series/")
-        val chaptersDeferred = async { getChapters(seriesId) }
+        val headers = buildAuthHeaders()
+        val chaptersDeferred = async { getChapters(seriesId, headers) }
 
         val response = webClient.httpGet(
             "https://appswat.com/v2/api/v2/series/?type=131&page=1",
-            buildAuthHeaders(),
+            headers,
         ).parseJson()
         val results = response.getJSONArray("results")
 
@@ -241,8 +254,9 @@ internal class MangaSwat(context: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterId = chapter.url.substringAfter("/chapters/")
+        // Use v1 API for chapters - this is what requires authentication
         val response = webClient.httpGet(
-            "https://appswat.com/v2/api/v2/chapters/$chapterId/",
+            "https://appswat.com/v2/api/v1/chapters/$chapterId/",
             buildAuthHeaders(),
         ).parseJson()
         val images = response.getJSONArray("images")
@@ -260,10 +274,9 @@ internal class MangaSwat(context: MangaLoaderContext) :
 
     // ─── Chapters ──────────────────────────────────────────────────────────────
 
-    private suspend fun getChapters(seriesId: String): List<MangaChapter> {
+    private suspend fun getChapters(seriesId: String, headers: Headers?): List<MangaChapter> {
         val allChapters = mutableListOf<JSONObject>()
         var page = 1
-        val headers = buildAuthHeaders()
 
         while (true) {
             val url = "https://appswat.com/v2/api/v2/chapters/?page=$page&serie=$seriesId&order_by=-order&page_size=20"
