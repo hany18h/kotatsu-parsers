@@ -70,4 +70,13 @@ public sealed class ConfigKey<T>(
 	public class InterceptCloudflare(
 		override val defaultValue: Boolean = false,
 	) : ConfigKey<Boolean>("intercept_cloudflare")
+
+    public class Username(
+    override val defaultValue: String = "",
+    ) : ConfigKey<String>("username")
+
+    public class Password(
+    override val defaultValue: String = "",
+    ) : ConfigKey<String>("password")
+
 }
