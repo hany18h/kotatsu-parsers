@@ -2,6 +2,9 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import okhttp3.Headers
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaParserAuthProvider
@@ -21,25 +24,88 @@ internal class MangaSwat(context: MangaLoaderContext) :
 
     override val configKeyDomain = ConfigKey.Domain("meshmanga.com")
 
+    private val configKeyUsername = ConfigKey.Username()
+    private val configKeyPassword = ConfigKey.Password()
+
+    // Token cache
+    private var accessToken: String? = null
+    private var refreshToken: String? = null
+    private var tokenExpiry: Long = 0L
+    private val tokenMutex = Mutex()
+
     // ─── Auth ──────────────────────────────────────────────────────────────────
 
     override val authUrl: String
         get() = "https://meshmanga.com/accounts/login/"
 
     override suspend fun isAuthorized(): Boolean {
-        return try {
-            val response = webClient.httpGet("https://appswat.com/v2/api/v1/users/me/").parseJson()
-            response.has("id")
-        } catch (e: Exception) {
-            false
-        }
+        return getValidToken() != null
     }
 
     override suspend fun getUsername(): String {
-        val response = webClient.httpGet("https://appswat.com/v2/api/v1/users/me/").parseJson()
+        val headers = buildAuthHeaders() ?: throw AuthRequiredException(source)
+        val response = webClient.httpGet(
+            "https://appswat.com/v2/api/v1/users/me/",
+            headers,
+        ).parseJson()
         return response.optString("username", "").ifEmpty {
             throw AuthRequiredException(source)
         }
+    }
+
+    private suspend fun getValidToken(): String? = tokenMutex.withLock {
+        val now = System.currentTimeMillis()
+
+        // 1. Return cached access token if still valid
+        val cached = accessToken
+        if (cached != null && now < tokenExpiry) {
+            return@withLock cached
+        }
+
+        // 2. Try refresh token first (no need for username/password)
+        val refresh = refreshToken
+        if (refresh != null) {
+            try {
+                val response = webClient.httpPost(
+                    "https://appswat.com/v2/api/v1/token/refresh/",
+                    mapOf("refresh" to refresh),
+                ).parseJson()
+                accessToken = response.getString("access")
+                tokenExpiry = now + (14 * 60 * 1000L)
+                return@withLock accessToken
+            } catch (e: Exception) {
+                // Refresh token expired, fall through to re-login
+                refreshToken = null
+            }
+        }
+
+        // 3. Re-login with username/password
+        val username = config[configKeyUsername].orEmpty()
+        val password = config[configKeyPassword].orEmpty()
+        if (username.isEmpty() || password.isEmpty()) return@withLock null
+
+        return@withLock try {
+            val response = webClient.httpPost(
+                "https://appswat.com/v2/api/v1/token/",
+                mapOf(
+                    "username" to username,
+                    "password" to password,
+                ),
+            ).parseJson()
+            accessToken = response.getString("access")
+            refreshToken = response.getString("refresh")
+            tokenExpiry = now + (14 * 60 * 1000L)
+            accessToken
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private suspend fun buildAuthHeaders(): Headers? {
+        val token = getValidToken() ?: return null
+        return Headers.Builder()
+            .add("Authorization", "Bearer $token")
+            .build()
     }
 
     // ─── Filter ────────────────────────────────────────────────────────────────
@@ -65,7 +131,10 @@ internal class MangaSwat(context: MangaLoaderContext) :
     )
 
     private suspend fun fetchAvailableTags(): Set<MangaTag> {
-        val response = webClient.httpGet("https://appswat.com/v2/api/v2/genres/").parseJsonArray()
+        val response = webClient.httpGet(
+            "https://appswat.com/v2/api/v2/genres/",
+            buildAuthHeaders(),
+        ).parseJsonArray()
         val tags = mutableSetOf<MangaTag>()
         for (i in 0 until response.length()) {
             val genreObj = response.getJSONObject(i)
@@ -85,27 +154,21 @@ internal class MangaSwat(context: MangaLoaderContext) :
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         val url = buildString {
             append("https://appswat.com/v2/api/v2/series/?type=131&page=$page")
-
             if (!filter.query.isNullOrEmpty()) {
                 append("&search=${filter.query.urlEncoded()}")
             }
-
             when (order) {
                 SortOrder.POPULARITY -> append("&order_by=followers_count")
                 SortOrder.RATING -> append("&order_by=-rating")
                 else -> {}
             }
-
             if (filter.tags.isNotEmpty()) {
-                filter.tags.forEach { tag ->
-                    append("&genres=${tag.key}")
-                }
+                filter.tags.forEach { tag -> append("&genres=${tag.key}") }
             }
         }
 
-        val response = webClient.httpGet(url).parseJson()
+        val response = webClient.httpGet(url, buildAuthHeaders()).parseJson()
         val results = response.getJSONArray("results")
-
         return (0 until results.length()).map { i ->
             parseMangaFromJson(results.getJSONObject(i))
         }
@@ -118,8 +181,7 @@ internal class MangaSwat(context: MangaLoaderContext) :
         val title = json.getString("title")
         val slug = json.getString("slug")
 
-        val status = json.getJSONObject("status")
-        val state = when (status.getString("name")) {
+        val state = when (json.getJSONObject("status").getString("name")) {
             "ongoing" -> MangaState.ONGOING
             "completed" -> MangaState.FINISHED
             else -> null
@@ -171,8 +233,10 @@ internal class MangaSwat(context: MangaLoaderContext) :
         val seriesId = manga.url.substringAfter("/series/")
         val chaptersDeferred = async { getChapters(seriesId) }
 
-        val detailUrl = "https://appswat.com/v2/api/v2/series/?type=131&page=1"
-        val response = webClient.httpGet(detailUrl).parseJson()
+        val response = webClient.httpGet(
+            "https://appswat.com/v2/api/v2/series/?type=131&page=1",
+            buildAuthHeaders(),
+        ).parseJson()
         val results = response.getJSONArray("results")
 
         var updatedManga = manga
@@ -184,16 +248,17 @@ internal class MangaSwat(context: MangaLoaderContext) :
             }
         }
 
-        return@coroutineScope updatedManga.copy(
-            chapters = chaptersDeferred.await(),
-        )
+        updatedManga.copy(chapters = chaptersDeferred.await())
     }
 
     // ─── Pages ─────────────────────────────────────────────────────────────────
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterId = chapter.url.substringAfter("/chapters/")
-        val response = webClient.httpGet("https://appswat.com/v2/api/v2/chapters/$chapterId/").parseJson()
+        val response = webClient.httpGet(
+            "https://appswat.com/v2/api/v2/chapters/$chapterId/",
+            buildAuthHeaders(),
+        ).parseJson()
         val images = response.getJSONArray("images")
 
         return (0 until images.length()).map { i ->
@@ -212,18 +277,17 @@ internal class MangaSwat(context: MangaLoaderContext) :
     private suspend fun getChapters(seriesId: String): List<MangaChapter> {
         val allChapters = mutableListOf<JSONObject>()
         var page = 1
+        val headers = buildAuthHeaders()
 
         while (true) {
             val url = "https://appswat.com/v2/api/v2/chapters/?page=$page&serie=$seriesId&order_by=-order&page_size=20"
-            val response = webClient.httpGet(url).parseJson()
+            val response = webClient.httpGet(url, headers).parseJson()
             val results = response.getJSONArray("results")
 
             if (results.length() == 0) break
-
             for (i in 0 until results.length()) {
                 allChapters.add(results.getJSONObject(i))
             }
-
             if (response.isNull("next")) break
             page++
         }
@@ -238,7 +302,6 @@ internal class MangaSwat(context: MangaLoaderContext) :
             } catch (e: Exception) {
                 0L
             }
-
             MangaChapter(
                 id = generateUid(chapterId.toString()),
                 title = item.getString("title"),
