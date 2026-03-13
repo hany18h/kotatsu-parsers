@@ -7,11 +7,9 @@ import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
-import org.koitharu.kotatsu.parsers.MangaParserAuthProvider
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
-import org.koitharu.kotatsu.parsers.exception.AuthRequiredException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
@@ -19,8 +17,7 @@ import java.util.*
 
 @MangaSourceParser("MANGASWAT", "Manga Swat", "ar", ContentType.MANGA)
 internal class MangaSwat(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.MANGASWAT, 20),
-    MangaParserAuthProvider {
+    PagedMangaParser(context, MangaParserSource.MANGASWAT, 20) {
 
     override val configKeyDomain = ConfigKey.Domain("meshmanga.com")
 
@@ -33,25 +30,15 @@ internal class MangaSwat(context: MangaLoaderContext) :
     private var tokenExpiry: Long = 0L
     private val tokenMutex = Mutex()
 
+    // ─── Config ────────────────────────────────────────────────────────────────
+
+    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+        super.onCreateConfig(keys)
+        keys.add(configKeyUsername)
+        keys.add(configKeyPassword)
+    }
+
     // ─── Auth ──────────────────────────────────────────────────────────────────
-
-    override val authUrl: String
-        get() = "https://meshmanga.com/accounts/login/"
-
-    override suspend fun isAuthorized(): Boolean {
-        return getValidToken() != null
-    }
-
-    override suspend fun getUsername(): String {
-        val headers = buildAuthHeaders() ?: throw AuthRequiredException(source)
-        val response = webClient.httpGet(
-            "https://appswat.com/v2/api/v1/users/me/",
-            headers,
-        ).parseJson()
-        return response.optString("username", "").ifEmpty {
-            throw AuthRequiredException(source)
-        }
-    }
 
     private suspend fun getValidToken(): String? = tokenMutex.withLock {
         val now = System.currentTimeMillis()
@@ -62,7 +49,7 @@ internal class MangaSwat(context: MangaLoaderContext) :
             return@withLock cached
         }
 
-        // 2. Try refresh token first (no need for username/password)
+        // 2. Try refresh token
         val refresh = refreshToken
         if (refresh != null) {
             try {
@@ -74,12 +61,11 @@ internal class MangaSwat(context: MangaLoaderContext) :
                 tokenExpiry = now + (14 * 60 * 1000L)
                 return@withLock accessToken
             } catch (e: Exception) {
-                // Refresh token expired, fall through to re-login
                 refreshToken = null
             }
         }
 
-        // 3. Re-login with username/password
+        // 3. Login with username/password from config
         val username = config[configKeyUsername].orEmpty()
         val password = config[configKeyPassword].orEmpty()
         if (username.isEmpty() || password.isEmpty()) return@withLock null
