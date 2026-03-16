@@ -16,8 +16,86 @@ internal class FadaaAlriwayat(context: MangaLoaderContext) :
     override val tagPrefix = "cont-genre/"
     override val datePattern = "MMMM d, yyyy"
 
-    // الموقع يستخدم AJAX لتحميل الفصول
-    override val postReq = true
+    // الموقع لا يدعم المانجا المشابهة — نتجنب الخطأ
+    override suspend fun getRelatedManga(seed: Manga): List<Manga> = emptyList()
+
+    override suspend fun getDetails(manga: Manga): Manga {
+        val fullUrl = manga.url.toAbsoluteUrl(domain)
+        val doc = webClient.httpGet(fullUrl).parseHtml()
+
+        // جلب الـ manga ID من الصفحة مباشرة
+        val mangaId = doc.selectFirst("div#manga-chapters-holder")?.attr("data-id")
+            ?: doc.selectFirst("div.nhv-manga-chapters")?.attr("data-post-id")
+            ?: doc.selectFirst("[data-manga-id]")?.attr("data-manga-id")
+            ?: ""
+
+        val href = doc.selectFirst("head meta[property='og:url']")
+            ?.attr("content")?.toRelativeUrl(domain) ?: manga.url
+
+        val chapters = if (mangaId.isNotEmpty()) {
+            loadChaptersWithId(mangaId)
+        } else {
+            // fallback: جلب الفصول من الصفحة مباشرة
+            getChapters(manga, doc)
+        }
+
+        val desc = doc.select(selectDesc).html()
+
+        val stateDiv = doc.selectFirst(selectState)
+            ?.selectLast("div.summary-content")
+            ?: doc.selectFirst("div.manga-status .nhv-meta-value")
+
+        val state = stateDiv?.let {
+            when (it.text().lowercase()) {
+                in ongoing -> MangaState.ONGOING
+                in finished -> MangaState.FINISHED
+                in abandoned -> MangaState.ABANDONED
+                in paused -> MangaState.PAUSED
+                else -> null
+            }
+        }
+
+        return manga.copy(
+            title = doc.selectFirst("h1")?.textOrNull() ?: manga.title,
+            url = href,
+            publicUrl = href.toAbsoluteUrl(domain),
+            tags = doc.body().select(selectGenre).mapToSet { a ->
+                MangaTag(
+                    key = a.attr("href").removeSuffix("/").substringAfterLast('/'),
+                    title = a.text().toTitleCase(),
+                    source = source,
+                )
+            },
+            description = desc,
+            state = state,
+            chapters = chapters,
+            contentRating = ContentRating.SAFE,
+        )
+    }
+
+    private suspend fun loadChaptersWithId(mangaId: String): List<MangaChapter> {
+        val url = "https://$domain/wp-admin/admin-ajax.php"
+        val postData = "action=manga_get_chapters&manga=$mangaId"
+        val doc = webClient.httpPost(url, postData).parseHtml()
+        val dateFormat = java.text.SimpleDateFormat(datePattern, sourceLocale)
+        return doc.select(selectChapter).mapChapters(reversed = true) { i, li ->
+            val a = li.selectFirstOrThrow("a")
+            val href = a.attrAsRelativeUrl("href")
+            val dateText = li.selectFirst(selectDate)?.text()
+            val name = a.selectFirst("p")?.text() ?: a.ownText()
+            MangaChapter(
+                id = generateUid(href),
+                url = href + stylePage,
+                title = name,
+                number = i + 1f,
+                volume = 0,
+                branch = null,
+                uploadDate = parseChapterDate(dateFormat, dateText),
+                scanlator = null,
+                source = source,
+            )
+        }
+    }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val content = getChapterContent(chapter) ?: return emptyList()
@@ -38,16 +116,15 @@ internal class FadaaAlriwayat(context: MangaLoaderContext) :
         val chapterTitle = doc.selectFirst("h3.chapter-name")?.text()?.trim()
             ?: chapter.title ?: ""
 
-        // إزالة العناصر غير المرغوبة
+        // إزالة العناصر غير المرغوبة والـ watermarks
         doc.select(
             "span[aria-hidden=true], p[aria-hidden=true], " +
-                "div.chapter-warning, " +
-                "div.nhv-support-box, div.nhv-support-divider, " +
-                "div.nhv-reading-topbar, div.sidebar-tools, " +
-                "script, style, iframe"
+                "div.chapter-warning, div.nhv-support-box, " +
+                "div.nhv-support-divider, div.nhv-reading-topbar, " +
+                "div.sidebar-tools, script, style, iframe"
         ).remove()
 
-        val contentDiv = doc.selectFirst("div.text-left, div.reading-content") ?: return null
+        val contentDiv = doc.selectFirst("div.text-left") ?: return null
 
         val paragraphs = contentDiv.select("p")
             .map { it.text().trim() }
@@ -74,9 +151,7 @@ internal class FadaaAlriwayat(context: MangaLoaderContext) :
             append("p{margin-bottom:1.3rem;}")
             append("</style></head><body>")
             if (title.isNotBlank()) append("<h1>$title</h1>")
-            paragraphs.forEach { para ->
-                append("<p>$para</p>")
-            }
+            paragraphs.forEach { append("<p>$it</p>") }
             append("</body></html>")
         }
     }
