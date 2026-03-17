@@ -7,4 +7,7 @@ import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 
 @MangaSourceParser("HIZOMANGA", "Hizo Manga", "ar")
 internal class HizoManga(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.HIZOMANGA, "hizomanga.net")
+	MadaraParser(context, MangaParserSource.HIZOMANGA, "hizomanga.net") {
+
+	override val listUrl = "mangas/"
+}

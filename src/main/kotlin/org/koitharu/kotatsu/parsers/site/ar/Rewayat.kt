@@ -46,15 +46,24 @@ internal class Rewayat(context: MangaLoaderContext) :
     }
 
     private suspend fun fetchAvailableTags(): Set<MangaTag> {
-        val json = webClient.httpGet("https://$apiDomain/api/genres/").parseJson()
+        val json = webClient.httpGet("https://$apiDomain/api/novels/?page=1&ordering=-num_chapters").parseJson()
         val results = json.getJSONArray("results")
-        return results.mapJSONToSet { obj ->
-            MangaTag(
-                title = obj.getStringOrNull("arabic") ?: obj.getString("english"),
-                key = obj.getInt("id").toString(),
-                source = source,
-            )
+        val tags = HashSet<MangaTag>()
+        for (i in 0 until results.length()) {
+            val novel = results.getJSONObject(i)
+            val genres = novel.optJSONArray("genre") ?: continue
+            for (j in 0 until genres.length()) {
+                val g = genres.getJSONObject(j)
+                tags.add(
+                    MangaTag(
+                        title = g.getStringOrNull("arabic") ?: g.getString("english"),
+                        key = g.getInt("id").toString(),
+                        source = source,
+                    ),
+                )
+            }
         }
+        return tags
     }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
