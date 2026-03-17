@@ -199,6 +199,9 @@ internal class Rewayat(context: MangaLoaderContext) :
         return allChapters.flatMap { it }
     }
 
+    // مطلوبة من PagedMangaParser لكن غير مستخدمة للـ NOVEL
+    override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = emptyList()
+
     override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
         val parts = chapter.url.removePrefix("/novel/").split("/")
         if (parts.size < 2) return null
@@ -220,12 +223,11 @@ internal class Rewayat(context: MangaLoaderContext) :
             }
         }
         return NovelChapterContent(
-            html = buildChapterHtml(title, paragraphs),  // ← الآن body فقط
+            html = buildChapterHtml(title, paragraphs),
             images = emptyList(),
         )
     }
 
-    // ─── التعديل الرئيسي: body content فقط، بدون HTML/head/body wrapper ──────
     private fun buildChapterHtml(title: String, paragraphs: List<String>): String {
         return buildString {
             if (title.isNotBlank()) {
