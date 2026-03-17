@@ -1,5 +1,9 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -187,17 +191,15 @@ internal class Rewayat(context: MangaLoaderContext) :
             return allChapters
         }
 
-        // تحميل باقي الصفحات على دفعات لتجنب إثقال السيرفر
-        val batchSize = 5
-        for (batch in (2..totalPages).chunked(batchSize)) {
-            kotlinx.coroutines.coroutineScope {
+        for (batch in (2..totalPages).chunked(5)) {
+            coroutineScope {
                 val jobs = batch.map { page ->
-                    kotlinx.coroutines.async(kotlinx.coroutines.Dispatchers.IO) {
+                    async(Dispatchers.IO) {
                         val json = webClient.httpGet("$baseUrl&page=$page").parseJson()
-                        page to parseChapters(json.getJSONArray("results"))
+                        parseChapters(json.getJSONArray("results"))
                     }
                 }
-                for ((_, chapters) in kotlinx.coroutines.awaitAll(*jobs.toTypedArray())) {
+                jobs.awaitAll().forEach { chapters ->
                     allChapters.addAll(chapters)
                 }
             }
@@ -209,10 +211,7 @@ internal class Rewayat(context: MangaLoaderContext) :
 
     private fun parseDate(dateFormat: SimpleDateFormat, dateStr: String): Long {
         return runCatching {
-            // قص الميكروثواني والمنطقة الزمنية، نأخذ فقط yyyy-MM-ddTHH:mm:ss
             val cleaned = dateStr.substringBefore(".")
-                .substringBefore("+")
-                .substringBefore("-", dateStr.substringBefore("."))
             dateFormat.parse(cleaned)?.time ?: 0L
         }.getOrDefault(0L)
     }
