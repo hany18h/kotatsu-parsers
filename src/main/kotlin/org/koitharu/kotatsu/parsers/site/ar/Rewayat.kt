@@ -9,10 +9,6 @@ import org.koitharu.kotatsu.parsers.util.*
 import org.koitharu.kotatsu.parsers.util.json.*
 import java.text.SimpleDateFormat
 import java.util.*
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 
 @MangaSourceParser("REWAYAT", "نادي الروايات", "ar", ContentType.NOVEL)
 internal class Rewayat(context: MangaLoaderContext) :
@@ -50,7 +46,7 @@ internal class Rewayat(context: MangaLoaderContext) :
         val results = json.getJSONArray("results")
         return results.mapJSONToSet { obj ->
             MangaTag(
-                title = obj.getString("name"),
+                title = obj.getStringOrNull("arabic") ?: obj.getString("english"),
                 key = obj.getInt("id").toString(),
                 source = source,
             )
@@ -102,16 +98,15 @@ internal class Rewayat(context: MangaLoaderContext) :
                 altTitles = setOfNotNull(obj.getStringOrNull("english")),
                 url = novelUrl,
                 publicUrl = "https://$domain$novelUrl",
-                rating = obj.getFloatOrDefault("rating", 0f) / 5f,
+                rating = RATING_UNKNOWN,
                 contentRating = ContentRating.SAFE,
                 coverUrl = obj.getStringOrNull("poster_url")?.toCoverUrl(),
                 tags = emptySet(),
-                state = when (obj.getStringOrNull("status")) {
-                    "ongoing"   -> MangaState.ONGOING
-                    "completed" -> MangaState.FINISHED
-                    else        -> null
+                state = when {
+                    obj.optBoolean("complete", false) -> MangaState.FINISHED
+                    else -> MangaState.ONGOING
                 },
-                authors = setOfNotNull(obj.getStringOrNull("author")),
+                authors = emptySet(),
                 source = source,
             )
         }
@@ -124,28 +119,34 @@ internal class Rewayat(context: MangaLoaderContext) :
         val slug = manga.url.substringAfterLast("/")
         val json = webClient.httpGet("https://$apiDomain/api/novels/$slug/").parseJson()
         val chapters = fetchAllChapters(slug)
-        val tags = json.optJSONArray("genres")?.mapJSONToSet { g ->
+
+        val tags = json.optJSONArray("genre")?.mapJSONToSet { g ->
             MangaTag(
-                title = g.getString("name"),
+                title = g.getStringOrNull("arabic") ?: g.getString("english"),
                 key = g.getInt("id").toString(),
                 source = source,
             )
         } ?: emptySet()
+
         val authors = json.optJSONArray("contributors")?.mapJSONNotNullToSet { c ->
-            c.getStringOrNull("name")
-        } ?: manga.authors
+            c.getStringOrNull("username")
+        } ?: emptySet()
+
+        val statusStr = json.getStringOrNull("get_novel_status")
+        val state = when {
+            statusStr != null && (statusStr.contains("مستمر") || statusStr.contains("ongoing", true)) -> MangaState.ONGOING
+            statusStr != null && (statusStr.contains("مكتمل") || statusStr.contains("completed", true)) -> MangaState.FINISHED
+            else -> manga.state
+        }
+
         return manga.copy(
             title = json.getStringOrNull("arabic") ?: json.getString("english"),
             altTitles = setOfNotNull(json.getStringOrNull("english")),
-            description = json.getStringOrNull("synopsis"),
+            description = json.getStringOrNull("about"),
             coverUrl = json.getStringOrNull("poster_url")?.toCoverUrl() ?: manga.coverUrl,
             largeCoverUrl = json.getStringOrNull("poster_url")?.toCoverUrl(),
-            rating = json.getFloatOrDefault("rating", 0f) / 5f,
-            state = when (json.getStringOrNull("status")) {
-                "ongoing"   -> MangaState.ONGOING
-                "completed" -> MangaState.FINISHED
-                else        -> manga.state
-            },
+            rating = RATING_UNKNOWN,
+            state = state,
             authors = authors,
             tags = tags,
             chapters = chapters,
@@ -153,15 +154,17 @@ internal class Rewayat(context: MangaLoaderContext) :
     }
 
     private suspend fun fetchAllChapters(novelSlug: String): List<MangaChapter> {
-        val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
         val baseUrl = "https://$apiDomain/api/chapters/$novelSlug/?ordering=number"
+
         val firstJson = webClient.httpGet("$baseUrl&page=1").parseJson()
         val totalCount = firstJson.getInt("count")
-        val chapterPageSize = firstJson.getJSONArray("results").length().takeIf { it > 0 } ?: 10
+        val results = firstJson.getJSONArray("results")
+        val chapterPageSize = results.length().takeIf { it > 0 } ?: 20
         val totalPages = (totalCount + chapterPageSize - 1) / chapterPageSize
 
-        fun parseChapters(results: org.json.JSONArray): List<MangaChapter> =
-            results.mapJSON { obj ->
+        fun parseChapters(arr: org.json.JSONArray): List<MangaChapter> =
+            arr.mapJSON { obj ->
                 val number = obj.getInt("number")
                 val chapterUrl = "/novel/$novelSlug/$number"
                 MangaChapter(
@@ -171,35 +174,49 @@ internal class Rewayat(context: MangaLoaderContext) :
                     volume = 0,
                     url = chapterUrl,
                     scanlator = null,
-                    uploadDate = obj.getStringOrNull("date")?.let {
-                        runCatching { dateFormat.parse(it)?.time ?: 0L }.getOrDefault(0L)
-                    } ?: 0L,
+                    uploadDate = obj.getStringOrNull("date")?.let { parseDate(dateFormat, it) } ?: 0L,
                     branch = null,
                     source = source,
                 )
             }
 
+        val allChapters = ArrayList<MangaChapter>(totalCount)
+        allChapters.addAll(parseChapters(results))
+
         if (totalPages <= 1) {
-            return parseChapters(firstJson.getJSONArray("results"))
+            return allChapters
         }
 
-        val allChapters = Array<List<MangaChapter>>(totalPages) { emptyList() }
-        allChapters[0] = parseChapters(firstJson.getJSONArray("results"))
-        coroutineScope {
-            val jobs = (2..totalPages).map { page ->
-                async(Dispatchers.IO) {
-                    val json = webClient.httpGet("$baseUrl&page=$page").parseJson()
-                    page to parseChapters(json.getJSONArray("results"))
+        // تحميل باقي الصفحات على دفعات لتجنب إثقال السيرفر
+        val batchSize = 5
+        for (batch in (2..totalPages).chunked(batchSize)) {
+            kotlinx.coroutines.coroutineScope {
+                val jobs = batch.map { page ->
+                    kotlinx.coroutines.async(kotlinx.coroutines.Dispatchers.IO) {
+                        val json = webClient.httpGet("$baseUrl&page=$page").parseJson()
+                        page to parseChapters(json.getJSONArray("results"))
+                    }
+                }
+                for ((_, chapters) in kotlinx.coroutines.awaitAll(*jobs.toTypedArray())) {
+                    allChapters.addAll(chapters)
                 }
             }
-            for ((page, chapters) in jobs.awaitAll()) {
-                allChapters[page - 1] = chapters
-            }
         }
-        return allChapters.flatMap { it }
+
+        allChapters.sortBy { it.number }
+        return allChapters
     }
 
-    // مطلوبة من PagedMangaParser لكن غير مستخدمة للـ NOVEL
+    private fun parseDate(dateFormat: SimpleDateFormat, dateStr: String): Long {
+        return runCatching {
+            // قص الميكروثواني والمنطقة الزمنية، نأخذ فقط yyyy-MM-ddTHH:mm:ss
+            val cleaned = dateStr.substringBefore(".")
+                .substringBefore("+")
+                .substringBefore("-", dateStr.substringBefore("."))
+            dateFormat.parse(cleaned)?.time ?: 0L
+        }.getOrDefault(0L)
+    }
+
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = emptyList()
 
     override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
