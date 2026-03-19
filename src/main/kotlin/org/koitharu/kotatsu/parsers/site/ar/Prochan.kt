@@ -34,8 +34,8 @@ class ProChan(context: MangaLoaderContext) : PagedMangaParser(context, MangaPars
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
 		val newRequest = request.newBuilder()
-			.header("Referer", "https://${getDomain()}/")
-			.header("Origin", "https://${getDomain()}")
+			.header("Referer", "https://${domain}/")
+			.header("Origin", "https://${domain}")
 			.header("Accept", "*/*")
 			.header("Accept-Language", "en-US,en;q=0.9,ar;q=0.8")
 			.header(
@@ -70,7 +70,7 @@ class ProChan(context: MangaLoaderContext) : PagedMangaParser(context, MangaPars
 	}
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val domain = getDomain()
+		val domain = domain
 		val sortParam = when (order) {
 			SortOrder.UPDATED -> "updates"
 			SortOrder.POPULARITY -> "series"
@@ -134,7 +134,7 @@ class ProChan(context: MangaLoaderContext) : PagedMangaParser(context, MangaPars
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val domain = getDomain()
+		val domain = domain
 		val url = manga.publicUrl.ifBlank { "https://$domain${manga.url}" }
 		val doc = webClient.httpGet(url).parseHtml()
 
@@ -207,7 +207,7 @@ class ProChan(context: MangaLoaderContext) : PagedMangaParser(context, MangaPars
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val domain = getDomain()
+		val domain = domain
 		val url = if (chapter.url.startsWith("http")) chapter.url else "https://$domain${chapter.url}"
 		val doc = webClient.httpGet(url).parseHtml()
 
@@ -261,9 +261,5 @@ class ProChan(context: MangaLoaderContext) : PagedMangaParser(context, MangaPars
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions {
 		return MangaListFilterOptions()
-	}
-
-	private fun getDomain(): String {
-		return domain
 	}
 }
