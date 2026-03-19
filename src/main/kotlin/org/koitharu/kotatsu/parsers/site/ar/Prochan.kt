@@ -2,9 +2,8 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import okhttp3.Interceptor
 import okhttp3.Response
-import org.json.JSONArray
-import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
+import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
@@ -12,10 +11,7 @@ import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
 import java.util.*
 
-/**
- * Parser for ProComic (procomic.pro / procomic.net)
- * Arabic manga/manhua/manhwa reader using Next.js with server-rendered content
- */
+@MangaSourceParser("PROCHAN", "ProChan", "ar")
 class ProChan(context: MangaLoaderContext) : PagedMangaParser(context, MangaParserSource.PROCHAN, 18), Interceptor {
 
 	override val configKeyDomain = ConfigKey.Domain("procomic.pro")
@@ -123,12 +119,12 @@ class ProChan(context: MangaLoaderContext) : PagedMangaParser(context, MangaPars
 					title = title,
 					coverUrl = coverUrl,
 					source = source,
-					altTitle = null,
+					altTitles = emptySet(),
 					rating = RATING_UNKNOWN,
-					isNsfw = false,
+					contentRating = null,
 					tags = emptySet(),
 					state = null,
-					author = null,
+					authors = emptySet(),
 					description = null,
 				),
 			)
@@ -181,7 +177,7 @@ class ProChan(context: MangaLoaderContext) : PagedMangaParser(context, MangaPars
 				MangaChapter(
 					id = generateUid(chapterId),
 					url = href,
-					name = chapterTitle,
+					title = chapterTitle,
 					number = chapterNum,
 					volume = 0,
 					branch = null,
@@ -197,12 +193,14 @@ class ProChan(context: MangaLoaderContext) : PagedMangaParser(context, MangaPars
 			.distinctBy { it.id }
 			.sortedBy { it.number }
 
+		val authors = author?.let { setOf(it) } ?: emptySet()
+
 		return manga.copy(
 			title = title,
 			description = description,
 			coverUrl = coverUrl,
 			largeCoverUrl = coverUrl,
-			author = author,
+			authors = authors,
 			state = state,
 			chapters = sortedChapters,
 		)
