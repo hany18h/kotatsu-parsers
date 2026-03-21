@@ -85,13 +85,23 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
             else -> "latest-updates"
         }
 
+        // The latest-updates endpoint returns chapter-level entries, so the same manga
+        // can appear multiple times. Request more items to compensate for deduplication.
+        val apiLimit = if (order == SortOrder.UPDATED) pageSize * 3 else pageSize
         val url = "https://$domain/api/public/content/$endpoint" +
-            "?limit=$pageSize&category=comics&page=$page"
+            "?limit=$apiLimit&category=comics&page=$page"
 
         val json = webClient.httpGet(url).parseJson()
         val data = json.optJSONArray("data") ?: return emptyList()
 
+        val seen = HashSet<Int>()
         return data.mapJSONNotNull { item ->
+            val mangaId = item.optInt("mangaId").takeIf { it > 0 }
+                ?: item.optInt("id").takeIf { it > 0 }
+                ?: return@mapJSONNotNull null
+            if (!seen.add(mangaId)) {
+                return@mapJSONNotNull null
+            }
             parseMangaFromList(item)
         }
     }
