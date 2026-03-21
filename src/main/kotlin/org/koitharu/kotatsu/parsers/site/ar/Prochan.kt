@@ -241,19 +241,26 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
         val url = "https://$domain/api/public/chapters/$chapterId"
         val json = webClient.httpGet(url).parseJson()
 
-        val cdnPath = json.optString("cdn_path").takeIf { it.isNotEmpty() } ?: "cdn2"
+        val cdnPath = json.optString("cdn_path").takeIf { it.isNotEmpty() }
+        val cdnBase = when {
+            cdnPath != null && cdnPath.startsWith("http") -> cdnPath.trimEnd('/')
+            cdnPath != null -> "https://$cdnPath.procomic.pro"
+            else -> "https://app.procomic.pro"
+        }
 
         val images = json.optJSONObject("metadata")?.optJSONArray("images")
             ?: json.optJSONArray("images")
+            ?: json.optJSONObject("chapter")?.optJSONObject("metadata")?.optJSONArray("images")
+            ?: json.optJSONObject("chapter")?.optJSONArray("images")
             ?: return emptyList()
 
         val result = mutableListOf<MangaPage>()
         for (i in 0 until images.length()) {
-            val imagePath = images.optString(i).takeIf { it.isNotEmpty() } ?: continue
+            val imagePath = extractImagePath(images, i) ?: continue
             val finalUrl = if (imagePath.startsWith("http")) {
                 imagePath
             } else {
-                "https://$cdnPath.procomic.net$imagePath"
+                "$cdnBase$imagePath"
             }
             result.add(
                 MangaPage(
@@ -265,6 +272,20 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
             )
         }
         return result
+    }
+
+    private fun extractImagePath(images: JSONArray, index: Int): String? {
+        val item = images.opt(index) ?: return null
+        if (item is String) {
+            return item.takeIf { it.isNotEmpty() }
+        }
+        if (item is JSONObject) {
+            return item.optString("url").takeIf { it.isNotEmpty() }
+                ?: item.optString("path").takeIf { it.isNotEmpty() }
+                ?: item.optString("src").takeIf { it.isNotEmpty() }
+                ?: item.optString("image").takeIf { it.isNotEmpty() }
+        }
+        return images.optString(index).takeIf { it.isNotEmpty() }
     }
 
     override suspend fun getPageUrl(page: MangaPage): String = page.url
