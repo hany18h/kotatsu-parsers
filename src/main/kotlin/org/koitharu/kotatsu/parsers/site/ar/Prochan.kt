@@ -158,12 +158,10 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
     }
 
     override suspend fun getDetails(manga: Manga): Manga {
-        // URL format: /series/{type}/{id}/{slug}
         val parts = manga.url.split("/").filter { it.isNotEmpty() }
         if (parts.size < 4) return manga
         val id = parts[2]
 
-        // ✅ API الصحيح للفصول
         val chaptersUrl = "https://$domain/api/public/chapters" +
             "?seriesId=$id&page=1&limit=2000&order=asc"
 
@@ -171,7 +169,6 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
             webClient.httpGet(chaptersUrl).parseJson()
         }.getOrElse { return manga }
 
-        // ✅ الفصول في "chapters" وليس "data"
         val chaptersData = chaptersJson.optJSONArray("chapters") ?: JSONArray()
 
         return manga.copy(
@@ -180,25 +177,27 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
     }
 
     private fun parseChapters(data: JSONArray, mangaUrl: String): List<MangaChapter> {
-        return data.mapJSONNotNull { item ->
-            // تخطي الفصول المدفوعة
+        val chapters = mutableListOf<MangaChapter>()
+        for (i in 0 until data.length()) {
+            val item = data.optJSONObject(i) ?: continue
+
             val coinsRequired = item.optInt("coins_required", 0)
             val lockedForever = item.optBoolean("lockedForever", false)
-            if (coinsRequired > 0 || lockedForever) {
-                return@mapJSONNotNull null
-            }
+            if (coinsRequired > 0 || lockedForever) continue
 
-            val chapterId = item.optInt("id").takeIf { it > 0 } ?: return@mapJSONNotNull null
+            val chapterId = item.optInt("id").takeIf { it > 0 } ?: continue
 
-            // الـ slug من metadata أو chapter_number
-            val chapterNumber = item.optString("chapter_number").takeIf { it.isNotEmpty() }
-                ?: item.optString("title").takeIf { it.isNotEmpty() }
-                ?: return@mapJSONNotNull null
+            val chapterNumberStr = item.optString("chapter_number")
+                .takeIf { it.isNotEmpty() && it != "null" }
+            val title = item.optString("title")
+                .takeIf { it.isNotEmpty() && it != "null" }
 
-            val chapterNum = chapterNumber.toFloatOrNull() ?: return@mapJSONNotNull null
-            val title = item.optString("title").takeIf {
-                it.isNotEmpty() && it != "null" && it != chapterNumber
-            }
+            val chapterNum = chapterNumberStr?.toFloatOrNull()
+                ?: title?.toFloatOrNull()
+                ?: (i + 1).toFloat()
+
+            val displayTitle = title?.takeIf { it != chapterNumberStr }
+
             val publishedAt = item.optString("published_at", "")
                 .takeIf { it.isNotEmpty() }
                 ?: item.optString("publishedAt", "")
@@ -207,34 +206,35 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
                 dateFormat.parse(publishedAt)?.time ?: 0L
             }.getOrDefault(0L)
 
-            // نحتاج slug للـ URL - نستخدم chapter_number كـ slug
-            val chapterUrl = "$mangaUrl/$chapterId/$chapterNumber"
+            val chapterUrl = "$mangaUrl/$chapterId"
 
-            MangaChapter(
-                id = generateUid(chapterUrl),
-                title = title,
-                number = chapterNum,
-                volume = 0,
-                url = chapterUrl,
-                scanlator = null,
-                uploadDate = uploadDate,
-                branch = null,
-                source = source,
+            chapters.add(
+                MangaChapter(
+                    id = generateUid(chapterUrl),
+                    title = displayTitle,
+                    number = chapterNum,
+                    volume = 0,
+                    url = chapterUrl,
+                    scanlator = null,
+                    uploadDate = uploadDate,
+                    branch = null,
+                    source = source,
+                ),
             )
         }
+        return chapters
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        // URL: /series/{type}/{mangaId}/{slug}/{chapterId}/{chapterNumber}
+        // URL: /series/{type}/{mangaId}/{slug}/{chapterId}
         val parts = chapter.url.split("/").filter { it.isNotEmpty() }
-        val chapterId = parts.getOrNull(4) ?: return emptyList()
+        val chapterId = parts.lastOrNull() ?: return emptyList()
 
         val url = "https://$domain/api/public/chapters/$chapterId"
         val json = webClient.httpGet(url).parseJson()
 
         val cdnPath = json.optString("cdn_path").takeIf { it.isNotEmpty() } ?: "cdn2"
 
-        // الصور في metadata.images
         val images = json.optJSONObject("metadata")?.optJSONArray("images")
             ?: json.optJSONArray("images")
             ?: return emptyList()
