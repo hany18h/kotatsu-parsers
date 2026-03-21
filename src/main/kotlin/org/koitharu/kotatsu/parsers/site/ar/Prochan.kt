@@ -85,11 +85,8 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
             else -> "latest-updates"
         }
 
-        // The latest-updates endpoint returns chapter-level entries, so the same manga
-        // can appear multiple times. Request more items to compensate for deduplication.
-        val apiLimit = if (order == SortOrder.UPDATED) pageSize * 3 else pageSize
         val url = "https://$domain/api/public/content/$endpoint" +
-            "?limit=$apiLimit&category=comics&page=$page"
+            "?limit=$pageSize&category=comics&page=$page"
 
         val json = webClient.httpGet(url).parseJson()
         val data = json.optJSONArray("data") ?: return emptyList()
@@ -173,7 +170,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
         val id = parts[2]
 
         val chaptersUrl = "https://$domain/api/public/chapters" +
-            "?seriesId=$id&page=1&limit=2000&order=asc"
+            "?contentId=$id&page=1&limit=2000&order=asc"
 
         val chaptersJson = runCatching {
             webClient.httpGet(chaptersUrl).parseJson()
@@ -192,7 +189,8 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
             val item = data.optJSONObject(i) ?: continue
 
             val coinsRequired = item.optInt("coins_required", 0)
-            val lockedForever = item.optBoolean("lockedForever", false)
+            val lockedForever = item.optBoolean("lockedForever", false) ||
+                item.optJSONObject("metadata")?.optBoolean("lockForever", false) == true
             if (coinsRequired > 0 || lockedForever) continue
 
             val chapterId = item.optInt("id").takeIf { it > 0 } ?: continue
