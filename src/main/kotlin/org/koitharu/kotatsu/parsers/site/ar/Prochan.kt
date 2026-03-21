@@ -169,17 +169,30 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
         if (parts.size < 4) return manga
         val id = parts[2]
 
-        val chaptersUrl = "https://$domain/api/public/chapters" +
-            "?contentId=$id&page=1&limit=2000&order=asc"
+        val allChapters = JSONArray()
+        var page = 1
+        while (true) {
+            val chaptersUrl = "https://$domain/api/public/chapters" +
+                "?contentId=$id&page=$page&limit=500&order=asc"
 
-        val chaptersJson = runCatching {
-            webClient.httpGet(chaptersUrl).parseJson()
-        }.getOrElse { return manga }
+            val chaptersJson = runCatching {
+                webClient.httpGet(chaptersUrl).parseJson()
+            }.getOrElse { break }
 
-        val chaptersData = chaptersJson.optJSONArray("chapters") ?: JSONArray()
+            val chaptersData = chaptersJson.optJSONArray("chapters") ?: break
+            if (chaptersData.length() == 0) break
+
+            for (i in 0 until chaptersData.length()) {
+                allChapters.put(chaptersData.opt(i))
+            }
+
+            val hasMore = chaptersJson.optBoolean("hasMore", false)
+            if (!hasMore) break
+            page++
+        }
 
         return manga.copy(
-            chapters = parseChapters(chaptersData, manga.url),
+            chapters = parseChapters(allChapters, manga.url),
         )
     }
 
@@ -230,6 +243,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
                 ),
             )
         }
+        chapters.sortBy { it.number }
         return chapters
     }
 
