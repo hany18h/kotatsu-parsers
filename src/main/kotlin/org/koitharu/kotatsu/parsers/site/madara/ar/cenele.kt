@@ -18,44 +18,41 @@ internal class Cenele(context: MangaLoaderContext) :
 	override val tagPrefix = "novel-genre/"
 	override val datePattern = "MMMM d, yyyy"
 
+	// MadaraParser يضيف "?style=list" لكل رابط فصل
+	// هذا يُغيّر طريقة عرض الصفحة ويُفسد قراءة المحتوى النصي
+	// نُفرّغه حتى يبقى URL الفصل نظيفاً
+	override val stylePage = ""
+
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
 
 		val content = doc.selectFirst("div.text-left") ?: return null
 
 		// إزالة العناصر المخفية التي يضيفها الموقع لحماية المحتوى من السرقة
-		// هذه العناصر تحتوي نصوص مشوهة وتُفسد المحتوى الحقيقي
+		// (spans وparagraphs مع aria-hidden أو role=presentation تحتوي نصوص مشوهة)
 		content.select(
 			"span[aria-hidden=true], " +
 				"span[role=presentation], " +
 				"p[aria-hidden=true], " +
 				"p[role=presentation], " +
+				"input[type=hidden], " +
 				"script, style, ins, iframe, noscript, " +
 				".adsbygoogle, .google-auto-placed, " +
 				"[id^=ezoic], [id^=pf-], [id^=bg-ssp]",
 		).remove()
 
-		// إزالة الـ input المخفية (url الفصل)
-		content.select("input[type=hidden]").remove()
-
-		// إزالة الفقرات الفارغة أو التي تحتوي مسافات فقط
+		// إزالة الفقرات الفارغة بعد تنظيف العناصر المخفية
 		content.select("p").forEach { p ->
-			val text = p.text().trim()
-			if (text.isEmpty() || text == "\u00a0") p.remove()
+			if (p.text().trim().isEmpty()) p.remove()
 		}
 
-		// عنوان الفصل من h3.chapter-name (داخل div#chapter-XXXXX)
 		val title = doc.selectFirst("h3.chapter-name")?.text()?.trim()
 			?: chapter.title
 			?: ""
 
 		return NovelChapterContent(
 			html = buildString {
-				if (title.isNotBlank()) {
-					append("<h1>")
-					append(title)
-					append("</h1>")
-				}
+				if (title.isNotBlank()) append("<h1>$title</h1>")
 				append(content.html())
 			},
 			images = emptyList(),
