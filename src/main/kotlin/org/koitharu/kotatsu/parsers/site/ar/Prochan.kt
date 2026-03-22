@@ -55,7 +55,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val response = chain.proceed(newRequest)
 		val host = request.url.host
 
-		// إصلاح Content-Type للصور التي يُعيدها CDN بدون نوع صحيح
+		// إصلاح Content-Type للصور من CDN
 		if (host.contains("procomic") || host.contains("prochan")) {
 			val contentType = response.header("Content-Type") ?: ""
 			if (contentType.contains("octet-stream") || contentType.isEmpty()) {
@@ -115,10 +115,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val type = item.optString("type", "manhua")
 		if (type == "novel") return null
 
-		val coverUrl = getBestCover(item)
-		val status = item.optString("status", "")
 		val mangaUrl = "/series/$type/$id/$slug"
-
 		return Manga(
 			id = generateUid(mangaUrl),
 			title = title,
@@ -127,9 +124,9 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			publicUrl = "https://$domain$mangaUrl",
 			rating = RATING_UNKNOWN,
 			contentRating = if (item.optBoolean("isSensitiveImage")) ContentRating.ADULT else null,
-			coverUrl = coverUrl,
+			coverUrl = getBestCover(item),
 			tags = emptySet(),
-			state = parseState(status),
+			state = parseState(item.optString("status", "")),
 			authors = emptySet(),
 			description = null,
 			chapters = null,
@@ -140,8 +137,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	private fun getBestCover(item: JSONObject): String {
 		val appCover = item.optJSONObject("coverImageApp")
 		if (appCover != null) {
-			val card = appCover.optJSONObject("card")
-			val mobile = card?.optString("mobile")?.takeIf { it.isNotEmpty() }
+			val mobile = appCover.optJSONObject("card")?.optString("mobile")?.takeIf { it.isNotEmpty() }
 			if (mobile != null) return mobile
 			val desktop = appCover.optString("desktop").takeIf { it.isNotEmpty() }
 			if (desktop != null) return desktop
@@ -166,25 +162,20 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val allChapters = JSONArray()
 		var page = 1
 		while (true) {
-			val chaptersUrl = "https://$domain/api/public/chapters" +
-				"?contentId=$id&page=$page&limit=500&order=asc"
-
 			val chaptersJson = runCatching {
-				webClient.httpGet(chaptersUrl).parseJson()
+				webClient.httpGet(
+					"https://$domain/api/public/chapters?contentId=$id&page=$page&limit=500&order=asc",
+				).parseJson()
 			}.getOrElse { break }
 
 			val chaptersData = chaptersJson.optJSONArray("chapters") ?: break
 			if (chaptersData.length() == 0) break
-			for (i in 0 until chaptersData.length()) {
-				allChapters.put(chaptersData.opt(i))
-			}
+			for (i in 0 until chaptersData.length()) allChapters.put(chaptersData.opt(i))
 			if (!chaptersJson.optBoolean("hasMore", false)) break
 			page++
 		}
 
-		return manga.copy(
-			chapters = parseChapters(allChapters, manga.url),
-		)
+		return manga.copy(chapters = parseChapters(allChapters, manga.url))
 	}
 
 	private fun parseChapters(data: JSONArray, mangaUrl: String): List<MangaChapter> {
@@ -198,35 +189,21 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			if (coinsRequired > 0 || lockedForever) continue
 
 			val chapterId = item.optInt("id").takeIf { it > 0 } ?: continue
-
-			val chapterNumberStr = item.optString("chapter_number")
-				.takeIf { it.isNotEmpty() && it != "null" }
-			val title = item.optString("title")
-				.takeIf { it.isNotEmpty() && it != "null" }
-
-			val chapterNum = chapterNumberStr?.toFloatOrNull()
-				?: title?.toFloatOrNull()
-				?: (i + 1).toFloat()
-
-			val displayTitle = title?.takeIf { it != chapterNumberStr }
-
-			val publishedAt = item.optString("published_at", "")
-				.takeIf { it.isNotEmpty() }
+			val chapterNumberStr = item.optString("chapter_number").takeIf { it.isNotEmpty() && it != "null" }
+			val title = item.optString("title").takeIf { it.isNotEmpty() && it != "null" }
+			val chapterNum = chapterNumberStr?.toFloatOrNull() ?: title?.toFloatOrNull() ?: (i + 1).toFloat()
+			val publishedAt = item.optString("published_at", "").takeIf { it.isNotEmpty() }
 				?: item.optString("publishedAt", "")
-
-			val uploadDate = runCatching {
-				dateFormat.parse(publishedAt)?.time ?: 0L
-			}.getOrDefault(0L)
 
 			chapters.add(
 				MangaChapter(
 					id = generateUid("$mangaUrl/$chapterId"),
-					title = displayTitle,
+					title = title?.takeIf { it != chapterNumberStr },
 					number = chapterNum,
 					volume = 0,
 					url = "$mangaUrl/$chapterId",
 					scanlator = null,
-					uploadDate = uploadDate,
+					uploadDate = runCatching { dateFormat.parse(publishedAt)?.time ?: 0L }.getOrDefault(0L),
 					branch = null,
 					source = source,
 				),
@@ -237,30 +214,35 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val parts = chapter.url.split("/").filter { it.isNotEmpty() }
-		val chapterId = parts.lastOrNull() ?: return emptyList()
+		val chapterId = chapter.url.split("/").filter { it.isNotEmpty() }.lastOrNull() ?: return emptyList()
 
-		val url = "https://$domain/api/public/chapters/$chapterId"
-		val json = webClient.httpGet(url).parseJson()
+		val json = webClient.httpGet("https://$domain/api/public/chapters/$chapterId").parseJson()
 
-		// ——— الأولوية: appImages (الصور الكاملة غير المقطعة) ———
-		// الموقع يقسم كل صفحة لـ mobile (نصف يسار) + desktop (نصف يمين أو كاملة)
-		// نستخدم desktop لأنها الصورة الكاملة
-		val appImages = json.optJSONArray("appImages")
-		if (appImages != null && appImages.length() > 0) {
+		// الصور الكاملة موجودة في "images" array من CDN مباشرة
+		// هذه الصور غير مقسمة — API يُرجعها كاملة بدون Turnstile عند الاستدعاء المباشر
+		val cdnPath = json.optString("cdn_path").takeIf { it.isNotEmpty() }
+		val cdnBase = when {
+			cdnPath != null && cdnPath.startsWith("http") -> cdnPath.trimEnd('/')
+			cdnPath != null -> "https://$cdnPath.procomic.pro"
+			else -> "https://app.procomic.pro"
+		}
+
+		// جرب images من metadata أولاً، ثم root
+		val images: JSONArray? =
+			json.optJSONObject("metadata")?.optJSONArray("images")
+				?: json.optJSONArray("images")
+				?: json.optJSONObject("chapter")?.optJSONObject("metadata")?.optJSONArray("images")
+				?: json.optJSONObject("chapter")?.optJSONArray("images")
+
+		if (!images.isNullOrEmpty()) {
 			val pages = mutableListOf<MangaPage>()
-			for (i in 0 until appImages.length()) {
-				val imgObj = appImages.optJSONObject(i) ?: continue
-				// desktop = الصورة الكاملة للصفحة
-				val desktopUrl = imgObj.optString("desktop").takeIf { it.isNotEmpty() }
-				// fallback لـ mobile إذا desktop غير موجود
-				val imageUrl = desktopUrl
-					?: imgObj.optString("mobile").takeIf { it.isNotEmpty() }
-					?: continue
+			for (i in 0 until images.length()) {
+				val imagePath = extractImagePath(images, i) ?: continue
+				val finalUrl = if (imagePath.startsWith("http")) imagePath else "$cdnBase/$imagePath".replace("//", "/").replace("https:/", "https://")
 				pages.add(
 					MangaPage(
 						id = generateUid("${chapter.id}-$i"),
-						url = imageUrl,
+						url = finalUrl,
 						preview = null,
 						source = source,
 					),
@@ -269,35 +251,24 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			if (pages.isNotEmpty()) return pages
 		}
 
-		// ——— Fallback: images array من CDN ———
-		val cdnPath = json.optString("cdn_path").takeIf { it.isNotEmpty() }
-		val cdnBase = when {
-			cdnPath != null && cdnPath.startsWith("http") -> cdnPath.trimEnd('/')
-			cdnPath != null -> "https://$cdnPath.procomic.pro"
-			else -> "https://app.procomic.pro"
+		// Fallback: appImages → desktop (أفضل من mobile لكن قد تكون مقسمة)
+		val appImages = json.optJSONArray("appImages")
+		if (!appImages.isNullOrEmpty()) {
+			val pages = mutableListOf<MangaPage>()
+			for (i in 0 until appImages.length()) {
+				val obj = appImages.optJSONObject(i) ?: continue
+				val url = obj.optString("desktop").takeIf { it.isNotEmpty() }
+					?: obj.optString("mobile").takeIf { it.isNotEmpty() }
+					?: continue
+				pages.add(MangaPage(id = generateUid("${chapter.id}-app-$i"), url = url, preview = null, source = source))
+			}
+			if (pages.isNotEmpty()) return pages
 		}
 
-		val images = json.optJSONObject("metadata")?.optJSONArray("images")
-			?: json.optJSONArray("images")
-			?: json.optJSONObject("chapter")?.optJSONObject("metadata")?.optJSONArray("images")
-			?: json.optJSONObject("chapter")?.optJSONArray("images")
-			?: return emptyList()
-
-		val result = mutableListOf<MangaPage>()
-		for (i in 0 until images.length()) {
-			val imagePath = extractImagePath(images, i) ?: continue
-			val finalUrl = if (imagePath.startsWith("http")) imagePath else "$cdnBase$imagePath"
-			result.add(
-				MangaPage(
-					id = generateUid("${chapter.id}-$i"),
-					url = finalUrl,
-					preview = null,
-					source = source,
-				),
-			)
-		}
-		return result
+		return emptyList()
 	}
+
+	private fun JSONArray?.isNullOrEmpty() = this == null || this.length() == 0
 
 	private fun extractImagePath(images: JSONArray, index: Int): String? {
 		val item = images.opt(index) ?: return null
