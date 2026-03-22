@@ -18,18 +18,21 @@ internal class Cenele(context: MangaLoaderContext) :
 	override val tagPrefix = "novel-genre/"
 	override val datePattern = "MMMM d, yyyy"
 
-	// MadaraParser يضيف "?style=list" لكل رابط فصل
-	// هذا يُغيّر طريقة عرض الصفحة ويُفسد قراءة المحتوى النصي
-	// نُفرّغه حتى يبقى URL الفصل نظيفاً
+	// منع إضافة ?style=list للفصول الجديدة
 	override val stylePage = ""
 
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
-		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
+		// نحذف ?style=list من الـ URL في حالة كان مخزناً من قبل
+		val cleanUrl = chapter.url
+			.replace("?style=list", "")
+			.replace("&style=list", "")
+			.toAbsoluteUrl(domain)
+
+		val doc = webClient.httpGet(cleanUrl).parseHtml()
 
 		val content = doc.selectFirst("div.text-left") ?: return null
 
-		// إزالة العناصر المخفية التي يضيفها الموقع لحماية المحتوى من السرقة
-		// (spans وparagraphs مع aria-hidden أو role=presentation تحتوي نصوص مشوهة)
+		// إزالة العناصر المخفية (حماية الموقع من السرقة)
 		content.select(
 			"span[aria-hidden=true], " +
 				"span[role=presentation], " +
@@ -41,7 +44,7 @@ internal class Cenele(context: MangaLoaderContext) :
 				"[id^=ezoic], [id^=pf-], [id^=bg-ssp]",
 		).remove()
 
-		// إزالة الفقرات الفارغة بعد تنظيف العناصر المخفية
+		// إزالة الفقرات الفارغة
 		content.select("p").forEach { p ->
 			if (p.text().trim().isEmpty()) p.remove()
 		}
