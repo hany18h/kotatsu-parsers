@@ -1,9 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
-import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
-import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -24,20 +21,6 @@ internal class DilarTube(context: MangaLoaderContext) :
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
         keys.add(userAgentKey)
-    }
-
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val originalRequest = chain.request()
-
-        // Only modify POST requests to the search/filter endpoint
-        if (originalRequest.method == "POST" && originalRequest.url.toString().contains("/api/search/filter")) {
-            val newRequest = originalRequest.newBuilder()
-                .removeHeader("Content-Encoding")
-                .build()
-            return chain.proceed(newRequest)
-        }
-
-        return chain.proceed(originalRequest)
     }
 
     override val filterCapabilities: MangaListFilterCapabilities
@@ -63,8 +46,6 @@ internal class DilarTube(context: MangaLoaderContext) :
             val groupId = group.optString("id").toIntOrNull() ?: group.optInt("id")
             val categories = group.getJSONArray("categories")
 
-            // Group 3 is "Style" (Manhwa, etc) -> seriesType
-            // Others -> categories
             val prefix = if (groupId == 3) "seriesType" else "categories"
 
             for (j in 0 until categories.length()) {
@@ -83,11 +64,9 @@ internal class DilarTube(context: MangaLoaderContext) :
     }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        // Check if we have any actual filters to apply
         val hasSearch = !filter.query.isNullOrBlank()
         val hasTagFilters = filter.tags.isNotEmpty() || filter.tagsExclude.isNotEmpty()
 
-        // Use GET for default listing only (no search, no tags)
         if (!hasSearch && !hasTagFilters) {
             val url = "https://v2.dilar.tube/api/series/?page=$page"
             val response = webClient.httpGet(url).parseJson()
@@ -97,7 +76,6 @@ internal class DilarTube(context: MangaLoaderContext) :
             }
         }
 
-        // Use POST for search and/or tag filtering
         val url = "https://v2.dilar.tube/api/search/filter"
 
         val seriesTypeInclude = mutableListOf<Int>()
@@ -105,88 +83,71 @@ internal class DilarTube(context: MangaLoaderContext) :
         val categoriesInclude = mutableListOf<Int>()
         val categoriesExclude = mutableListOf<Int>()
 
-            filter.tags.forEach { tag ->
-                val parts = tag.key.split(":")
-                if (parts.size == 2) {
-                    val type = parts[0]
-                    val id = parts[1].toIntOrNull() ?: return@forEach
-                    if (type == "seriesType") {
-                        seriesTypeInclude.add(id)
-                    } else if (type == "categories") {
-                        categoriesInclude.add(id)
-                    }
-                }
+        filter.tags.forEach { tag ->
+            val parts = tag.key.split(":")
+            if (parts.size == 2) {
+                val type = parts[0]
+                val id = parts[1].toIntOrNull() ?: return@forEach
+                if (type == "seriesType") seriesTypeInclude.add(id)
+                else if (type == "categories") categoriesInclude.add(id)
             }
+        }
 
-            filter.tagsExclude.forEach { tag ->
-                val parts = tag.key.split(":")
-                if (parts.size == 2) {
-                    val type = parts[0]
-                    val id = parts[1].toIntOrNull() ?: return@forEach
-                    if (type == "seriesType") {
-                        seriesTypeExclude.add(id)
-                    } else if (type == "categories") {
-                        categoriesExclude.add(id)
-                    }
-                }
+        filter.tagsExclude.forEach { tag ->
+            val parts = tag.key.split(":")
+            if (parts.size == 2) {
+                val type = parts[0]
+                val id = parts[1].toIntOrNull() ?: return@forEach
+                if (type == "seriesType") seriesTypeExclude.add(id)
+                else if (type == "categories") categoriesExclude.add(id)
             }
+        }
 
-            // Build JSON payload exactly as shown in working examples
-            val jsonBody = JSONObject()
+        val jsonBody = JSONObject()
+        jsonBody.put("query", filter.query ?: "")
 
-            // Add query
-            jsonBody.put("query", filter.query ?: "")
+        val seriesTypeObject = JSONObject()
+        val seriesTypeIncludeArray = JSONArray()
+        seriesTypeInclude.forEach { seriesTypeIncludeArray.put(it) }
+        val seriesTypeExcludeArray = JSONArray()
+        seriesTypeExclude.forEach { seriesTypeExcludeArray.put(it) }
+        seriesTypeObject.put("include", seriesTypeIncludeArray)
+        seriesTypeObject.put("exclude", seriesTypeExcludeArray)
+        jsonBody.put("seriesType", seriesTypeObject)
 
-            // Add seriesType
-            val seriesTypeObject = JSONObject()
-            val seriesTypeIncludeArray = JSONArray()
-            seriesTypeInclude.forEach { seriesTypeIncludeArray.put(it) }
-            val seriesTypeExcludeArray = JSONArray()
-            seriesTypeExclude.forEach { seriesTypeExcludeArray.put(it) }
-            seriesTypeObject.put("include", seriesTypeIncludeArray)
-            seriesTypeObject.put("exclude", seriesTypeExcludeArray)
-            jsonBody.put("seriesType", seriesTypeObject)
+        jsonBody.put("oneshot", false)
 
-            // Add oneshot
-            jsonBody.put("oneshot", false)
+        val categoriesObject = JSONObject()
+        val categoriesIncludeArray = JSONArray()
+        categoriesInclude.forEach { categoriesIncludeArray.put(it) }
+        val categoriesExcludeArray = JSONArray()
+        categoriesExclude.forEach { categoriesExcludeArray.put(it) }
+        categoriesObject.put("include", categoriesIncludeArray)
+        categoriesObject.put("exclude", categoriesExcludeArray)
+        jsonBody.put("categories", categoriesObject)
 
-            // Add categories
-            val categoriesObject = JSONObject()
-            val categoriesIncludeArray = JSONArray()
-            categoriesInclude.forEach { categoriesIncludeArray.put(it) }
-            val categoriesExcludeArray = JSONArray()
-            categoriesExclude.forEach { categoriesExcludeArray.put(it) }
-            categoriesObject.put("include", categoriesIncludeArray)
-            categoriesObject.put("exclude", categoriesExcludeArray)
-            jsonBody.put("categories", categoriesObject)
+        val chaptersObject = JSONObject()
+        chaptersObject.put("min", "")
+        chaptersObject.put("max", "")
+        jsonBody.put("chapters", chaptersObject)
 
-            // Add chapters
-            val chaptersObject = JSONObject()
-            chaptersObject.put("min", "")
-            chaptersObject.put("max", "")
-            jsonBody.put("chapters", chaptersObject)
+        val datesObject = JSONObject()
+        datesObject.put("start", JSONObject.NULL)
+        datesObject.put("end", JSONObject.NULL)
+        jsonBody.put("dates", datesObject)
 
-            // Add dates
-            val datesObject = JSONObject()
-            datesObject.put("start", JSONObject.NULL)
-            datesObject.put("end", JSONObject.NULL)
-            jsonBody.put("dates", datesObject)
-
-            // Add page
-            jsonBody.put("page", page)
+        jsonBody.put("page", page)
 
         val response = webClient.httpPost(url.toHttpUrl(), jsonBody).parseJson()
 
-        // Parse the response - search/filter endpoint returns "rows", regular endpoint returns "series"
         val rows = when {
             response.has("rows") -> response.getJSONArray("rows")
             response.has("series") -> response.getJSONArray("series")
-            else -> JSONArray() // Empty array if no results
+            else -> JSONArray()
         }
 
         return (0 until rows.length()).map { i ->
-            val item = rows.getJSONObject(i)
-            parseMangaFromJson(item)
+            parseMangaFromJson(rows.getJSONObject(i))
         }
     }
 
@@ -196,11 +157,9 @@ internal class DilarTube(context: MangaLoaderContext) :
         val cover = json.optString("cover", "")
         val summary = json.optString("summary", "")
 
-        // Build cover URL - rollback to original working structure
         val coverUrl = if (cover.isNotEmpty()) {
-            if (cover.startsWith("http")) {
-                cover
-            } else {
+            if (cover.startsWith("http")) cover
+            else {
                 val coverName = cover.substringBeforeLast('.') + ".webp"
                 "https://dilar.tube/uploads/manga/cover/$id/large_$coverName"
             }
@@ -208,7 +167,6 @@ internal class DilarTube(context: MangaLoaderContext) :
 
         val rating = json.optString("rating", "0.00").toFloatOrNull()?.div(5f) ?: RATING_UNKNOWN
 
-        // Get alternative titles from synonyms
         val synonyms = json.optJSONObject("synonyms")
         val altTitles = mutableSetOf<String>()
         synonyms?.let { syn ->
@@ -252,7 +210,7 @@ internal class DilarTube(context: MangaLoaderContext) :
 
         val title = json.getString("title")
         val summary = json.optString("summary").nullIfEmpty()
-        
+
         val cover = json.optString("cover").nullIfEmpty()
         val coverUrl = if (cover != null) {
             val coverName = cover.substringBeforeLast('.') + ".webp"
@@ -311,11 +269,11 @@ internal class DilarTube(context: MangaLoaderContext) :
 
             val release = releases.getJSONObject(0)
             val releaseId = release.getInt("id")
-            
+
             val chapterNum = item.optString("chapter").toFloatOrNull() ?: 0f
             val volNum = item.optString("volume").toIntOrNull() ?: 0
             val title = item.optString("title").nullIfEmpty() ?: ""
-            
+
             val dateStr = item.optString("created_at")
             val date = try {
                 dateFormat.parse(dateStr)?.time ?: 0L
@@ -350,7 +308,7 @@ internal class DilarTube(context: MangaLoaderContext) :
         return (0 until pagesJson.length()).map { i ->
             val page = pagesJson.getJSONObject(i)
             val imageUrl = page.getString("url")
-            
+
             val fullUrl = if (imageUrl.startsWith("http")) {
                 imageUrl
             } else {
