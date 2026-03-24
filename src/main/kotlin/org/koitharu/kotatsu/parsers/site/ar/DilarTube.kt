@@ -38,7 +38,7 @@ internal class DilarTube(context: MangaLoaderContext) :
     )
 
     private suspend fun fetchAvailableTags(): Set<MangaTag> {
-        val response = webClient.httpGet("https://v2.dilar.tube/api/categories").parseJsonArray()
+        val response = webClient.httpGet("https://dilar.tube/api/categories").parseJsonArray()
         val tags = mutableSetOf<MangaTag>()
 
         for (i in 0 until response.length()) {
@@ -67,8 +67,9 @@ internal class DilarTube(context: MangaLoaderContext) :
         val hasSearch = !filter.query.isNullOrBlank()
         val hasTagFilters = filter.tags.isNotEmpty() || filter.tagsExclude.isNotEmpty()
 
+        // الصفحة الرئيسية بدون بحث أو فلاتر
         if (!hasSearch && !hasTagFilters) {
-            val url = "https://v2.dilar.tube/api/series/?page=$page"
+            val url = "https://dilar.tube/api/series/?page=$page"
             val response = webClient.httpGet(url).parseJson()
             val series = response.getJSONArray("series")
             return (0 until series.length()).map { i ->
@@ -76,6 +77,28 @@ internal class DilarTube(context: MangaLoaderContext) :
             }
         }
 
+        // بحث بالنص فقط بدون فلاتر
+        if (hasSearch && !hasTagFilters) {
+            val url = "https://dilar.tube/api/search/quick_search"
+            val jsonBody = JSONObject()
+            jsonBody.put("query", filter.query ?: "")
+            jsonBody.put("includes", JSONArray().apply { put("Manga") })
+
+            val response = webClient.httpPost(url.toHttpUrl(), jsonBody).parseJsonArray()
+
+            for (i in 0 until response.length()) {
+                val obj = response.getJSONObject(i)
+                if (obj.optString("class") == "Manga") {
+                    val rows = obj.getJSONArray("data")
+                    return (0 until rows.length()).map { j ->
+                        parseMangaFromJson(rows.getJSONObject(j))
+                    }
+                }
+            }
+            return emptyList()
+        }
+
+        // بحث مع فلاتر
         val url = "https://dilar.tube/api/search/filter"
 
         val seriesTypeInclude = mutableListOf<Int>()
@@ -107,28 +130,20 @@ internal class DilarTube(context: MangaLoaderContext) :
         jsonBody.put("query", filter.query ?: "")
 
         val seriesTypeObject = JSONObject()
-        val seriesTypeIncludeArray = JSONArray()
-        seriesTypeInclude.forEach { seriesTypeIncludeArray.put(it) }
-        val seriesTypeExcludeArray = JSONArray()
-        seriesTypeExclude.forEach { seriesTypeExcludeArray.put(it) }
-        seriesTypeObject.put("include", seriesTypeIncludeArray)
-        seriesTypeObject.put("exclude", seriesTypeExcludeArray)
+        seriesTypeObject.put("include", JSONArray().apply { seriesTypeInclude.forEach { put(it) } })
+        seriesTypeObject.put("exclude", JSONArray().apply { seriesTypeExclude.forEach { put(it) } })
         jsonBody.put("seriesType", seriesTypeObject)
 
         jsonBody.put("oneshot", false)
 
         val categoriesObject = JSONObject()
-        val categoriesIncludeArray = JSONArray()
-        categoriesInclude.forEach { categoriesIncludeArray.put(it) }
-        val categoriesExcludeArray = JSONArray()
-        categoriesExclude.forEach { categoriesExcludeArray.put(it) }
-        categoriesObject.put("include", categoriesIncludeArray)
-        categoriesObject.put("exclude", categoriesExcludeArray)
+        categoriesObject.put("include", JSONArray().apply { categoriesInclude.forEach { put(it) } })
+        categoriesObject.put("exclude", JSONArray().apply { categoriesExclude.forEach { put(it) } })
         jsonBody.put("categories", categoriesObject)
 
         val chaptersObject = JSONObject()
-        chaptersObject.put("min", "")
-        chaptersObject.put("max", "")
+        chaptersObject.put("min", JSONObject.NULL)
+        chaptersObject.put("max", JSONObject.NULL)
         jsonBody.put("chapters", chaptersObject)
 
         val datesObject = JSONObject()
@@ -170,10 +185,19 @@ internal class DilarTube(context: MangaLoaderContext) :
         val synonyms = json.optJSONObject("synonyms")
         val altTitles = mutableSetOf<String>()
         synonyms?.let { syn ->
-            syn.optString("arabic")?.takeIf { it.isNotEmpty() && it != "null" }?.let { altTitles.add(it) }
-            syn.optString("english")?.takeIf { it.isNotEmpty() && it != "null" }?.let { altTitles.add(it) }
-            syn.optString("japanese")?.takeIf { it.isNotEmpty() && it != "null" }?.let { altTitles.add(it) }
-            syn.optString("alternative")?.takeIf { it.isNotEmpty() && it != "null" }?.let { altTitles.add(it) }
+            fun addIfValid(value: Any?) {
+                when (value) {
+                    is String -> if (value.isNotEmpty() && value != "null") altTitles.add(value)
+                    is JSONArray -> for (k in 0 until value.length()) {
+                        val s = value.optString(k)
+                        if (s.isNotEmpty() && s != "null") altTitles.add(s)
+                    }
+                }
+            }
+            addIfValid(syn.opt("arabic"))
+            addIfValid(syn.opt("english"))
+            addIfValid(syn.opt("japanese"))
+            addIfValid(syn.opt("alternative"))
         }
 
         val status = json.optString("story_status", "")
@@ -205,7 +229,7 @@ internal class DilarTube(context: MangaLoaderContext) :
 
     override suspend fun getDetails(manga: Manga): Manga {
         val id = manga.url.substringAfterLast("/")
-        val url = "https://v2.dilar.tube/api/series/$id"
+        val url = "https://dilar.tube/api/series/$id"
         val json = webClient.httpGet(url).parseJson()
 
         val title = json.getString("title")
@@ -221,7 +245,7 @@ internal class DilarTube(context: MangaLoaderContext) :
         val state = when (statusStr?.lowercase()) {
             "ongoing" -> MangaState.ONGOING
             "completed" -> MangaState.FINISHED
-            "hiatus" -> MangaState.ONGOING
+            "hiatus" -> MangaState.PAUSED
             else -> null
         }
 
@@ -235,11 +259,13 @@ internal class DilarTube(context: MangaLoaderContext) :
         if (categories != null) {
             for (i in 0 until categories.length()) {
                 val cat = categories.getJSONObject(i)
-                tags.add(MangaTag(
-                    key = cat.getInt("id").toString(),
-                    title = cat.getString("name"),
-                    source = source
-                ))
+                tags.add(
+                    MangaTag(
+                        key = cat.getInt("id").toString(),
+                        title = cat.getString("name"),
+                        source = source,
+                    )
+                )
             }
         }
 
@@ -255,7 +281,7 @@ internal class DilarTube(context: MangaLoaderContext) :
     }
 
     private suspend fun getChapters(seriesId: String): List<MangaChapter> {
-        val url = "https://v2.dilar.tube/api/series/$seriesId/chapters"
+        val url = "https://dilar.tube/api/series/$seriesId/chapters"
         val response = webClient.httpGet(url).parseJson()
         val chaptersJson = response.getJSONArray("chapters")
         val chapters = mutableListOf<MangaChapter>()
@@ -291,7 +317,7 @@ internal class DilarTube(context: MangaLoaderContext) :
                     uploadDate = date,
                     source = source,
                     scanlator = null,
-                    branch = null
+                    branch = null,
                 )
             )
         }
@@ -300,7 +326,7 @@ internal class DilarTube(context: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val id = chapter.url.substringAfterLast("/")
-        val url = "https://v2.dilar.tube/api/chapters/$id"
+        val url = "https://dilar.tube/api/chapters/$id"
         val json = webClient.httpGet(url).parseJson()
         val pagesJson = json.getJSONArray("pages")
         val storageKey = json.optString("storage_key").nullIfEmpty()
@@ -323,7 +349,7 @@ internal class DilarTube(context: MangaLoaderContext) :
                 id = generateUid("$id-$i"),
                 url = fullUrl,
                 preview = null,
-                source = source
+                source = source,
             )
         }
     }
