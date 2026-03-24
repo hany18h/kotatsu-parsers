@@ -5,7 +5,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
-import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
@@ -80,32 +79,28 @@ internal class DilarTube(context: MangaLoaderContext) :
 
         // بحث بالنص فقط بدون فلاتر
         if (hasSearch && !hasTagFilters) {
-    return try {
-        val url = "https://dilar.tube/api/search/quick_search"
-        val jsonBody = JSONObject()
-        jsonBody.put("query", filter.query ?: "")
-        jsonBody.put("includes", JSONArray().apply {
-            put("Manga")
-            put("Team")
-            put("Member")
-        })
-        val response = webClient.httpPost(url.toHttpUrl(), jsonBody).parseJsonArray()
-        for (i in 0 until response.length()) {
-            val obj = response.getJSONObject(i)
-            if (obj.optString("class") == "Manga") {
-                val rows = obj.getJSONArray("data")
-                return (0 until rows.length()).map { j ->
-                    parseMangaFromJson(rows.getJSONObject(j))
+            val url = "https://dilar.tube/api/search/quick_search"
+            val jsonBody = JSONObject()
+            jsonBody.put("query", filter.query ?: "")
+            jsonBody.put("includes", JSONArray().apply {
+                put("Manga")
+                put("Team")
+                put("Member")
+            })
+
+            val response = webClient.httpPost(url.toHttpUrl(), jsonBody).parseJsonArray()
+
+            for (i in 0 until response.length()) {
+                val obj = response.getJSONObject(i)
+                if (obj.optString("class") == "Manga") {
+                    val rows = obj.getJSONArray("data")
+                    return (0 until rows.length()).map { j ->
+                        parseMangaFromJson(rows.getJSONObject(j))
+                    }
                 }
             }
+            return emptyList()
         }
-        emptyList()
-    } catch (e: Exception) {
-        // لو فشل، افتح WebView علشان تحل Cloudflare
-        context.requestBrowserAction(this, "https://dilar.tube")
-        throw ParseException("Please open the browser to verify", "https://dilar.tube")
-    }
-}
 
         // بحث مع فلاتر
         val url = "https://dilar.tube/api/search/filter"
