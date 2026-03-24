@@ -77,7 +77,44 @@ internal class DilarTube(context: MangaLoaderContext) :
             }
         }
 
-        // بحث بالنص فقط أو بحث مع فلاتر — كلاهما يستخدم filter endpoint
+        // بحث بالنص فقط بدون فلاتر
+        if (hasSearch && !hasTagFilters) {
+            return searchByQuery(filter.query!!, page)
+        }
+
+        // بحث بالفلاتر (مع أو بدون نص)
+        return searchByFilter(filter, page)
+    }
+
+    private suspend fun searchByQuery(query: String, page: Int): List<Manga> {
+        // quick_search لا يدعم pagination
+        if (page > 1) return emptyList()
+
+        val url = "https://dilar.tube/api/search/quick_search"
+        val jsonBody = JSONObject().apply {
+            put("query", query)
+            put("includes", JSONArray().apply {
+                put("Manga")
+                put("Team")
+                put("Member")
+            })
+        }
+
+        val response = webClient.httpPost(url.toHttpUrl(), jsonBody).parseJsonArray()
+
+        for (i in 0 until response.length()) {
+            val obj = response.getJSONObject(i)
+            if (obj.optString("class") == "Manga") {
+                val rows = obj.getJSONArray("data")
+                return (0 until rows.length()).map { j ->
+                    parseMangaFromJson(rows.getJSONObject(j))
+                }
+            }
+        }
+        return emptyList()
+    }
+
+    private suspend fun searchByFilter(filter: MangaListFilter, page: Int): List<Manga> {
         val url = "https://dilar.tube/api/search/filter"
 
         val seriesTypeInclude = mutableListOf<Int>()
@@ -105,36 +142,36 @@ internal class DilarTube(context: MangaLoaderContext) :
             }
         }
 
-        val jsonBody = JSONObject()
+        val jsonBody = JSONObject().apply {
+            // أضف query فقط لو مش فاضي
+            if (!filter.query.isNullOrBlank()) {
+                put("query", filter.query)
+            }
 
-        // أضف query فقط لو مش فاضي — السيرفر بيرفض query فاضي بـ 400
-        if (hasSearch) {
-            jsonBody.put("query", filter.query)
+            put("seriesType", JSONObject().apply {
+                put("include", JSONArray().apply { seriesTypeInclude.forEach { put(it) } })
+                put("exclude", JSONArray().apply { seriesTypeExclude.forEach { put(it) } })
+            })
+
+            put("oneshot", false)
+
+            put("categories", JSONObject().apply {
+                put("include", JSONArray().apply { categoriesInclude.forEach { put(it) } })
+                put("exclude", JSONArray().apply { categoriesExclude.forEach { put(it) } })
+            })
+
+            put("chapters", JSONObject().apply {
+                put("min", JSONObject.NULL)
+                put("max", JSONObject.NULL)
+            })
+
+            put("dates", JSONObject().apply {
+                put("start", JSONObject.NULL)
+                put("end", JSONObject.NULL)
+            })
+
+            put("page", page)
         }
-
-        val seriesTypeObject = JSONObject()
-        seriesTypeObject.put("include", JSONArray().apply { seriesTypeInclude.forEach { put(it) } })
-        seriesTypeObject.put("exclude", JSONArray().apply { seriesTypeExclude.forEach { put(it) } })
-        jsonBody.put("seriesType", seriesTypeObject)
-
-        jsonBody.put("oneshot", false)
-
-        val categoriesObject = JSONObject()
-        categoriesObject.put("include", JSONArray().apply { categoriesInclude.forEach { put(it) } })
-        categoriesObject.put("exclude", JSONArray().apply { categoriesExclude.forEach { put(it) } })
-        jsonBody.put("categories", categoriesObject)
-
-        val chaptersObject = JSONObject()
-        chaptersObject.put("min", JSONObject.NULL)
-        chaptersObject.put("max", JSONObject.NULL)
-        jsonBody.put("chapters", chaptersObject)
-
-        val datesObject = JSONObject()
-        datesObject.put("start", JSONObject.NULL)
-        datesObject.put("end", JSONObject.NULL)
-        jsonBody.put("dates", datesObject)
-
-        jsonBody.put("page", page)
 
         val response = webClient.httpPost(url.toHttpUrl(), jsonBody).parseJson()
 
