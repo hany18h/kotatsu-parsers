@@ -133,7 +133,6 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 				MangaState.PAUSED,
 				MangaState.ABANDONED,
 			),
-			availableContentRating = EnumSet.allOf(ContentRating::class.java),
 			availableDemographics = EnumSet.of(
 				Demographic.SHOUNEN,
 				Demographic.SHOUJO,
@@ -246,7 +245,7 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 
 			// If contentRating is not provided, add default values
 			if (!hasContentRating) {
-				append("&contentRating[]=safe&contentRating[]=suggestive&contentRating[]=erotica&contentRating[]=pornographic")
+				append("&contentRating[]=safe&contentRating[]=suggestive")
 			}
 
 			append("&order")
@@ -441,7 +440,7 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 			append(limitedLimit)
 			append("&includes[]=scanlation_group&order[volume]=asc&order[chapter]=asc&offset=")
 			append(offset)
-			append("&contentRating[]=safe&contentRating[]=suggestive&contentRating[]=erotica&contentRating[]=pornographic")
+			append("&contentRating[]=safe&contentRating[]=suggestive")
 		}
 		val json = webClient.httpGet(url).parseJson()
 		if (json.getString("result") == "ok") {
