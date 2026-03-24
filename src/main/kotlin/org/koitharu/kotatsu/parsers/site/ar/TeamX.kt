@@ -13,9 +13,9 @@ import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
 import java.util.*
 
-@MangaSourceParser("TEAMXNOVEL", "TeamXNovel", "ar")
-internal class TeamXNovel(context: MangaLoaderContext) :
-	PagedMangaParser(context, MangaParserSource.TEAMXNOVEL, 10) {
+@MangaSourceParser("TEAMX", "TeamX", "ar")
+internal class TeamX(context: MangaLoaderContext) :
+	PagedMangaParser(context, MangaParserSource.TEAMX, 10) {
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(SortOrder.UPDATED, SortOrder.POPULARITY)
 
