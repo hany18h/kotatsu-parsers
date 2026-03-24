@@ -16,7 +16,7 @@ import java.util.*
 internal class DilarTube(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.DILARTUBE, 24) {
 
-    override val configKeyDomain = ConfigKey.Domain("v2.dilar.tube")
+    override val configKeyDomain = ConfigKey.Domain("dilar.tube")
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
