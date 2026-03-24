@@ -77,32 +77,7 @@ internal class DilarTube(context: MangaLoaderContext) :
             }
         }
 
-        // بحث بالنص فقط بدون فلاتر
-        if (hasSearch && !hasTagFilters) {
-            val url = "https://dilar.tube/api/search/quick_search"
-            val jsonBody = JSONObject()
-            jsonBody.put("query", filter.query ?: "")
-            jsonBody.put("includes", JSONArray().apply {
-                put("Manga")
-                put("Team")
-                put("Member")
-            })
-
-            val response = webClient.httpPost(url.toHttpUrl(), jsonBody).parseJsonArray()
-
-            for (i in 0 until response.length()) {
-                val obj = response.getJSONObject(i)
-                if (obj.optString("class") == "Manga") {
-                    val rows = obj.getJSONArray("data")
-                    return (0 until rows.length()).map { j ->
-                        parseMangaFromJson(rows.getJSONObject(j))
-                    }
-                }
-            }
-            return emptyList()
-        }
-
-        // بحث مع فلاتر
+        // بحث بالنص فقط أو بحث مع فلاتر — كلاهما يستخدم filter endpoint
         val url = "https://dilar.tube/api/search/filter"
 
         val seriesTypeInclude = mutableListOf<Int>()
@@ -131,7 +106,11 @@ internal class DilarTube(context: MangaLoaderContext) :
         }
 
         val jsonBody = JSONObject()
-        jsonBody.put("query", filter.query ?: "")
+
+        // أضف query فقط لو مش فاضي — السيرفر بيرفض query فاضي بـ 400
+        if (hasSearch) {
+            jsonBody.put("query", filter.query)
+        }
 
         val seriesTypeObject = JSONObject()
         seriesTypeObject.put("include", JSONArray().apply { seriesTypeInclude.forEach { put(it) } })
