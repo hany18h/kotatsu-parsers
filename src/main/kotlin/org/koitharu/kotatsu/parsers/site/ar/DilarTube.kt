@@ -76,7 +76,7 @@ internal class DilarTube(context: MangaLoaderContext) :
             }
         }
 
-        val url = "https://v2.dilar.tube/api/search/filter"
+        val url = "https://dilar.tube/api/search/filter"
 
         val seriesTypeInclude = mutableListOf<Int>()
         val seriesTypeExclude = mutableListOf<Int>()
