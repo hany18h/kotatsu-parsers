@@ -13,9 +13,9 @@ import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
 import java.util.*
 
-@MangaSourceParser("TEAMX", "TeamX", "ar")
-internal class TeamX(context: MangaLoaderContext) :
-	PagedMangaParser(context, MangaParserSource.TEAMX, 10) {
+@MangaSourceParser("TEAMXNOVEL", "TeamXNovel", "ar")
+internal class TeamXNovel(context: MangaLoaderContext) :
+	PagedMangaParser(context, MangaParserSource.TEAMXNOVEL, 10) {
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(SortOrder.UPDATED, SortOrder.POPULARITY)
 
@@ -138,58 +138,45 @@ internal class TeamX(context: MangaLoaderContext) :
 	override suspend fun getDetails(manga: Manga): Manga {
 		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
 		val mangaUrl = manga.url.toAbsoluteUrl(domain)
-		
-		// تحسين البحث عن عدد صفحات الفصول
-		val paginationLinks = doc.select(".pagination a, .hpage a, a.page-link")
+		val maxPageChapterSelect = doc.select(".pagination .page-item a")
 		var maxPageChapter = 1
-		
-		paginationLinks.forEach { link ->
-			val href = link.attr("href")
-			// البحث عن رقم الصفحة في الرابط
-			val pageMatch = Regex("""[?&]page=(\d+)""").find(href)
-			pageMatch?.groupValues?.get(1)?.toIntOrNull()?.let { pageNum ->
-				if (pageNum > maxPageChapter) {
-					maxPageChapter = pageNum
+		if (!maxPageChapterSelect.isNullOrEmpty()) {
+			maxPageChapterSelect.map {
+				val i = it.attr("href").substringAfterLast("=").toInt()
+				if (i > maxPageChapter) {
+					maxPageChapter = i
 				}
 			}
 		}
-		
 		return manga.copy(
-			state = doc.selectFirst(".full-list-info:contains(الحالة:) a")?.text()?.let { status ->
-				when (status) {
-					"مستمرة" -> MangaState.ONGOING
-					"مكتمل" -> MangaState.FINISHED
-					"متوقف" -> MangaState.ABANDONED
-					else -> null
-				}
+			state = when (doc.selectFirstOrThrow(".full-list-info:contains(الحالة:) a").text()) {
+				"مستمرة" -> MangaState.ONGOING
+				"مكتمل" -> MangaState.FINISHED
+				"متوقف" -> MangaState.ABANDONED
+				else -> null
 			},
-			tags = doc.select(".review-author-info a, .genre-info a").mapToSet { a ->
+			tags = doc.select(".review-author-info a").mapToSet { a ->
 				MangaTag(
 					key = a.attr("href").substringAfterLast("="),
 					title = a.text(),
 					source = source,
 				)
 			},
-			description = doc.selectFirst(".review-content, .summary__content, .entry-content")?.html(),
+			description = doc.selectFirstOrThrow(".review-content").html(),
 			chapters = run {
 				if (maxPageChapter == 1) {
 					parseChapters(doc)
 				} else {
 					coroutineScope {
-						val allChapters = ArrayList(parseChapters(doc))
-						allChapters.ensureCapacity(allChapters.size * maxPageChapter)
-						
-						val additionalChapters = (2..maxPageChapter).map { page ->
+						val result = ArrayList(parseChapters(doc))
+						result.ensureCapacity(result.size * maxPageChapter)
+						(2..maxPageChapter).map { i ->
 							async {
-								loadChapters(mangaUrl, page)
+								loadChapters(mangaUrl, i)
 							}
 						}.awaitAll()
-						
-						additionalChapters.forEach { chapters ->
-							allChapters.addAll(chapters)
-						}
-						
-						allChapters
+							.flattenTo(result)
+						result
 					}
 				}
 			}.reversed(),
@@ -197,98 +184,67 @@ internal class TeamX(context: MangaLoaderContext) :
 	}
 
 	private suspend fun loadChapters(baseUrl: String, page: Int): List<MangaChapter> {
-		val doc = webClient.httpGet("$baseUrl?page=$page").parseHtml()
-		return parseChapters(doc)
+		return parseChapters(webClient.httpGet("$baseUrl?page=$page").parseHtml().body())
 	}
 
-	private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", sourceLocale)
+	private val dateFormat = SimpleDateFormat("yyyy-MM-dd hh:mm:ss", Locale.getDefault())
 
 	private fun parseChapters(root: Element): List<MangaChapter> {
-		// البحث عن الفصول في enhanced-chapters-grid أولاً
-		val chapterCards = root.select(".enhanced-chapters-grid .chapter-card")
-		
-		if (chapterCards.isNotEmpty()) {
-			return chapterCards.mapNotNull { card ->
-				val link = card.selectFirst(".chapter-link") ?: return@mapNotNull null
-				val url = link.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
-				
-				// تجاهل الروابط التي تفتح modal
-				if (link.hasAttr("data-bs-toggle")) return@mapNotNull null
-				
-				val number = card.attr("data-number").toFloatOrNull() ?: 0f
-				val title = card.selectFirst(".chapter-title")?.text() 
-					?: card.selectFirst(".chapter-number")?.text()
-					?: "Chapter $number"
-				
-				val dateStr = card.attr("data-date")
-				val uploadDate = if (dateStr.isNotEmpty()) {
-					try {
-						dateStr.toLong() * 1000 // Convert to milliseconds
-					} catch (e: Exception) {
-						0
-					}
-				} else {
-					0
+		// Try current website structure first (enhanced-chapters-grid)
+		val chapters = root.select("div.enhanced-chapters-grid a.chapter-link").ifEmpty {
+			// Fallback to potential alternative structures
+			root.select("div.chapter-card a").ifEmpty {
+				root.select("div.eplister ul a").ifEmpty {
+					root.select("#chapter-contact .eplister ul li a")
 				}
-				
-				MangaChapter(
-					id = generateUid(url),
-					title = title,
-					number = number,
-					volume = 0,
-					url = url,
-					scanlator = null,
-					uploadDate = uploadDate,
-					branch = null,
-					source = source,
-				)
 			}
 		}
-		
-		// محاولة البحث في القوائم التقليدية
-		val chapterElements = root.select("#chapter-contact li, .eplister li, ul.clstyle li, .chapter-list li")
-		
-		if (chapterElements.isNotEmpty()) {
-			return chapterElements.mapNotNull { li ->
-				val link = li.selectFirst("a") ?: return@mapNotNull null
-				val url = link.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
-				
-				val title = li.selectFirst(".epl-title, .chapternum, .chapter-title")?.text() 
-					?: link.text()
-					?: "Chapter ${url.substringAfterLast('/')}"
-				
-				val dateElement = li.selectFirst(".epl-date, .chapterdate, .chapter-date")
-				
-				MangaChapter(
-					id = generateUid(url),
-					title = title,
-					number = url.substringAfterLast('/').filter { it.isDigit() || it == '.' }.toFloatOrNull() ?: 0f,
-					volume = 0,
-					url = url,
-					scanlator = null,
-					uploadDate = dateElement?.text()?.let { dateFormat.parseSafe(it) } ?: 0,
-					branch = null,
-					source = source,
-				)
+
+		return chapters.map { element ->
+			val url = element.attrAsRelativeUrl("href")
+
+			// Extract chapter number and title from current structure
+			val chpNum = element.select(".chapter-number").text()
+			val chpTitle = element.select(".chapter-title").text()
+
+			// Fallback to old structure if current selectors are empty
+			val finalChpNum = chpNum.ifEmpty {
+				element.select("div.chapter-info div.chapter-number").text().ifEmpty {
+					element.select("div.epl-num").text()
+				}
 			}
-		}
-		
-		// آخر محاولة: البحث عن أي روابط للفصول
-		return root.select("a[href*=/series/][href*=/]").mapNotNull { link ->
-			val url = link.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
-			val urlPath = url.substringAfter("/series/")
-			if (!urlPath.contains("/")) return@mapNotNull null
-			
-			val number = urlPath.substringAfterLast('/').toFloatOrNull() ?: return@mapNotNull null
-			
+			val finalChpTitle = chpTitle.ifEmpty {
+				element.select("div.chapter-info div.chapter-title").text().ifEmpty {
+					element.select("div.epl-title").text()
+				}
+			}
+
+			val title = when {
+				finalChpNum.isNotBlank() -> "$finalChpNum - $finalChpTitle"
+				else -> finalChpTitle
+			}
+
+			// Extract date from current structure, fallback to old structures
+			val dateText = element.select(".chapter-date").text().ifEmpty {
+				element.select("div.chapter-info div.chapter-date").text().ifEmpty {
+					element.select("div.epl-date").text()
+				}
+			}.replace(Regex("^\\s*\\S+\\s+"), "") // Remove icon text if present
+
+			// Try to extract chapter number from data attribute or URL
+			val chapterNumber = element.select("div.chapter-card").attr("data-number").toFloatOrNull()
+				?: finalChpNum.filter { it.isDigit() || it == '.' }.toFloatOrNull()
+				?: url.substringAfterLast('/').toFloatOrNull()
+				?: 0f
+
 			MangaChapter(
 				id = generateUid(url),
-				title = link.text().ifEmpty { "Chapter $number" },
-				number = number,
+				title = title,
+				number = chapterNumber,
 				volume = 0,
 				url = url,
 				scanlator = null,
-				uploadDate = 0,
+				uploadDate = dateFormat.parseSafe(dateText),
 				branch = null,
 				source = source,
 			)
@@ -298,13 +254,12 @@ internal class TeamX(context: MangaLoaderContext) :
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val fullUrl = chapter.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(fullUrl).parseHtml()
-		return doc.select(".image_list img, .image_list canvas, #readerarea img, .chapter-content img").map { img ->
+		return doc.select(".image_list img, .image_list canvas").map { img ->
 			val url = when {
 				img.hasAttr("src") -> img.requireSrc().toRelativeUrl(domain)
-				img.hasAttr("data-src") -> img.attrAsRelativeUrl("data-src")
-				else -> img.attrAsRelativeUrl("data-lazy-src")
+				else -> img.attrAsRelativeUrl("data-src")
 			}
-			
+
 			MangaPage(
 				id = generateUid(url),
 				url = url,
