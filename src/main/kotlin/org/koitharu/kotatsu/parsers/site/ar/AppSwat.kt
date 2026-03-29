@@ -46,7 +46,6 @@ internal class MangaSwat(context: MangaLoaderContext) :
         val cached = csrfToken
         if (!cached.isNullOrEmpty()) return@withLock cached
 
-        // Fetch the main page to get CSRF token
         val response = webClient.httpGet("https://meshmanga.com/", apiHeaders)
         val html = response.body?.string() ?: ""
         val token = Jsoup.parse(html)
@@ -74,7 +73,6 @@ internal class MangaSwat(context: MangaLoaderContext) :
     override fun intercept(chain: Interceptor.Chain): Response {
         val response = chain.proceed(chain.request())
 
-        // Update CSRF token from HTML responses
         if (response.header("Content-Type")?.contains("text/html") == true) {
             val html = response.peekBody(Long.MAX_VALUE).string()
             val token = Jsoup.parse(html)
@@ -215,7 +213,6 @@ internal class MangaSwat(context: MangaLoaderContext) :
         val seriesId = manga.url.substringAfter("/series/")
         val chaptersDeferred = async { getChapters(seriesId) }
 
-        // Use direct series endpoint
         val response = webClient.httpGet(
             "$apiBaseUrl/series/$seriesId/",
             apiHeaders,
@@ -253,7 +250,8 @@ internal class MangaSwat(context: MangaLoaderContext) :
         var page = 1
 
         while (true) {
-            val url = "$apiBaseUrl/chapters/?serie=$seriesId&order_by=-order&page_size=200&page=$page"
+            // ✅ FIX: جلب تصاعدي (order) بدل تنازلي (-order) وحذف .reversed() اللي كان يعكسه مرتين
+            val url = "$apiBaseUrl/chapters/?serie=$seriesId&order_by=order&page_size=200&page=$page"
             val response = webClient.httpGet(url, apiHeaders).parseJson()
             val results = response.getJSONArray("results")
 
@@ -267,6 +265,7 @@ internal class MangaSwat(context: MangaLoaderContext) :
 
         val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
 
+        // ✅ FIX: الـ index الآن صح لأن القائمة تصاعدية من البداية
         return allChapters.mapIndexedNotNull { index, item ->
             val chapterId = item.getInt("id")
             val chapterNumber = item.optString("chapter", "").toFloatOrNull() ?: (index + 1f)
@@ -286,6 +285,7 @@ internal class MangaSwat(context: MangaLoaderContext) :
                 scanlator = null,
                 branch = null,
             )
-        }.reversed()
+        }
+        // ✅ FIX: حذف .reversed() — مش محتاجه خالص
     }
 }
