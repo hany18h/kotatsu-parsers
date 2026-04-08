@@ -60,10 +60,13 @@ internal class CommonHeadersInterceptor : Interceptor {
 	private fun isImageUrl(url: String): Boolean {
 		// قائمة بـ CDN domains الشائعة للصور
 		val imageCdnPatterns = listOf(
+			"app.procomic.net",
+			"cdn2.procomic.pro",
+			"cdn3.procomic.pro",
+			"cdn4.procomic.pro",
+			"app.procomic.pro",
 			"cdn2.prochan.net",
 			"cdn3.prochan.net",
-			"app.prochan.net/chapters",
-			// يمكن إضافة CDNs أخرى هنا
 		)
 		
 		// امتدادات الصور الشائعة
