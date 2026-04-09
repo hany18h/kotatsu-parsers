@@ -77,18 +77,23 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 
         val response = chain.proceed(newRequestBuilder.build())
 
-        if (isProcomicHost) {
-            val contentType = response.header("Content-Type") ?: ""
-            if (contentType.contains("octet-stream") || contentType.isEmpty()) {
-                val path = request.url.encodedPath.lowercase()
-                val fixedType = when {
-                    path.endsWith(".avif") -> "image/avif"
-                    path.endsWith(".webp") -> "image/webp"
-                    path.endsWith(".jpg") || path.endsWith(".jpeg") -> "image/jpeg"
-                    path.endsWith(".png") -> "image/png"
-                    path.endsWith(".gif") -> "image/gif"
-                    else -> "image/jpeg"
-                }
+        // Fix wrong Content-Type for image responses — CDN sometimes returns octet-stream.
+        // Applied universally (not just procomic hosts) because deferred images may be
+        // served from third-party CDNs whose domain we don't recognise in advance.
+        val contentType = response.header("Content-Type") ?: ""
+        if (contentType.contains("octet-stream") || contentType.isEmpty()) {
+            val path = request.url.encodedPath.lowercase()
+            val fixedType = when {
+                path.endsWith(".avif") -> "image/avif"
+                path.endsWith(".webp") -> "image/webp"
+                path.endsWith(".jpg") || path.endsWith(".jpeg") -> "image/jpeg"
+                path.endsWith(".png") -> "image/png"
+                path.endsWith(".gif") -> "image/gif"
+                // No extension but request is to a known procomic CDN → assume JPEG
+                isProcomicHost -> "image/jpeg"
+                else -> null
+            }
+            if (fixedType != null) {
                 return response.newBuilder()
                     .header("Content-Type", fixedType)
                     .build()
@@ -197,7 +202,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
         val chaptersData = chaptersJson.optJSONArray("chapters") ?: JSONArray()
 
         return manga.copy(
-            chapters = parseChapters(chaptersData, manga.url),
+            chapters = parseChapters(chaptersData, manga.url).reversed(),
         )
     }
 
