@@ -185,9 +185,9 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
         if (parts.size < 4) return manga
         val id = parts[2]
 
-        // ✅ API الصحيح للفصول
+        // ✅ API الصحيح للفصول — الـ parameter الصحيح هو contentId وليس seriesId
         val chaptersUrl = "https://$domain/api/public/chapters" +
-            "?seriesId=$id&page=1&limit=2000&order=asc"
+            "?contentId=$id&page=1&limit=2000&order=asc"
 
         val chaptersJson = runCatching {
             webClient.httpGet(chaptersUrl).parseJson()
