@@ -153,7 +153,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
             state = parseState(status),
             authors = emptySet(),
             description = null,
-            chapters = null,
+            chapters = emptyList(),
             source = source,
         )
     }
