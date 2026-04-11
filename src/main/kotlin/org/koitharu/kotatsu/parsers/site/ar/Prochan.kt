@@ -244,54 +244,57 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val parts = chapter.url.split("/").filter { it.isNotEmpty() }
         val chapterId = parts.getOrNull(4) ?: return emptyList()
-
         val chapterUrl = "https://$domain${chapter.url}"
         val doc = webClient.httpGet(chapterUrl).parseHtml()
-
-        val scriptContent = doc.select("script")
-            .map { it.data() }
-            .filter { it.contains("appImages") || it.contains("deferredMedia") }
-            .joinToString("")
-
-        if (scriptContent.isEmpty()) return emptyList()
-
-        val unescaped = scriptContent
-            .replace("\\\"", "\"")
-            .replace("\\\\", "\\")
 
         val pages = mutableListOf<MangaPage>()
         var pageIndex = 0
 
-        // appImages
-        val appImagesRegex = Regex(""""appImages":\[(.*?)\]""", RegexOption.DOT_MATCHES_ALL)
-        appImagesRegex.find(unescaped)?.let { match ->
+        // اجمع كل نصوص الـ scripts بما فيها __next_f
+        val allText = doc.select("script")
+            .joinToString("") { it.data() }
+            .replace("\\\"", "\"")
+            .replace("\\/", "/")
+            .replace("\\\\", "\\")
+
+        // استخرج appImages - الصور الكاملة غير المقسمة
+        val appImagesPattern = Regex(
+            """"appImages":\[(.*?)\]""",
+            RegexOption.DOT_MATCHES_ALL,
+        )
+
+        var foundAppImages = false
+        appImagesPattern.find(allText)?.groupValues?.get(1)?.let { raw ->
             runCatching {
-                val arr = JSONArray("[${match.groupValues[1]}]")
+                val arr = JSONArray("[$raw]")
                 for (i in 0 until arr.length()) {
                     val item = arr.optJSONObject(i) ?: continue
-                    val imgUrl = item.optString("mobile").takeIf { it.isNotEmpty() }
+                    val url = item.optString("mobile").takeIf { it.isNotEmpty() }
                         ?: item.optString("desktop").takeIf { it.isNotEmpty() }
                         ?: continue
-                    pages.add(MangaPage(
-                        id = generateUid("${chapter.id}-$pageIndex"),
-                        url = imgUrl,
-                        preview = null,
-                        source = source,
-                    ))
+                    pages.add(
+                        MangaPage(
+                            id = generateUid("${chapter.id}-$pageIndex"),
+                            url = url,
+                            preview = null,
+                            source = source,
+                        ),
+                    )
                     pageIndex++
+                    foundAppImages = true
                 }
             }
         }
 
-        // deferred
-        val tokenMatch = Regex(""""token":"([^"]+)"""").find(unescaped)
-        val splitMatch = Regex(""""splitIndex":(\d+)""").find(unescaped)
+        // استخرج deferredMedia token لتحميل باقي الصور
+        val tokenPattern = Regex(""""token":"([^"]+)"""")
+        val splitPattern = Regex(""""splitIndex":(\d+)""")
+        val token = tokenPattern.find(allText)?.groupValues?.get(1)
+        val splitIndex = splitPattern.find(allText)?.groupValues?.get(1) ?: "3"
 
-        if (tokenMatch != null && splitMatch != null) {
-            val token = tokenMatch.groupValues[1]
-            val split = splitMatch.groupValues[1]
-
-            val deferredUrl = "https://$domain/chapter-deferred-media/$chapterId?token=$token&split=$split"
+        if (!token.isNullOrEmpty()) {
+            val deferredUrl = "https://$domain/chapter-deferred-media/$chapterId" +
+                "?token=$token&split=$splitIndex"
 
             val deferredData = runCatching {
                 webClient.httpGet(deferredUrl).parseJson()
@@ -301,17 +304,19 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
             deferredData?.optJSONArray("images")?.let { images ->
                 for (i in 0 until images.length()) {
                     val imgUrl = images.optString(i).takeIf { it.isNotEmpty() } ?: continue
-                    pages.add(MangaPage(
-                        id = generateUid("${chapter.id}-$pageIndex"),
-                        url = imgUrl,
-                        preview = null,
-                        source = source,
-                    ))
+                    pages.add(
+                        MangaPage(
+                            id = generateUid("${chapter.id}-def-$pageIndex"),
+                            url = imgUrl,
+                            preview = null,
+                            source = source,
+                        ),
+                    )
                     pageIndex++
                 }
             }
 
-            // maps — شرائح لازم تتجمع
+            // maps - شرائح تحتاج دمج
             deferredData?.optJSONArray("maps")?.let { maps ->
                 for (i in 0 until maps.length()) {
                     val map = maps.optJSONObject(i) ?: continue
@@ -332,14 +337,35 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
                     val encodedPieces = Base64.getUrlEncoder().withoutPadding()
                         .encodeToString(orderedPieces.joinToString("|").toByteArray())
 
-                    val mapUrl = "prochan-map://stitch?w=$width&h=$height&mode=$mode&pieces=$encodedPieces"
+                    val mapUrl = "prochan-map://stitch?w=$width&h=$height" +
+                        "&mode=$mode&pieces=$encodedPieces"
 
-                    pages.add(MangaPage(
-                        id = generateUid("${chapter.id}-map-$pageIndex"),
-                        url = mapUrl,
-                        preview = null,
-                        source = source,
-                    ))
+                    pages.add(
+                        MangaPage(
+                            id = generateUid("${chapter.id}-map-$pageIndex"),
+                            url = mapUrl,
+                            preview = null,
+                            source = source,
+                        ),
+                    )
+                    pageIndex++
+                }
+            }
+        }
+
+        // fallback - لو appImages فشل استخدم images من deferredMedia فقط
+        if (!foundAppImages && pages.isEmpty()) {
+            val imagesPattern = Regex(""""images":\["(.*?)"\]""", RegexOption.DOT_MATCHES_ALL)
+            imagesPattern.find(allText)?.groupValues?.get(1)?.split("\",\"")?.forEach { url ->
+                if (url.isNotEmpty()) {
+                    pages.add(
+                        MangaPage(
+                            id = generateUid("${chapter.id}-fb-$pageIndex"),
+                            url = url,
+                            preview = null,
+                            source = source,
+                        ),
+                    )
                     pageIndex++
                 }
             }
