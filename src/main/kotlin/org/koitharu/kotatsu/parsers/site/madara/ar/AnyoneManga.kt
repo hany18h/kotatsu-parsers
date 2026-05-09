@@ -7,4 +7,8 @@ import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 
 @MangaSourceParser("ANYONEMANGA", "AnyoneManga", "ar")
 internal class AnyoneManga(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.ANYONEMANGA, "anyonemanga.com", pageSize = 20)
+	MadaraParser(context, MangaParserSource.ANYONEMANGA, "anyonemanga.com", pageSize = 10) {
+	override val datePattern = "d MMMM، yyyy"
+	override val stylePage = ""
+    override val withoutAjax = true
+}
