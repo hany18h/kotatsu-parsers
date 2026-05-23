@@ -1,17 +1,9 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Canvas
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.Protocol
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -21,19 +13,14 @@ import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import org.koitharu.kotatsu.parsers.util.json.mapJSONNotNull
-import java.io.ByteArrayOutputStream
-import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.*
-import javax.crypto.Cipher
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 
-private const val STITCH_HOST = "kotatsu-prochan-stitch.local"
-private const val SCRAMBLE_KEY_BASE =
-	"prochan-browser-map:2e6f9a1c4d8b7e3f0a5c9d2b6e1f4a8c7d3b0e6a9f2c5d8b1e4a7c0d3f6b9e2"
+// IMPORTANT: this host MUST also be registered in the app via a Coil3 Fetcher
+// that turns the URL into a stitched JPEG. See ProChanStitchFetcher in the app.
+internal const val PROCHAN_STITCH_HOST = "kotatsu-prochan-stitch.local"
 
 @MangaSourceParser("PROCHAN", "ProChan", "ar")
 internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
@@ -68,15 +55,18 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	private var allSeriesCacheAt = 0L
 	private val allSeriesTtlMs = 5 * 60 * 1000L
 
-	// =========================================================================
-	// HTTP INTERCEPTOR
-	// =========================================================================
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
-
-		// Intercept stitched-image virtual URL: build a real JPEG response on the fly.
-		if (request.url.host == STITCH_HOST) {
-			return buildStitchedResponse(chain, request)
+		// The stitch host is handled by the app-side Coil Fetcher.
+		// Don't let it reach the network — short-circuit with 501.
+		if (request.url.host == PROCHAN_STITCH_HOST) {
+			return Response.Builder()
+				.request(request)
+				.protocol(okhttp3.Protocol.HTTP_1_1)
+				.code(501)
+				.message("Handled by ProChanStitchFetcher on app side")
+				.body(okhttp3.ResponseBody.create(null, ByteArray(0)))
+				.build()
 		}
 
 		val host = request.url.host
@@ -92,7 +82,6 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 					"(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
 			)
-
 		if (isImageCdnRequest) {
 			builder
 				.header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
@@ -102,7 +91,6 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		} else {
 			builder.header("Accept", "*/*")
 		}
-
 		val response = chain.proceed(builder.build())
 		val contentType = response.header("Content-Type") ?: ""
 		if (contentType.contains("octet-stream") || contentType.isEmpty()) {
@@ -123,15 +111,11 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		return response
 	}
 
-	// =========================================================================
-	// LISTING / SEARCH / DETAILS / CHAPTERS  (unchanged from before)
-	// =========================================================================
 	override suspend fun getFilterOptions() = MangaListFilterOptions()
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		val query = filter.query?.trim()
 		if (!query.isNullOrEmpty()) return searchPage(query, page)
-
 		val endpoint = when (order) {
 			SortOrder.UPDATED -> "latest-updates"
 			SortOrder.POPULARITY -> "popular"
@@ -194,7 +178,6 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val coverUrl = getBestCover(item)
 		val status = item.optString("status", "")
 		val mangaUrl = "/series/$type/$id/$slug"
-
 		return Manga(
 			id = generateUid(mangaUrl),
 			title = title,
@@ -275,9 +258,6 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		}
 	}
 
-	// =========================================================================
-	// PAGES  (replaced fake "prochan-map://" scheme with real http://STITCH_HOST/...)
-	// =========================================================================
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val parts = chapter.url.split("/").filter { it.isNotEmpty() }
 		val chapterId = parts.getOrNull(4) ?: return emptyList()
@@ -338,17 +318,14 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			deferredData?.optJSONArray("maps")?.let { maps ->
 				for (i in 0 until maps.length()) {
 					val map = maps.optJSONObject(i) ?: continue
-					// Two cases:
-					// 1) "direct"   -> has pieces/order/mode/dim
-					// 2) "indirect" -> has token/method (AES-GCM encrypted payload)
-					val payloadJson: String = when {
-						map.has("pieces") -> map.toString()
-						map.has("token") && map.has("method") -> map.toString()
-						else -> continue
-					}
-					val encoded = encodeUrlSafeB64(payloadJson.toByteArray(Charsets.UTF_8))
-					// Real http URL the OkHttp Interceptor can catch:
-					val mapUrl = "https://$STITCH_HOST/p?d=$encoded&cid=$chapterId"
+					if (!(map.has("pieces") || (map.has("token") && map.has("method")))) continue
+					val payload = JSONObject().apply {
+						put("map", map)
+						put("domain", domain)
+						put("chapterId", chapterId)
+					}.toString()
+					val encoded = encodeUrlSafeB64(payload.toByteArray(Charsets.UTF_8))
+					val mapUrl = "https://$PROCHAN_STITCH_HOST/p?d=$encoded"
 					pages.add(
 						MangaPage(
 							id = generateUid("${chapter.id}-map-$pageIndex"),
@@ -379,176 +356,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 
 	override suspend fun getPageUrl(page: MangaPage): String = page.url
 
-	// =========================================================================
-	// STITCH PIPELINE  (called from intercept())
-	// =========================================================================
-	private fun buildStitchedResponse(chain: Interceptor.Chain, request: Request): Response {
-		return try {
-			val d = request.url.queryParameter("d") ?: error("missing d")
-			val cid = request.url.queryParameter("cid")?.toIntOrNull() ?: 0
-			val payloadJson = String(decodeUrlSafeB64(d), Charsets.UTF_8)
-			val payload = JSONObject(payloadJson)
-
-			val scrambled: JSONObject = if (payload.has("pieces")) {
-				payload
-			} else {
-				// indirect: decrypt
-				decryptIndirect(payload, cid)
-			}
-
-			val mode = scrambled.optString("mode", "vertical")
-			val dim = scrambled.optJSONArray("dim") ?: error("no dim")
-			val width = dim.optInt(0, 800)
-			val height = dim.optInt(1, 1000)
-			val piecesArr = scrambled.optJSONArray("pieces") ?: error("no pieces")
-			val orderArr = scrambled.optJSONArray("order") ?: error("no order")
-
-			val rawPieces = (0 until piecesArr.length()).map { piecesArr.optString(it) }
-			val ordered = (0 until orderArr.length())
-				.mapNotNull { rawPieces.getOrNull(orderArr.optInt(it)) }
-				.filter { it.isNotEmpty() }
-
-			val bitmaps = ordered.map { piece ->
-				val signedUrl = signCdnUrlIfNeeded(chain, piece)
-				val req = Request.Builder().url(signedUrl).get().build()
-				chain.proceed(req).use { r ->
-					val bytes = r.body?.bytes() ?: error("empty piece")
-					BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-						?: error("decode failed")
-				}
-			}
-
-			val result = stitchBitmaps(bitmaps, mode, width, height)
-			val baos = ByteArrayOutputStream()
-			result.compress(Bitmap.CompressFormat.JPEG, 90, baos)
-			bitmaps.forEach { it.recycle() }
-			result.recycle()
-
-			Response.Builder()
-				.request(request)
-				.protocol(Protocol.HTTP_1_1)
-				.code(200)
-				.message("OK")
-				.body(baos.toByteArray().toResponseBody("image/jpeg".toMediaType()))
-				.build()
-		} catch (e: Throwable) {
-			Response.Builder()
-				.request(request)
-				.protocol(Protocol.HTTP_1_1)
-				.code(500)
-				.message("stitch failed: ${e.message}")
-				.body("".toResponseBody("text/plain".toMediaType()))
-				.build()
-		}
-	}
-
-	private fun stitchBitmaps(pieces: List<Bitmap>, mode: String, w: Int, h: Int): Bitmap {
-		val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-		val canvas = Canvas(out)
-		val (puzzleMode, layout) = if (mode.contains('_')) {
-			val (m, l) = mode.split('_', limit = 2)
-			m to l
-		} else {
-			mode to ""
-		}
-		when (puzzleMode) {
-			"vertical" -> {
-				// horizontal strip layout (matches keiyoushi behavior)
-				var x = 0f
-				for (b in pieces) {
-					canvas.drawBitmap(b, x, 0f, null)
-					x += b.width
-				}
-			}
-			"grid" -> {
-				val (cols, rows) = layout.split('x', limit = 2).map { it.toInt() }
-				var y = 0f
-				for (r in 0 until rows) {
-					var x = 0f
-					var maxH = 0f
-					for (c in 0 until cols) {
-						val idx = r * cols + c
-						if (idx < pieces.size) {
-							val b = pieces[idx]
-							canvas.drawBitmap(b, x, y, null)
-							x += b.width
-							if (b.height > maxH) maxH = b.height.toFloat()
-						}
-					}
-					y += maxH
-				}
-			}
-			else -> {
-				// fallback: stack vertically
-				var y = 0f
-				for (b in pieces) {
-					canvas.drawBitmap(b, 0f, y, null)
-					y += b.height
-				}
-			}
-		}
-		return out
-	}
-
-	private fun signCdnUrlIfNeeded(chain: Interceptor.Chain, pieceUrl: String): String {
-		val full = if (pieceUrl.startsWith("/")) "https://cdn3.$domain$pieceUrl" else pieceUrl
-		val host = runCatching { okhttp3.HttpUrl.parse(full)?.host() }.getOrNull() ?: return full
-		if (!host.startsWith("cdn")) return full
-
-		val body = JSONObject().put("url", full).toString()
-			.toRequestBody("application/json".toMediaType())
-		val signReq = Request.Builder()
-			.url("https://$domain/api/cdn-image/sign")
-			.post(body)
-			.header("Content-Type", "application/json")
-			.build()
-		return runCatching {
-			chain.proceed(signReq).use { resp ->
-				if (!resp.isSuccessful) return@runCatching full
-				val j = JSONObject(resp.body?.string().orEmpty())
-				val tok = j.optString("token")
-				val exp = j.optString("expires")
-				if (tok.isEmpty()) full
-				else "$full" + (if (full.contains('?')) "&" else "?") +
-					"token=$tok&expires=$exp"
-			}
-		}.getOrDefault(full)
-	}
-
-	// =========================================================================
-	// AES-GCM DECRYPTION for "indirect" maps (matches keiyoushi v2 browser mode)
-	// =========================================================================
-	private fun decryptIndirect(map: JSONObject, fallbackCid: Int): JSONObject {
-		val token = map.optString("token")
-		val bytes = decodeUrlSafeB64(token)
-		val value = JSONObject(String(bytes, Charsets.UTF_8))
-		val cid = value.optInt("cid", fallbackCid)
-		val iv = decodeUrlSafeB64(value.getString("iv"))
-		val tag = decodeUrlSafeB64(value.getString("tag"))
-		val data = decodeUrlSafeB64(value.getString("data"))
-		val method = value.optString("m")
-		val v = value.optInt("v")
-
-		val keyBytes: ByteArray = when {
-			method == "browser" && v == 2 -> {
-				val seed = "$SCRAMBLE_KEY_BASE:$cid"
-				MessageDigest.getInstance("SHA-256")
-					.digest(seed.toByteArray(Charsets.UTF_8))
-			}
-			else -> error("Unsupported scramble method: $method v=$v")
-		}
-		val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply {
-			init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
-		}
-		val decrypted = cipher.doFinal(data + tag)
-		return JSONObject(String(decrypted, Charsets.UTF_8))
-	}
-
 	@OptIn(ExperimentalEncodingApi::class)
 	private fun encodeUrlSafeB64(data: ByteArray): String =
 		Base64.UrlSafe.withPadding(Base64.PaddingOption.ABSENT).encode(data)
-
-	@OptIn(ExperimentalEncodingApi::class)
-	private fun decodeUrlSafeB64(s: String): ByteArray =
-		Base64.UrlSafe.withPadding(Base64.PaddingOption.PRESENT_OPTIONAL).decode(s)
 }
