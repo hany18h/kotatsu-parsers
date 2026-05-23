@@ -7,10 +7,4 @@ import org.koitharu.kotatsu.parsers.site.mangareader.MangaReaderParser
 
 @MangaSourceParser("DESPAIRMANGA", "Despair Manga", "ar")
 internal class DespairManga(context: MangaLoaderContext) :
-	MangaReaderParser(
-		context = context,
-		source = MangaParserSource.DESPAIRMANGA,
-		domain = "despair-manga.net",
-		pageSize = 20,
-		searchPageSize = 10,
-	)
+	MangaReaderParser(context, MangaParserSource.DESPAIRMANGA, "despair-manga.net", pageSize = 20, searchPageSize = 10)
