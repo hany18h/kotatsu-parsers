@@ -1,9 +1,17 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Protocol
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -13,9 +21,19 @@ import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import org.koitharu.kotatsu.parsers.util.json.mapJSONNotNull
+import java.io.ByteArrayOutputStream
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.*
-import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import kotlin.io.encoding.Base64
+import kotlin.io.encoding.ExperimentalEncodingApi
+
+private const val STITCH_HOST = "kotatsu-prochan-stitch.local"
+private const val SCRAMBLE_KEY_BASE =
+	"prochan-browser-map:2e6f9a1c4d8b7e3f0a5c9d2b6e1f4a8c7d3b0e6a9f2c5d8b1e4a7c0d3f6b9e2"
 
 @MangaSourceParser("PROCHAN", "ProChan", "ar")
 internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
@@ -33,39 +51,39 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	)
 
 	override val filterCapabilities: MangaListFilterCapabilities
-		get() = MangaListFilterCapabilities(
-			isSearchSupported = true,
-		)
+		get() = MangaListFilterCapabilities(isSearchSupported = true)
 
 	private val dateFormat by lazy {
 		SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 	}
 
 	private val imageCdnHosts = setOf(
-		"app.procomic.net",
-		"app.procomic.pro",
-		"cdn2.procomic.pro",
-		"cdn3.procomic.pro",
-		"cdn4.procomic.pro",
-		"cdn2.prochan.net",
-		"cdn3.prochan.net",
+		"app.procomic.net", "app.procomic.pro",
+		"cdn2.procomic.pro", "cdn3.procomic.pro", "cdn4.procomic.pro",
+		"cdn2.prochan.net", "cdn3.prochan.net",
 	)
 
-	// In-memory cache of every series (≈25 pages x 18 ≈ 450 items).
-	// procomic.pro's /search endpoint is locked behind Cloudflare Turnstile,
-	// so we do client-side title filtering instead.
 	private val allSeriesMutex = Mutex()
 	private var allSeriesCache: List<JSONObject>? = null
 	private var allSeriesCacheAt = 0L
 	private val allSeriesTtlMs = 5 * 60 * 1000L
 
+	// =========================================================================
+	// HTTP INTERCEPTOR
+	// =========================================================================
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
+
+		// Intercept stitched-image virtual URL: build a real JPEG response on the fly.
+		if (request.url.host == STITCH_HOST) {
+			return buildStitchedResponse(chain, request)
+		}
+
 		val host = request.url.host
 		val isProcomicHost = host.contains("procomic") || host.contains("prochan")
 		val isImageCdnRequest = host in imageCdnHosts
 
-		val newRequestBuilder = request.newBuilder()
+		val builder = request.newBuilder()
 			.header("Referer", "https://procomic.pro/")
 			.header("Origin", "https://procomic.pro")
 			.header("Accept-Language", "en-US,en;q=0.9,ar;q=0.8")
@@ -76,21 +94,20 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			)
 
 		if (isImageCdnRequest) {
-			newRequestBuilder
+			builder
 				.header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
 				.header("Sec-Fetch-Dest", "image")
 				.header("Sec-Fetch-Mode", "no-cors")
 				.header("Sec-Fetch-Site", "same-site")
 		} else {
-			newRequestBuilder.header("Accept", "*/*")
+			builder.header("Accept", "*/*")
 		}
 
-		val response = chain.proceed(newRequestBuilder.build())
-
+		val response = chain.proceed(builder.build())
 		val contentType = response.header("Content-Type") ?: ""
 		if (contentType.contains("octet-stream") || contentType.isEmpty()) {
 			val path = request.url.encodedPath.lowercase()
-			val fixedType = when {
+			val fixed = when {
 				path.endsWith(".avif") -> "image/avif"
 				path.endsWith(".webp") -> "image/webp"
 				path.endsWith(".jpg") || path.endsWith(".jpeg") -> "image/jpeg"
@@ -99,22 +116,21 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 				isProcomicHost -> "image/jpeg"
 				else -> null
 			}
-			if (fixedType != null) {
-				return response.newBuilder()
-					.header("Content-Type", fixedType)
-					.build()
+			if (fixed != null) {
+				return response.newBuilder().header("Content-Type", fixed).build()
 			}
 		}
 		return response
 	}
 
+	// =========================================================================
+	// LISTING / SEARCH / DETAILS / CHAPTERS  (unchanged from before)
+	// =========================================================================
 	override suspend fun getFilterOptions() = MangaListFilterOptions()
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		val query = filter.query?.trim()
-		if (!query.isNullOrEmpty()) {
-			return searchPage(query, page)
-		}
+		if (!query.isNullOrEmpty()) return searchPage(query, page)
 
 		val endpoint = when (order) {
 			SortOrder.UPDATED -> "latest-updates"
@@ -122,16 +138,11 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			SortOrder.ALPHABETICAL -> "az"
 			else -> "latest-updates"
 		}
-
 		val url = "https://$domain/api/public/content/$endpoint" +
 			"?limit=$pageSize&category=comics&page=$page"
-
 		val json = webClient.httpGet(url).parseJson()
 		val data = json.optJSONArray("data") ?: return emptyList()
-
-		return data.mapJSONNotNull { item ->
-			parseMangaFromList(item)
-		}
+		return data.mapJSONNotNull { parseMangaFromList(it) }
 	}
 
 	private suspend fun searchPage(query: String, page: Int): List<Manga> {
@@ -141,9 +152,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			val slug = item.optString("mangaSlug").ifEmpty { item.optString("slug") }
 			if (title.contains(query, ignoreCase = true) || slug.contains(query, ignoreCase = true)) {
 				parseMangaFromList(item)
-			} else {
-				null
-			}
+			} else null
 		}
 		val from = (page - 1) * pageSize
 		if (from >= matches.size) return emptyList()
@@ -154,9 +163,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	private suspend fun loadAllSeries(): List<JSONObject> = allSeriesMutex.withLock {
 		val cached = allSeriesCache
 		val now = System.currentTimeMillis()
-		if (cached != null && (now - allSeriesCacheAt) < allSeriesTtlMs) {
-			return@withLock cached
-		}
+		if (cached != null && (now - allSeriesCacheAt) < allSeriesTtlMs) return@withLock cached
 		val all = mutableListOf<JSONObject>()
 		var p = 1
 		while (p <= 60) {
@@ -165,9 +172,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			val json = runCatching { webClient.httpGet(url).parseJson() }.getOrNull() ?: break
 			val data = json.optJSONArray("data") ?: break
 			if (data.length() == 0) break
-			for (i in 0 until data.length()) {
-				data.optJSONObject(i)?.let { all.add(it) }
-			}
+			for (i in 0 until data.length()) data.optJSONObject(i)?.let { all.add(it) }
 			p++
 		}
 		allSeriesCache = all
@@ -180,16 +185,12 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 
 	private fun parseMangaFromList(item: JSONObject): Manga? {
 		val id = item.optInt("mangaId").takeIf { it > 0 }
-			?: item.optInt("id").takeIf { it > 0 }
-			?: return null
+			?: item.optInt("id").takeIf { it > 0 } ?: return null
 		val slug = item.optString("mangaSlug").takeIf { it.isNotEmpty() }
-			?: item.optString("slug").takeIf { it.isNotEmpty() }
-			?: return null
+			?: item.optString("slug").takeIf { it.isNotEmpty() } ?: return null
 		val title = bestTitle(item).takeIf { it.isNotEmpty() } ?: return null
 		val type = item.optString("type", "manhua")
-
 		if (type == "novel") return null
-
 		val coverUrl = getBestCover(item)
 		val status = item.optString("status", "")
 		val mangaUrl = "/series/$type/$id/$slug"
@@ -201,11 +202,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			url = mangaUrl,
 			publicUrl = "https://$domain$mangaUrl",
 			rating = RATING_UNKNOWN,
-			contentRating = if (item.optBoolean("isSensitiveImage")) {
-				ContentRating.ADULT
-			} else {
-				null
-			},
+			contentRating = if (item.optBoolean("isSensitiveImage")) ContentRating.ADULT else null,
 			coverUrl = coverUrl,
 			tags = emptySet(),
 			state = parseState(status),
@@ -220,10 +217,8 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val appCover = item.optJSONObject("coverImageApp")
 		if (appCover != null) {
 			val card = appCover.optJSONObject("card")
-			val mobile = card?.optString("mobile")?.takeIf { it.isNotEmpty() }
-			if (mobile != null) return mobile
-			val desktop = appCover.optString("desktop").takeIf { it.isNotEmpty() }
-			if (desktop != null) return desktop
+			card?.optString("mobile")?.takeIf { it.isNotEmpty() }?.let { return it }
+			appCover.optString("desktop").takeIf { it.isNotEmpty() }?.let { return it }
 		}
 		return item.optString("coverImage", "")
 	}
@@ -241,19 +236,12 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val parts = manga.url.split("/").filter { it.isNotEmpty() }
 		if (parts.size < 4) return manga
 		val id = parts[2]
-
 		val chaptersUrl = "https://$domain/api/public/chapters" +
 			"?contentId=$id&page=1&limit=2000&order=asc"
-
-		val chaptersJson = runCatching {
-			webClient.httpGet(chaptersUrl).parseJson()
-		}.getOrElse { return manga }
-
+		val chaptersJson = runCatching { webClient.httpGet(chaptersUrl).parseJson() }
+			.getOrElse { return manga }
 		val chaptersData = chaptersJson.optJSONArray("chapters") ?: JSONArray()
-
-		return manga.copy(
-			chapters = parseChapters(chaptersData, manga.url).reversed(),
-		)
+		return manga.copy(chapters = parseChapters(chaptersData, manga.url).reversed())
 	}
 
 	private fun parseChapters(data: JSONArray, mangaUrl: String): List<MangaChapter> {
@@ -261,29 +249,18 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			val coinsRequired = item.optInt("coins_required", 0)
 			val lockedForever = item.optBoolean("lockedForever", false)
 			if (coinsRequired > 0 || lockedForever) return@mapJSONNotNull null
-
 			val chapterId = item.optInt("id").takeIf { it > 0 } ?: return@mapJSONNotNull null
-
 			val chapterNumber = item.optString("chapter_number").takeIf { it.isNotEmpty() }
-				?: item.optString("title").takeIf { it.isNotEmpty() }
-				?: return@mapJSONNotNull null
-
+				?: item.optString("title").takeIf { it.isNotEmpty() } ?: return@mapJSONNotNull null
 			val chapterNum = chapterNumber.toFloatOrNull() ?: return@mapJSONNotNull null
-
 			val title = item.optString("title").takeIf {
 				it.isNotEmpty() && it != "null" && it != chapterNumber
 			}
-
-			val publishedAt = item.optString("published_at", "")
-				.takeIf { it.isNotEmpty() }
+			val publishedAt = item.optString("published_at", "").takeIf { it.isNotEmpty() }
 				?: item.optString("publishedAt", "")
-
-			val uploadDate = runCatching {
-				dateFormat.parse(publishedAt)?.time ?: 0L
-			}.getOrDefault(0L)
-
+			val uploadDate = runCatching { dateFormat.parse(publishedAt)?.time ?: 0L }
+				.getOrDefault(0L)
 			val chapterUrl = "$mangaUrl/$chapterId/$chapterNumber"
-
 			MangaChapter(
 				id = generateUid(chapterUrl),
 				title = title,
@@ -298,6 +275,9 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		}
 	}
 
+	// =========================================================================
+	// PAGES  (replaced fake "prochan-map://" scheme with real http://STITCH_HOST/...)
+	// =========================================================================
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val parts = chapter.url.split("/").filter { it.isNotEmpty() }
 		val chapterId = parts.getOrNull(4) ?: return emptyList()
@@ -307,17 +287,10 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val pages = mutableListOf<MangaPage>()
 		var pageIndex = 0
 
-		val allText = doc.select("script")
-			.joinToString("") { it.data() }
-			.replace("\\\"", "\"")
-			.replace("\\/", "/")
-			.replace("\\\\", "\\")
+		val allText = doc.select("script").joinToString("") { it.data() }
+			.replace("\\\"", "\"").replace("\\/", "/").replace("\\\\", "\\")
 
-		val appImagesPattern = Regex(
-			""""appImages":\[(.*?)\]""",
-			RegexOption.DOT_MATCHES_ALL,
-		)
-
+		val appImagesPattern = Regex(""""appImages":\[(.*?)\]""", RegexOption.DOT_MATCHES_ALL)
 		var foundAppImages = false
 		appImagesPattern.find(allText)?.groupValues?.get(1)?.let { raw ->
 			runCatching {
@@ -325,14 +298,11 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 				for (i in 0 until arr.length()) {
 					val item = arr.optJSONObject(i) ?: continue
 					val url = item.optString("mobile").takeIf { it.isNotEmpty() }
-						?: item.optString("desktop").takeIf { it.isNotEmpty() }
-						?: continue
+						?: item.optString("desktop").takeIf { it.isNotEmpty() } ?: continue
 					pages.add(
 						MangaPage(
 							id = generateUid("${chapter.id}-$pageIndex"),
-							url = url,
-							preview = null,
-							source = source,
+							url = url, preview = null, source = source,
 						),
 					)
 					pageIndex++
@@ -349,10 +319,8 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		if (!token.isNullOrEmpty()) {
 			val deferredUrl = "https://$domain/chapter-deferred-media/$chapterId" +
 				"?token=$token&split=$splitIndex"
-
-			val deferredData = runCatching {
-				webClient.httpGet(deferredUrl).parseJson()
-			}.getOrNull()?.optJSONObject("data")
+			val deferredData = runCatching { webClient.httpGet(deferredUrl).parseJson() }
+				.getOrNull()?.optJSONObject("data")
 
 			deferredData?.optJSONArray("images")?.let { images ->
 				for (i in 0 until images.length()) {
@@ -360,9 +328,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 					pages.add(
 						MangaPage(
 							id = generateUid("${chapter.id}-def-$pageIndex"),
-							url = imgUrl,
-							preview = null,
-							source = source,
+							url = imgUrl, preview = null, source = source,
 						),
 					)
 					pageIndex++
@@ -372,32 +338,21 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			deferredData?.optJSONArray("maps")?.let { maps ->
 				for (i in 0 until maps.length()) {
 					val map = maps.optJSONObject(i) ?: continue
-					val pieces = map.optJSONArray("pieces") ?: continue
-					val orderArr = map.optJSONArray("order") ?: continue
-					val dim = map.optJSONArray("dim") ?: continue
-					val width = dim.optInt(0, 800)
-					val height = dim.optInt(1, 1000)
-					val mode = map.optString("mode", "vertical")
-
-					val tempPieces = (0 until pieces.length()).map { pieces.optString(it) }
-					val orderedPieces = (0 until orderArr.length())
-						.mapNotNull { tempPieces.getOrNull(orderArr.optInt(it)) }
-						.filter { it.isNotEmpty() }
-
-					if (orderedPieces.isEmpty()) continue
-
-					val encodedPieces = Base64.getUrlEncoder().withoutPadding()
-						.encodeToString(orderedPieces.joinToString("|").toByteArray())
-
-					val mapUrl = "prochan-map://stitch?w=$width&h=$height" +
-						"&mode=$mode&pieces=$encodedPieces"
-
+					// Two cases:
+					// 1) "direct"   -> has pieces/order/mode/dim
+					// 2) "indirect" -> has token/method (AES-GCM encrypted payload)
+					val payloadJson: String = when {
+						map.has("pieces") -> map.toString()
+						map.has("token") && map.has("method") -> map.toString()
+						else -> continue
+					}
+					val encoded = encodeUrlSafeB64(payloadJson.toByteArray(Charsets.UTF_8))
+					// Real http URL the OkHttp Interceptor can catch:
+					val mapUrl = "https://$STITCH_HOST/p?d=$encoded&cid=$chapterId"
 					pages.add(
 						MangaPage(
 							id = generateUid("${chapter.id}-map-$pageIndex"),
-							url = mapUrl,
-							preview = null,
-							source = source,
+							url = mapUrl, preview = null, source = source,
 						),
 					)
 					pageIndex++
@@ -412,18 +367,188 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 					pages.add(
 						MangaPage(
 							id = generateUid("${chapter.id}-fb-$pageIndex"),
-							url = url,
-							preview = null,
-							source = source,
+							url = url, preview = null, source = source,
 						),
 					)
 					pageIndex++
 				}
 			}
 		}
-
 		return pages
 	}
 
 	override suspend fun getPageUrl(page: MangaPage): String = page.url
+
+	// =========================================================================
+	// STITCH PIPELINE  (called from intercept())
+	// =========================================================================
+	private fun buildStitchedResponse(chain: Interceptor.Chain, request: Request): Response {
+		return try {
+			val d = request.url.queryParameter("d") ?: error("missing d")
+			val cid = request.url.queryParameter("cid")?.toIntOrNull() ?: 0
+			val payloadJson = String(decodeUrlSafeB64(d), Charsets.UTF_8)
+			val payload = JSONObject(payloadJson)
+
+			val scrambled: JSONObject = if (payload.has("pieces")) {
+				payload
+			} else {
+				// indirect: decrypt
+				decryptIndirect(payload, cid)
+			}
+
+			val mode = scrambled.optString("mode", "vertical")
+			val dim = scrambled.optJSONArray("dim") ?: error("no dim")
+			val width = dim.optInt(0, 800)
+			val height = dim.optInt(1, 1000)
+			val piecesArr = scrambled.optJSONArray("pieces") ?: error("no pieces")
+			val orderArr = scrambled.optJSONArray("order") ?: error("no order")
+
+			val rawPieces = (0 until piecesArr.length()).map { piecesArr.optString(it) }
+			val ordered = (0 until orderArr.length())
+				.mapNotNull { rawPieces.getOrNull(orderArr.optInt(it)) }
+				.filter { it.isNotEmpty() }
+
+			val bitmaps = ordered.map { piece ->
+				val signedUrl = signCdnUrlIfNeeded(chain, piece)
+				val req = Request.Builder().url(signedUrl).get().build()
+				chain.proceed(req).use { r ->
+					val bytes = r.body?.bytes() ?: error("empty piece")
+					BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+						?: error("decode failed")
+				}
+			}
+
+			val result = stitchBitmaps(bitmaps, mode, width, height)
+			val baos = ByteArrayOutputStream()
+			result.compress(Bitmap.CompressFormat.JPEG, 90, baos)
+			bitmaps.forEach { it.recycle() }
+			result.recycle()
+
+			Response.Builder()
+				.request(request)
+				.protocol(Protocol.HTTP_1_1)
+				.code(200)
+				.message("OK")
+				.body(baos.toByteArray().toResponseBody("image/jpeg".toMediaType()))
+				.build()
+		} catch (e: Throwable) {
+			Response.Builder()
+				.request(request)
+				.protocol(Protocol.HTTP_1_1)
+				.code(500)
+				.message("stitch failed: ${e.message}")
+				.body("".toResponseBody("text/plain".toMediaType()))
+				.build()
+		}
+	}
+
+	private fun stitchBitmaps(pieces: List<Bitmap>, mode: String, w: Int, h: Int): Bitmap {
+		val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+		val canvas = Canvas(out)
+		val (puzzleMode, layout) = if (mode.contains('_')) {
+			val (m, l) = mode.split('_', limit = 2)
+			m to l
+		} else {
+			mode to ""
+		}
+		when (puzzleMode) {
+			"vertical" -> {
+				// horizontal strip layout (matches keiyoushi behavior)
+				var x = 0f
+				for (b in pieces) {
+					canvas.drawBitmap(b, x, 0f, null)
+					x += b.width
+				}
+			}
+			"grid" -> {
+				val (cols, rows) = layout.split('x', limit = 2).map { it.toInt() }
+				var y = 0f
+				for (r in 0 until rows) {
+					var x = 0f
+					var maxH = 0f
+					for (c in 0 until cols) {
+						val idx = r * cols + c
+						if (idx < pieces.size) {
+							val b = pieces[idx]
+							canvas.drawBitmap(b, x, y, null)
+							x += b.width
+							if (b.height > maxH) maxH = b.height.toFloat()
+						}
+					}
+					y += maxH
+				}
+			}
+			else -> {
+				// fallback: stack vertically
+				var y = 0f
+				for (b in pieces) {
+					canvas.drawBitmap(b, 0f, y, null)
+					y += b.height
+				}
+			}
+		}
+		return out
+	}
+
+	private fun signCdnUrlIfNeeded(chain: Interceptor.Chain, pieceUrl: String): String {
+		val full = if (pieceUrl.startsWith("/")) "https://cdn3.$domain$pieceUrl" else pieceUrl
+		val host = runCatching { okhttp3.HttpUrl.parse(full)?.host() }.getOrNull() ?: return full
+		if (!host.startsWith("cdn")) return full
+
+		val body = JSONObject().put("url", full).toString()
+			.toRequestBody("application/json".toMediaType())
+		val signReq = Request.Builder()
+			.url("https://$domain/api/cdn-image/sign")
+			.post(body)
+			.header("Content-Type", "application/json")
+			.build()
+		return runCatching {
+			chain.proceed(signReq).use { resp ->
+				if (!resp.isSuccessful) return@runCatching full
+				val j = JSONObject(resp.body?.string().orEmpty())
+				val tok = j.optString("token")
+				val exp = j.optString("expires")
+				if (tok.isEmpty()) full
+				else "$full" + (if (full.contains('?')) "&" else "?") +
+					"token=$tok&expires=$exp"
+			}
+		}.getOrDefault(full)
+	}
+
+	// =========================================================================
+	// AES-GCM DECRYPTION for "indirect" maps (matches keiyoushi v2 browser mode)
+	// =========================================================================
+	private fun decryptIndirect(map: JSONObject, fallbackCid: Int): JSONObject {
+		val token = map.optString("token")
+		val bytes = decodeUrlSafeB64(token)
+		val value = JSONObject(String(bytes, Charsets.UTF_8))
+		val cid = value.optInt("cid", fallbackCid)
+		val iv = decodeUrlSafeB64(value.getString("iv"))
+		val tag = decodeUrlSafeB64(value.getString("tag"))
+		val data = decodeUrlSafeB64(value.getString("data"))
+		val method = value.optString("m")
+		val v = value.optInt("v")
+
+		val keyBytes: ByteArray = when {
+			method == "browser" && v == 2 -> {
+				val seed = "$SCRAMBLE_KEY_BASE:$cid"
+				MessageDigest.getInstance("SHA-256")
+					.digest(seed.toByteArray(Charsets.UTF_8))
+			}
+			else -> error("Unsupported scramble method: $method v=$v")
+		}
+		val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply {
+			init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
+		}
+		val decrypted = cipher.doFinal(data + tag)
+		return JSONObject(String(decrypted, Charsets.UTF_8))
+	}
+
+	@OptIn(ExperimentalEncodingApi::class)
+	private fun encodeUrlSafeB64(data: ByteArray): String =
+		Base64.UrlSafe.withPadding(Base64.PaddingOption.ABSENT).encode(data)
+
+	@OptIn(ExperimentalEncodingApi::class)
+	private fun decodeUrlSafeB64(s: String): ByteArray =
+		Base64.UrlSafe.withPadding(Base64.PaddingOption.PRESENT_OPTIONAL).decode(s)
 }
