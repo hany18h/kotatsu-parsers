@@ -216,17 +216,19 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val parts = manga.url.split("/").filter { it.isNotEmpty() }
-		if (parts.size < 4) return manga
-		val id = parts[2]
-		val chaptersUrl = "https://$domain/api/public/chapters" +
-			"?contentId=$id&page=1&limit=2000&order=asc"
-		val chaptersJson = runCatching { webClient.httpGet(chaptersUrl).parseJson() }
-			.getOrElse { return manga }
-		val chaptersData = chaptersJson.optJSONArray("chapters") ?: JSONArray()
-		return manga.copy(chapters = parseChapters(chaptersData, manga.url).reversed())
-	}
-
+    val parts = manga.url.split("/").filter { it.isNotEmpty() }
+    if (parts.size < 4) return manga
+    val id = parts[2]
+    val chaptersUrl = "https://$domain/api/public/chapters" +
+        "?contentId=$id&page=1&limit=2000&order=asc"
+    val chaptersJson = runCatching { webClient.httpGet(chaptersUrl).parseJson() }
+        .getOrElse { return manga }
+    val chaptersData = chaptersJson.optJSONArray("chapters") ?: JSONArray()
+    return manga.copy(
+        chapters = parseChapters(chaptersData, manga.url)
+            .sortedBy { it.number }   // ← اضف هذا السطر
+    )
+}
 	private fun parseChapters(data: JSONArray, mangaUrl: String): List<MangaChapter> {
 		return data.mapJSONNotNull { item ->
 			val coinsRequired = item.optInt("coins_required", 0)
