@@ -13,14 +13,20 @@ import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import org.koitharu.kotatsu.parsers.util.json.mapJSONNotNull
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 
-// IMPORTANT: this host MUST also be registered in the app via PageLoader's
-// stitching path. Do not change without updating the app side.
 internal const val PROCHAN_STITCH_HOST = "kotatsu-prochan-stitch.local"
+
+private const val SCRAMBLE_KEY_BASE =
+	"prochan-browser-map:2e6f9a1c4d8b7e3f0a5c9d2b6e1f4a8c7d3b0e6a9f2c5d8b1e4a7c0d3f6b9e2"
 
 @MangaSourceParser("PROCHAN", "ProChan", "ar")
 internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
@@ -56,14 +62,16 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	private var allSeriesCacheAt = 0L
 	private val allSeriesTtlMs = 5 * 60 * 1000L
 
+	// Session-key cache (parser side, per chapter id)
+	private val sessionKeyMutex = Mutex()
+	private val sessionKeys = ConcurrentHashMap<Int, Pair<String, Long>>()
+	private val sessionKeyTtlMs = 30 * 60_000L
+
 	// =========================================================================
-	// HTTP INTERCEPTOR
+	// HTTP INTERCEPTOR — injects cookies and headers required by procomic.pro
 	// =========================================================================
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
-		// Stitch URLs are intercepted on the app side (in PageLoader).
-		// Short-circuit here as a safety net in case any code path lets the URL
-		// reach the network — return 501 so the app can detect it.
 		if (request.url.host == PROCHAN_STITCH_HOST) {
 			return Response.Builder()
 				.request(request)
@@ -87,6 +95,15 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 					"(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
 			)
+
+		// Required cookies to bypass the bot challenge / Turnstile guard.
+		if (isProcomicHost) {
+			val existing = request.header("Cookie")
+			val ourCookies = "safe_browsing=off; language=ar"
+			val combined = if (existing.isNullOrEmpty()) ourCookies else "$existing; $ourCookies"
+			builder.header("Cookie", combined)
+		}
+
 		if (isImageCdnRequest) {
 			builder
 				.header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
@@ -236,8 +253,6 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val chaptersJson = runCatching { webClient.httpGet(chaptersUrl).parseJson() }
 			.getOrElse { return manga }
 		val chaptersData = chaptersJson.optJSONArray("chapters") ?: JSONArray()
-		// Sort by chapter number ASCENDING so the UI shows them in correct order
-		// regardless of the API's date-based ordering.
 		return manga.copy(
 			chapters = parseChapters(chaptersData, manga.url).sortedBy { it.number },
 		)
@@ -275,7 +290,9 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	// =========================================================================
-	// PAGES (with full multi-split iteration)
+	// PAGES — fetch HTML, iterate all splits, AND pre-decrypt indirect maps.
+	// All decryption happens here, in the SAME session that fetched the chapter,
+	// so by the time the user reads, no extra API calls are needed.
 	// =========================================================================
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val parts = chapter.url.split("/").filter { it.isNotEmpty() }
@@ -289,7 +306,6 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val allText = doc.select("script").joinToString("") { it.data() }
 			.replace("\\\"", "\"").replace("\\/", "/").replace("\\\\", "\\")
 
-		// ----- 1) Direct in-page images (appImages) -----
 		val appImagesPattern = Regex(""""appImages":\[(.*?)\]""", RegexOption.DOT_MATCHES_ALL)
 		var foundAppImages = false
 		appImagesPattern.find(allText)?.groupValues?.get(1)?.let { raw ->
@@ -311,14 +327,12 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			}
 		}
 
-		// ----- 2) Deferred-media (iterate ALL splits to collect every chunk) -----
 		val tokenPattern = Regex(""""token":"([A-Za-z0-9_\-=.]+)"""")
 		val splitPattern = Regex(""""splitIndex":(\d+)""")
 		val token = tokenPattern.find(allText)?.groupValues?.get(1)
 		val maxSplitHint = splitPattern.find(allText)?.groupValues?.get(1)?.toIntOrNull() ?: 3
 
 		if (!token.isNullOrEmpty()) {
-			// Iterate split=0..(maxSplitHint+5). Stop after 3 consecutive empties.
 			val maxSplitCeiling = (maxSplitHint + 5).coerceAtMost(40)
 			var emptyStreak = 0
 			for (splitIndex in 0..maxSplitCeiling) {
@@ -360,10 +374,21 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 				mapsArr?.let { maps ->
 					for (i in 0 until maps.length()) {
 						val map = maps.optJSONObject(i) ?: continue
-						// Two valid shapes: direct (has pieces) OR indirect (token+method).
-						if (!(map.has("pieces") || (map.has("token") && map.has("method")))) continue
+						// Try to resolve into a direct map (with pieces) right here,
+						// while the session cookies are still fresh.
+						val resolved: JSONObject = when {
+							map.has("pieces") -> map
+							map.has("token") && map.has("method") -> {
+								try {
+									decryptMap(map, chapterId.toIntOrNull() ?: 0)
+								} catch (e: Throwable) {
+									continue
+								}
+							}
+							else -> continue
+						}
 						val payload = JSONObject().apply {
-							put("map", map)
+							put("map", resolved)
 							put("domain", domain)
 							put("chapterId", chapterId)
 						}.toString()
@@ -381,7 +406,6 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			}
 		}
 
-		// ----- 3) Fallback: plain "images" array if everything else failed -----
 		if (!foundAppImages && pages.isEmpty()) {
 			val imagesPattern = Regex(""""images":\["(.*?)"\]""", RegexOption.DOT_MATCHES_ALL)
 			imagesPattern.find(allText)?.groupValues?.get(1)?.split("\",\"")?.forEach { url ->
@@ -401,7 +425,57 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 
 	override suspend fun getPageUrl(page: MangaPage): String = page.url
 
+	// =========================================================================
+	// DECRYPTION — runs in parser context with active session cookies
+	// =========================================================================
+	private suspend fun decryptMap(map: JSONObject, fallbackCid: Int): JSONObject {
+		val token = map.getString("token")
+		val tokenBytes = decodeUrlSafeB64(token)
+		val value = JSONObject(String(tokenBytes, Charsets.UTF_8))
+		val cid = value.optInt("cid", fallbackCid)
+		val iv = decodeUrlSafeB64(value.getString("iv"))
+		val tag = decodeUrlSafeB64(value.getString("tag"))
+		val ct = decodeUrlSafeB64(value.getString("data"))
+		val method = value.optString("m")
+		val v = value.optInt("v")
+
+		val keyBytes: ByteArray = when {
+			method == "browser" && v == 2 -> {
+				val seed = "$SCRAMBLE_KEY_BASE:$cid"
+				MessageDigest.getInstance("SHA-256")
+					.digest(seed.toByteArray(Charsets.UTF_8))
+			}
+			method == "browser_session" && v == 3 -> {
+				decodeUrlSafeB64(fetchSessionKey(cid))
+			}
+			else -> error("Unsupported scramble method: $method v=$v")
+		}
+		val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply {
+			init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
+		}
+		val pt = cipher.doFinal(ct + tag)
+		return JSONObject(String(pt, Charsets.UTF_8))
+	}
+
+	private suspend fun fetchSessionKey(cid: Int): String = sessionKeyMutex.withLock {
+		val now = System.currentTimeMillis()
+		sessionKeys[cid]?.takeIf { it.second > now }?.first?.let { return@withLock it }
+
+		val url = "https://$domain/chapter-map-session-key/$cid"
+		// webClient.httpGet runs through the parser intercept which sets all
+		// cookies + headers — same session that just fetched the chapter HTML.
+		val response = webClient.httpGet(url).parseJson()
+		val data = response.optJSONObject("data") ?: response
+		val key = data.getString("key")
+		sessionKeys[cid] = key to (now + sessionKeyTtlMs)
+		key
+	}
+
 	@OptIn(ExperimentalEncodingApi::class)
 	private fun encodeUrlSafeB64(data: ByteArray): String =
 		Base64.UrlSafe.withPadding(Base64.PaddingOption.ABSENT).encode(data)
+
+	@OptIn(ExperimentalEncodingApi::class)
+	private fun decodeUrlSafeB64(s: String): ByteArray =
+		Base64.UrlSafe.withPadding(Base64.PaddingOption.PRESENT_OPTIONAL).decode(s)
 }
