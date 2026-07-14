@@ -1,170 +1,165 @@
 package org.koitharu.kotatsu.parsers.site.zeistmanga.ar
 
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import org.json.JSONObject
-import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
+import org.koitharu.kotatsu.parsers.config.ConfigKey
+import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
-import org.koitharu.kotatsu.parsers.site.zeistmanga.ZeistMangaParser
 import org.koitharu.kotatsu.parsers.util.*
-import org.koitharu.kotatsu.parsers.util.json.asTypedList
-import java.text.SimpleDateFormat
+import org.koitharu.kotatsu.parsers.util.json.*
+import org.koitharu.kotatsu.parsers.util.suspendlazy.suspendLazy
+import java.util.EnumSet
+import java.util.Locale
 
+/*
+ * الموقع بقى SPA بالكامل وبيجيب بياناته من JSON endpoints مباشرة:
+ *   - /index.json                              -> قائمة كل الأعمال (رئيسية + بحث)
+ *   - /manga/{slug}/details.json                -> تفاصيل العمل + قائمة الفصول
+ *   - /manga/{slug}/chapters/{chapterNum}.json  -> صور الفصل
+ *
+ * القالب القديم (ZeistManga/Blogger) اللي كان الـ parser القديم مبني عليه مبقاش
+ * موجود، فالكلاس ده بقى مستقل ومبني بالكامل على استهلاك الـ JSON.
+ *
+ * ملحوظة: نظام القفل بالعملات/الروابط المختصرة شغال Client-side بس؛
+ * الـ JSON الخاص بالفصل بيرجع الصور كاملة بغض النظر عن حالة القفل،
+ * فمفيش داعي نتعامل مع أي منطق فتح/دفع هنا.
+ */
 @MangaSourceParser("MURIM", "Murim", "ar")
 internal class Murim(context: MangaLoaderContext) :
-	ZeistMangaParser(context, MangaParserSource.MURIM, "www.murim.site") {
-	
-	override val sateOngoing: String = "مستمرة"
-	override val sateFinished: String = "مكتمل"
-	override val sateAbandoned: String = "متروك"
+	PagedMangaParser(context, MangaParserSource.MURIM, pageSize = 12) {
 
-	override val selectTags = "div.chaptertags a, article div.mt-15 a"
-	
-	// تحديث selector الصفحات لدعم data-src و src
-	override val selectPage = "div.check-box img"
+	override val configKeyDomain = ConfigKey.Domain("www.murim.site")
 
-	override suspend fun fetchAvailableTags(): Set<MangaTag> {
-		val doc = webClient.httpGet("https://$domain").parseHtml()
-		return doc.selectFirstOrThrow("#PageList1").select("ul li a").mapToSet {
-			MangaTag(
-				key = it.attr("href").substringAfterLast('/').substringBefore('?'),
-				title = it.text(),
+	override val availableSortOrders: Set<SortOrder> = EnumSet.of(SortOrder.UPDATED)
+
+	override val filterCapabilities: MangaListFilterCapabilities
+		get() = MangaListFilterCapabilities(
+			isSearchSupported = true,
+		)
+
+	override suspend fun getFilterOptions() = MangaListFilterOptions()
+
+	// كاش لملف index.json عشان مانعملش fetch جديد مع كل صفحة/بحث
+	private val indexCache = suspendLazy(initializer = ::fetchIndex)
+
+	private suspend fun fetchIndex(): List<org.json.JSONObject> {
+		val json = webClient.httpGet("https://$domain/index.json").parseJson()
+		val arr = json.optJSONArray("latest") ?: return emptyList()
+		return arr.mapJSON { it }
+	}
+
+	private fun extractSlug(link: String?): String? {
+		if (link.isNullOrEmpty()) return null
+		val afterId = link.substringAfter("id=", "")
+		if (afterId.isEmpty()) return null
+		return afterId.substringBefore('&').substringBefore('#')
+	}
+
+	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+		val all = indexCache.get()
+
+		val query = filter.query?.trim()?.lowercase(Locale.getDefault())
+		val filtered = if (!query.isNullOrEmpty()) {
+			all.filter { it.getStringOrNull("title")?.lowercase(Locale.getDefault())?.contains(query) == true }
+		} else {
+			all
+		}
+
+		val start = (page - 1) * pageSize
+		if (start >= filtered.size) return emptyList()
+		val end = minOf(start + pageSize, filtered.size)
+
+		return filtered.subList(start, end).mapNotNull { item ->
+			val slug = extractSlug(item.getStringOrNull("link")) ?: return@mapNotNull null
+			Manga(
+				id = generateUid(slug),
+				title = item.getStringOrNull("title") ?: return@mapNotNull null,
+				altTitles = emptySet(),
+				url = slug,
+				publicUrl = "https://$domain/details?id=$slug",
+				rating = RATING_UNKNOWN,
+				contentRating = null,
+				coverUrl = item.getStringOrNull("image")?.toAbsoluteUrl(domain),
+				tags = emptySet(),
+				state = null,
+				authors = emptySet(),
 				source = source,
 			)
 		}
 	}
 
-	override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
-		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
-		
-		val state = doc.selectFirst("div.y6x11p:contains(الحالة) .dt") 
-			?: doc.selectFirst("div.y6x11p:contains(Status) .dt")
-		val mangaState = state?.text()?.lowercase().let {
-			when (it) {
-				in ongoing -> MangaState.ONGOING
-				in finished -> MangaState.FINISHED
-				in abandoned -> MangaState.ABANDONED
-				in paused -> MangaState.PAUSED
-				else -> null
+	override suspend fun getDetails(manga: Manga): Manga {
+		val slug = manga.url
+		val json = webClient.httpGet("https://$domain/manga/$slug/details.json").parseJson()
+
+		val stateStr = (json.getStringOrNull("status") ?: "").lowercase(Locale.getDefault())
+		val state = when {
+			stateStr.contains("مستمر") || stateStr.contains("ongoing") -> MangaState.ONGOING
+			stateStr.contains("مكتمل") || stateStr.contains("completed") -> MangaState.FINISHED
+			stateStr.contains("متروك") || stateStr.contains("dropped") -> MangaState.ABANDONED
+			stateStr.contains("متوقف") || stateStr.contains("paused") || stateStr.contains("hiatus") -> MangaState.PAUSED
+			else -> null
+		}
+
+		val tags = json.optJSONArray("tags")?.mapJSONToSet { /* not used, placeholder guard */ it } ?: emptySet()
+		// tags في details.json عبارة عن مصفوفة نصوص وليست كائنات JSON، فبنبنيها يدوي:
+		val tagArr = json.optJSONArray("tags")
+		val tagSet: Set<MangaTag> = if (tagArr != null) {
+			(0 until tagArr.length()).mapNotNullToSet { i ->
+				val name = tagArr.optString(i, "")
+				if (name.isEmpty()) null else MangaTag(key = name, title = name.toTitleCase(), source = source)
 			}
-		}
-		
-		val author = doc.selectFirst("div.y6x11p:contains(الكاتب) .dt") 
-			?: doc.selectFirst("div.y6x11p:contains(Author) .dt")
-		
-		val description = doc.select("div.max-w.pen p").firstOrNull { p ->
-			val text = p.text()
-			text.isNotEmpty() && 
-			!text.contains("الفصل") && 
-			!text.contains("Chapter") &&
-			!text.contains("إذا كانت") &&
-			text.length > 50
-		}?.text() ?: ""
-		
-		val chaptersDeferred = async { loadChapters(manga.url, doc) }
-		
-		manga.copy(
-			authors = author?.text()?.let { setOf(it) } ?: emptySet(),
-			tags = doc.select(selectTags).mapToSet { a ->
-				MangaTag(
-					key = a.attr("href").substringAfterLast("label/").substringBefore("?"),
-					title = a.text().toTitleCase(),
-					source = source,
-				)
-			},
-			description = description,
-			state = mangaState,
-			chapters = chaptersDeferred.await(),
-		)
-	}
-
-	override suspend fun loadChapters(mangaUrl: String, doc: Document): List<MangaChapter> {
-		val seriesName = doc.selectFirst("h1.m-0 a[rel='tag']")?.text()
-			?: doc.selectFirst("ol[itemtype*=BreadcrumbList] li:nth-child(2) a span")?.text()
-			?: doc.selectFirst("div.tac a[rel='tag']")?.text()
-			?: doc.selectFirst("h1 a[data]")?.attr("data")
-			?: run {
-				val breadcrumbLinks = doc.select("ol[itemtype*=BreadcrumbList] li a")
-				if (breadcrumbLinks.size >= 2) {
-					breadcrumbLinks[1].text()
-				} else {
-					doc.parseFailed("Could not find series name")
-				}
-			}
-
-		val url = buildString {
-			append("https://")
-			append(domain)
-			append("/feeds/posts/default/-/")
-			append(seriesName.urlEncoded())
-			append("?alt=json&orderby=published&max-results=9999")
-		}
-		
-		val raw = webClient.httpGet(url).parseRaw()
-
-		// لو الرد مش JSON (يعني صفحة Cloudflare/challenge أو أي HTML تاني) رجّع قايمة فاضية بدل الكراش
-		if (raw.isBlank() || !raw.trimStart().startsWith("{")) {
-			return emptyList()
+		} else {
+			emptySet()
 		}
 
-		val json = JSONObject(raw).getJSONObject("feed")
-
-		if (!json.toString().contains("\"entry\":")) {
-			return emptyList()
-		}
-		
-		val entries = json.getJSONArray("entry").asTypedList<JSONObject>().reversed()
-		val dateFormat = SimpleDateFormat(datePattern, sourceLocale)
-		
-		return entries.mapIndexedNotNull { i, j ->
-			val name = j.getJSONObject("title").getString("\$t")
-			val href = j.getJSONArray("link").asTypedList<JSONObject>()
-				.first { it.getString("rel") == "alternate" }
-				.getString("href")
-			val dateText = j.getJSONObject("published").getString("\$t").substringBefore("T")
-			
-			val slug = mangaUrl.substringAfterLast('/').substringBefore('?').substringBefore(".html")
-			val slugChapter = href.substringAfterLast('/').substringBefore('?').substringBefore(".html")
-			if (slug == slugChapter) {
-				return@mapIndexedNotNull null
-			}
-			
+		val chaptersArr = json.optJSONArray("chapters_list")
+		val chapters = chaptersArr?.mapJSONNotNull { ch ->
+			if (ch.optBoolean("is_draft", false)) return@mapJSONNotNull null
+			val chapterNum = ch.getStringOrNull("chapter")?.toFloatOrNull() ?: return@mapJSONNotNull null
 			MangaChapter(
-				id = generateUid(href),
-				url = href,
-				title = name,
-				number = i + 1f,
+				id = generateUid("$slug#$chapterNum"),
+				url = "$slug#$chapterNum",
+				title = ch.getStringOrNull("title"),
+				number = chapterNum,
 				volume = 0,
 				branch = null,
-				uploadDate = dateFormat.parseSafe(dateText),
+				uploadDate = parseChapterDate(ch.getStringOrNull("date")),
 				scanlator = null,
 				source = source,
 			)
-		}
+		}?.sortedBy { it.number } ?: emptyList()
+
+		return manga.copy(
+			title = json.getStringOrNull("title") ?: manga.title,
+			coverUrl = json.getStringOrNull("cover")?.toAbsoluteUrl(domain) ?: manga.coverUrl,
+			description = json.getStringOrNull("description"),
+			authors = json.getStringOrNull("author")?.let { setOf(it) } ?: emptySet(),
+			tags = tagSet,
+			state = state,
+			chapters = chapters,
+		)
 	}
 
-	// Override getPages لدعم data-src
+	private fun parseChapterDate(dateStr: String?): Long {
+		if (dateStr.isNullOrEmpty()) return 0L
+		dateStr.toLongOrNull()?.let { return it }
+		return dateStr.parseSafe("yyyy-MM-dd") // extension متوفرة في util package بالمكتبة
+	}
+
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-		
-		return doc.select(selectPage).mapNotNull { img ->
-			// محاولة الحصول على الصورة من data-src أولاً، ثم src
-			val url = img.attr("data-src").ifEmpty { 
-				img.attr("src") 
-			}
-			
-			if (url.isNotEmpty() && url != "data:image/png;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=") {
-				MangaPage(
-					id = generateUid(url),
-					url = url,
-					preview = null,
-					source = source,
-				)
-			} else {
-				null
-			}
+		val (slug, chapterNum) = chapter.url.split('#', limit = 2)
+		val json = webClient.httpGet("https://$domain/manga/$slug/chapters/$chapterNum.json").parseJson()
+		val imagesArr = json.optJSONArray("images") ?: return emptyList()
+
+		return (0 until imagesArr.length()).map { i ->
+			val url = imagesArr.getString(i).toAbsoluteUrl(domain)
+			MangaPage(
+				id = generateUid(url),
+				url = url,
+				preview = null,
+				source = source,
+			)
 		}
 	}
 }
