@@ -102,8 +102,15 @@ internal class Murim(context: MangaLoaderContext) :
 			append("?alt=json&orderby=published&max-results=9999")
 		}
 		
-		val json = webClient.httpGet(url).parseJson().getJSONObject("feed")
-		
+		val raw = webClient.httpGet(url).parseRaw()
+
+		// لو الرد مش JSON (يعني صفحة Cloudflare/challenge أو أي HTML تاني) رجّع قايمة فاضية بدل الكراش
+		if (raw.isBlank() || !raw.trimStart().startsWith("{")) {
+			return emptyList()
+		}
+
+		val json = JSONObject(raw).getJSONObject("feed")
+
 		if (!json.toString().contains("\"entry\":")) {
 			return emptyList()
 		}
