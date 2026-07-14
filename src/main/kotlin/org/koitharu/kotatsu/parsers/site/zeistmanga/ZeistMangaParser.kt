@@ -142,7 +142,14 @@ internal abstract class ZeistMangaParser(
 			}
 		}
 
-		val json = webClient.httpGet(url).parseJson().getJSONObject("feed")
+		val raw = webClient.httpGet(url).parseRaw()
+
+		// لو الرد مش JSON (صفحة Cloudflare/challenge أو أي HTML تاني) رجّع قايمة فاضية بدل الكراش
+		if (raw.isBlank() || !raw.trimStart().startsWith("{")) {
+			return emptyList()
+		}
+
+		val json = JSONObject(raw).getJSONObject("feed")
 
 		return if (json.toString().contains("\"entry\":")) {
 			parseMangaList(json.getJSONArray("entry"))
@@ -277,8 +284,15 @@ internal abstract class ZeistMangaParser(
 			append(feed)
 			append("?alt=json&orderby=published&max-results=9999")
 		}
+		val raw = webClient.httpGet(url).parseRaw()
+
+		// لو الرد مش JSON (صفحة Cloudflare/challenge أو أي HTML تاني) رجّع قايمة فاضية بدل الكراش
+		if (raw.isBlank() || !raw.trimStart().startsWith("{")) {
+			return emptyList()
+		}
+
 		val json =
-			webClient.httpGet(url).parseJson().getJSONObject("feed").getJSONArray("entry").asTypedList<JSONObject>()
+			JSONObject(raw).getJSONObject("feed").getJSONArray("entry").asTypedList<JSONObject>()
 				.reversed()
 		val dateFormat = SimpleDateFormat(datePattern, sourceLocale)
 		return json.mapIndexedNotNull { i, j ->
