@@ -229,7 +229,17 @@ internal class KolNovel(context: MangaLoaderContext) :
 
 		return NovelChapterContent(
 			html = html,
-			images = emptyList(),
+			images = contentElement.select("img").mapNotNull { image ->
+				image.src()?.let { url ->
+					NovelImage(
+						url = url,
+						headers = mapOf(
+							"Referer" to chapter.url.toAbsoluteUrl(domain),
+							"User-Agent" to config[userAgentKey],
+						),
+					)
+				}
+			}.distinctBy(NovelImage::url),
 		)
 	}
 }

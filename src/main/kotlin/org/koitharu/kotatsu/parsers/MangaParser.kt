@@ -89,6 +89,15 @@ public interface MangaParser : Interceptor {
 		return null
 	}
 
+	/**
+	 * Resolve an anime episode to directly playable HLS/MP4 streams.
+	 * Only parsers whose [MangaParserSource.contentType] is [ContentType.ANIME]
+	 * should override this method.
+	 */
+	public suspend fun getVideoStreams(chapter: MangaChapter): List<AnimeStream> {
+		return emptyList()
+	}
+
 	public fun getRequestHeaders(): Headers
 
 	/**

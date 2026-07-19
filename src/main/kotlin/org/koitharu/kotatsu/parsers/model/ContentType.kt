@@ -23,6 +23,9 @@ public enum class ContentType {
 
 	NOVEL,
 
+	/** Streamed anime series whose chapters represent playable episodes. */
+	ANIME,
+
 	/**
 	 * Use this type if no other suits your needs. For example, for an indie manga
 	 */

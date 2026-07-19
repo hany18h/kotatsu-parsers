@@ -297,7 +297,17 @@ internal class Cenele(context: MangaLoaderContext) :
 				if (title.isNotBlank()) append("<h1>$title</h1>")
 				append(content.html())
 			},
-			images = emptyList(),
+			images = content.select("img").mapNotNull { image ->
+				image.src()?.let { url ->
+					NovelImage(
+						url = url,
+						headers = mapOf(
+							"Referer" to cleanUrl,
+							"User-Agent" to config[userAgentKey],
+						),
+					)
+				}
+			}.distinctBy(NovelImage::url),
 		)
 	}
 }
