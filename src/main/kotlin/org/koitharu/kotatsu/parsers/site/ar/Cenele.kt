@@ -1,6 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -13,6 +14,11 @@ import java.util.*
 @MangaSourceParser("CENELE", "فضاء الروايات", "ar", ContentType.NOVEL)
 internal class Cenele(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.CENELE, pageSize = 12) {
+
+	init {
+		// Madara's load-more endpoint is zero based, while the regular search is one based.
+		setFirstPage(firstPage = 0, firstPageForSearch = 1)
+	}
 
 	override val configKeyDomain = ConfigKey.Domain("cenele.com")
 
@@ -141,7 +147,7 @@ internal class Cenele(context: MangaLoaderContext) :
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> {
 		val doc = webClient.httpGet("https://$domain/novel/").parseHtml()
-		return doc.select("li a[href*=novel-genre]").mapNotNullToSet { a ->
+		return doc.select("a[href*=/cont-genre/], a[href*=/novel-genre/]").mapNotNullToSet { a ->
 			val key = a.attr("href").removeSuffix("/").substringAfterLast("/")
 			if (key.isEmpty()) return@mapNotNullToSet null
 			MangaTag(
@@ -184,7 +190,7 @@ internal class Cenele(context: MangaLoaderContext) :
 		return manga.copy(
 			title = doc.selectFirst("div.post-title h1")?.text()?.trim() ?: manga.title,
 			altTitles = setOfNotNull(altTitle?.ifEmpty { null }),
-			description = doc.selectFirst("div.summary__content")?.html(),
+			description = loadDescription(doc),
 			coverUrl = coverUrl,
 			largeCoverUrl = coverUrl,
 			state = state,
@@ -192,6 +198,29 @@ internal class Cenele(context: MangaLoaderContext) :
 			tags = tags,
 			chapters = chapters,
 		)
+	}
+
+	private suspend fun loadDescription(doc: Document): String? {
+		val fallback = doc.selectFirst("div.summary__content, .manga-excerpt .excerpt-content")
+			?.html()?.trim()?.takeIf(String::isNotEmpty)
+		val readMore = doc.selectFirst("#nhv-synopsis-readmore") ?: return fallback
+		val postId = readMore.attr("data-post-id").trim().takeIf(String::isNotEmpty) ?: return fallback
+		val nonce = readMore.attr("data-nonce").trim().takeIf(String::isNotEmpty) ?: return fallback
+
+		return runCatching {
+			webClient.httpPost(
+				"https://$domain/wp-admin/admin-ajax.php",
+				mapOf(
+					"action" to "nhv_get_manga_synopsis",
+					"nonce" to nonce,
+					"post_id" to postId,
+				),
+			).parseJson()
+				.optJSONObject("data")
+				?.optString("html")
+				?.trim()
+				?.takeIf(String::isNotEmpty)
+		}.getOrNull() ?: fallback
 	}
 
 	private suspend fun loadChapters(mangaUrl: String, doc: Document): List<MangaChapter> {
@@ -267,8 +296,23 @@ internal class Cenele(context: MangaLoaderContext) :
 
 		val doc = webClient.httpGet(cleanUrl).parseHtml()
 
-		// div.text-left هو container النص في cenele
-		val content = doc.selectFirst("div.text-left") ?: return null
+		val content = doc.selectFirst(
+			".reading-content.current div.text-left, div.text-left, .reading-content.current",
+		) ?: return null
+
+		// Cenele inserts an anti-copy paragraph after each marker. CSS hides it in a browser,
+		// but a native novel reader would otherwise display it between every real paragraph.
+		content.select("template[data-nhv-rb] + p").remove()
+		content.select("template[data-nhv-rb], template").remove()
+		content.select("p, span, div").forEach { element ->
+			val text = element.ownText().trim()
+			if (
+				text.contains("هذا تنبيه من موقع فضاء الروايات") &&
+				text.contains("cenele.com")
+			) {
+				element.remove()
+			}
+		}
 
 		// إزالة كل العناصر المخفية (حماية الموقع من السرقة بـ spans/paragraphs مع aria-hidden)
 		content.select(
@@ -276,11 +320,17 @@ internal class Cenele(context: MangaLoaderContext) :
 				"p[aria-hidden=true], " +
 				"span[role=presentation], " +
 				"p[role=presentation], " +
-				"input[type=hidden], " +
-				"script, style, ins, iframe, noscript, " +
+				"input[type=hidden], [hidden], .d-none, " +
+				"[style*=\"display:none\"], [style*=\"display: none\"], " +
+				"[style*=\"visibility:hidden\"], [style*=\"visibility: hidden\"], " +
+				"script, style, ins, iframe, noscript, template, " +
 				".adsbygoogle, .google-auto-placed, " +
 				"[id^=ezoic], [id^=pf-], [id^=bg-ssp]",
 		).remove()
+
+		content.select("img").forEach { image ->
+			promoteLazyImageSource(image)
+		}
 
 		// إزالة الفقرات الفارغة
 		content.select("p").forEach { p ->
@@ -294,7 +344,7 @@ internal class Cenele(context: MangaLoaderContext) :
 
 		return NovelChapterContent(
 			html = buildString {
-				if (title.isNotBlank()) append("<h1>$title</h1>")
+				if (title.isNotBlank()) append(Element("h1").text(title).outerHtml())
 				append(content.html())
 			},
 			images = content.select("img").mapNotNull { image ->
@@ -309,5 +359,16 @@ internal class Cenele(context: MangaLoaderContext) :
 				}
 			}.distinctBy(NovelImage::url),
 		)
+	}
+
+	private fun promoteLazyImageSource(image: Element) {
+		if (image.attr("src").isNotBlank() && !image.attr("src").startsWith("data:")) return
+		for (attribute in arrayOf("data-src", "data-lazy-src", "data-original", "data-url")) {
+			val value = image.attr(attribute).trim()
+			if (value.isNotEmpty()) {
+				image.attr("src", value)
+				return
+			}
+		}
 	}
 }

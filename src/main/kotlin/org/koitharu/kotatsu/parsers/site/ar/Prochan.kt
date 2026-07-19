@@ -23,8 +23,6 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 
-internal const val PROCHAN_STITCH_HOST = "kotatsu-prochan-stitch.local"
-
 private const val SCRAMBLE_KEY_BASE =
 	"prochan-browser-map:2e6f9a1c4d8b7e3f0a5c9d2b6e1f4a8c7d3b0e6a9f2c5d8b1e4a7c0d3f6b9e2"
 
@@ -72,16 +70,6 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	// =========================================================================
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
-		if (request.url.host == PROCHAN_STITCH_HOST) {
-			return Response.Builder()
-				.request(request)
-				.protocol(okhttp3.Protocol.HTTP_1_1)
-				.code(501)
-				.message("Handled by app-side ProChan stitcher")
-				.body(okhttp3.ResponseBody.create(null, ByteArray(0)))
-				.build()
-		}
-
 		val host = request.url.host
 		val isProcomicHost = host.contains("procomic") || host.contains("prochan")
 		val isImageCdnRequest = host in imageCdnHosts
@@ -248,12 +236,40 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val parts = manga.url.split("/").filter { it.isNotEmpty() }
 		if (parts.size < 4) return manga
 		val id = parts[2]
+		val detailsDoc = runCatching {
+			webClient.httpGet(manga.publicUrl).parseHtml()
+		}.getOrNull()
+		val description = detailsDoc
+			?.selectFirst("h3:matchesOwn(^\\s*(?:نبذة|Summary)\\s*$)")
+			?.nextElementSibling()
+			?.outerHtml()
+			?: detailsDoc?.selectFirst("meta[name=description]")?.attr("content")
+				?.takeIf(String::isNotBlank)
+				?.let { org.jsoup.nodes.Element("p").text(it).outerHtml() }
+			?: manga.description
+		val altTitles = detailsDoc
+			?.selectFirst("h3:matchesOwn(^\\s*(?:عناوين بديلة|Alternative Titles)\\s*$)")
+			?.parent()
+			?.select("li")
+			?.mapNotNullToSet { it.text().trim().takeIf(String::isNotEmpty) }
+			.orEmpty()
+		val authors = detailsDoc?.select("div")
+			?.filter { element ->
+				element.ownText().trim() in setOf("المؤلف", "الرسام", "Author", "Artist")
+			}
+			?.mapNotNullToSet { label ->
+				label.nextElementSibling()?.text()?.trim()?.takeIf(String::isNotEmpty)
+			}
+			.orEmpty()
 		val chaptersUrl = "https://$domain/api/public/chapters" +
 			"?contentId=$id&page=1&limit=2000&order=asc"
 		val chaptersJson = runCatching { webClient.httpGet(chaptersUrl).parseJson() }
-			.getOrElse { return manga }
-		val chaptersData = chaptersJson.optJSONArray("chapters") ?: JSONArray()
+			.getOrNull()
+		val chaptersData = chaptersJson?.optJSONArray("chapters") ?: JSONArray()
 		return manga.copy(
+			description = description,
+			altTitles = altTitles.ifEmpty { manga.altTitles },
+			authors = authors.ifEmpty { manga.authors },
 			chapters = parseChapters(chaptersData, manga.url).sortedBy { it.number },
 		)
 	}
@@ -330,40 +346,23 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val tokenPattern = Regex(""""token":"([A-Za-z0-9_\-=.]+)"""")
 		val splitPattern = Regex(""""splitIndex":(\d+)""")
 		val token = tokenPattern.find(allText)?.groupValues?.get(1)
-		val maxSplitHint = splitPattern.find(allText)?.groupValues?.get(1)?.toIntOrNull() ?: 3
+		val splitIndex = splitPattern.find(allText)?.groupValues?.get(1)?.toIntOrNull() ?: 3
 
 		if (!token.isNullOrEmpty()) {
-			val maxSplitCeiling = (maxSplitHint + 5).coerceAtMost(40)
-			var emptyStreak = 0
-			for (splitIndex in 0..maxSplitCeiling) {
-				val deferredUrl = "https://$domain/chapter-deferred-media/$chapterId" +
-					"?token=$token&split=$splitIndex"
-				val deferredData = runCatching { webClient.httpGet(deferredUrl).parseJson() }
-					.getOrNull()?.optJSONObject("data")
-
-				if (deferredData == null) {
-					emptyStreak++
-					if (emptyStreak >= 3) break else continue
-				}
-
+			val deferredUrl = "https://$domain/chapter-deferred-media/$chapterId" +
+				"?token=$token&split=$splitIndex"
+			val deferredData = runCatching { webClient.httpGet(deferredUrl).parseJson() }
+				.getOrNull()?.optJSONObject("data")
+			if (deferredData != null) {
 				val imagesArr = deferredData.optJSONArray("images")
 				val mapsArr = deferredData.optJSONArray("maps")
-				val gotSomething =
-					(imagesArr != null && imagesArr.length() > 0) ||
-					(mapsArr != null && mapsArr.length() > 0)
-
-				if (!gotSomething) {
-					emptyStreak++
-					if (emptyStreak >= 3) break else continue
-				}
-				emptyStreak = 0
 
 				imagesArr?.let { images ->
 					for (i in 0 until images.length()) {
 						val imgUrl = images.optString(i).takeIf { it.isNotEmpty() } ?: continue
 						pages.add(
 							MangaPage(
-								id = generateUid("${chapter.id}-def-$splitIndex-$pageIndex"),
+								id = generateUid("${chapter.id}-def-$pageIndex"),
 								url = imgUrl, preview = null, source = source,
 							),
 						)
@@ -387,16 +386,10 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 							}
 							else -> continue
 						}
-						val payload = JSONObject().apply {
-							put("map", resolved)
-							put("domain", domain)
-							put("chapterId", chapterId)
-						}.toString()
-						val encoded = encodeUrlSafeB64(payload.toByteArray(Charsets.UTF_8))
-						val mapUrl = "https://$PROCHAN_STITCH_HOST/p?d=$encoded"
+						val mapUrl = buildProChanStitchUrl(resolved, domain) ?: continue
 						pages.add(
 							MangaPage(
-								id = generateUid("${chapter.id}-map-$splitIndex-$pageIndex"),
+								id = generateUid("${chapter.id}-map-$pageIndex"),
 								url = mapUrl, preview = null, source = source,
 							),
 						)
@@ -461,7 +454,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val now = System.currentTimeMillis()
 		sessionKeys[cid]?.takeIf { it.second > now }?.first?.let { return@withLock it }
 
-		val url = "https://$domain/chapter-map-session-key/$cid"
+		val url = "https://$domain/chapter-map-session-key/$cid?legacy=1"
 		// webClient.httpGet runs through the parser intercept which sets all
 		// cookies + headers — same session that just fetched the chapter HTML.
 		val response = webClient.httpGet(url).parseJson()
@@ -478,4 +471,39 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	@OptIn(ExperimentalEncodingApi::class)
 	private fun decodeUrlSafeB64(s: String): ByteArray =
 		Base64.UrlSafe.withPadding(Base64.PaddingOption.PRESENT_OPTIONAL).decode(s)
+}
+
+@OptIn(ExperimentalEncodingApi::class)
+internal fun buildProChanStitchUrl(map: JSONObject, domain: String): String? {
+	val pieces = map.optJSONArray("pieces") ?: return null
+	if (pieces.length() == 0) return null
+	val rawPieces = (0 until pieces.length()).mapNotNull { index ->
+		pieces.optString(index).trim().takeIf(String::isNotEmpty)
+	}
+	if (rawPieces.isEmpty()) return null
+
+	val order = map.optJSONArray("order")
+	val orderedPieces = if (order != null && order.length() > 0) {
+		(0 until order.length()).mapNotNull { index ->
+			rawPieces.getOrNull(order.optInt(index, -1))
+		}
+	} else {
+		rawPieces
+	}.map { url ->
+		if (url.startsWith("http://") || url.startsWith("https://")) url else url.toAbsoluteUrl(domain)
+	}
+	if (orderedPieces.isEmpty()) return null
+
+	val dim = map.optJSONArray("dim")
+	val width = dim?.optInt(0)?.takeIf { it > 0 }
+		?: map.optInt("width").takeIf { it > 0 }
+		?: 1
+	val height = dim?.optInt(1)?.takeIf { it > 0 }
+		?: map.optInt("height").takeIf { it > 0 }
+		?: 1
+	val mode = map.optString("mode", "vertical").ifEmpty { "vertical" }
+	val encodedPieces = Base64.UrlSafe.withPadding(Base64.PaddingOption.ABSENT).encode(
+		orderedPieces.joinToString("|").toByteArray(Charsets.UTF_8),
+	)
+	return "prochan-map://stitch?w=$width&h=$height&mode=${mode.urlEncoded()}&pieces=$encodedPieces"
 }
