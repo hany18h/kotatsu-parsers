@@ -7,6 +7,6 @@ import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 
 @MangaSourceParser("ASQORG", "3Asq", "ar")
 internal class Asq(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.ASQORG, "3asq.org") {
+	MadaraParser(context, MangaParserSource.ASQORG, "3asq.online") {
 	override val datePattern = "d MMMM، yyyy"
 }
