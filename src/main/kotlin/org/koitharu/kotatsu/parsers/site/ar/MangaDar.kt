@@ -189,6 +189,8 @@ internal class MangaDar(context: MangaLoaderContext) : PagedMangaParser(
 
 	private companion object {
 		val MANGA_PATH = Regex("^/manga/[^/]+/?$")
-		val ROWS_PATTERN = Regex("rows:\\s*(\\[\\[.*]])\\s*,\\s*cover:", RegexOption.DOT_MATCHES_ALL)
+		// The chapter array is followed by the user's read-state array. It used to be
+		// followed by `cover`, so anchoring to that field made every title look empty.
+		val ROWS_PATTERN = Regex("rows:\\s*(\\[\\[.*?]])\\s*,\\s*read:", RegexOption.DOT_MATCHES_ALL)
 	}
 }
