@@ -110,15 +110,7 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 		val studios = details?.firestoreStrings("studio").orEmpty().toSet()
 		val rating = fields.firestoreNumber("average_rate")
 			?: fields.firestoreMap("rating")?.firestoreNumber("rate")
-		val chapters = runCatching {
-			val summary = fetchDocument(
-				"anime_list",
-				animeId,
-				"episodes_summery",
-				"summery",
-			)
-			parseEpisodes(animeId, summary.optJSONObject("fields"))
-		}.getOrDefault(emptyList())
+		val chapters = loadEpisodes(animeId)
 
 		return manga.copy(
 			title = fields.firestoreString("name") ?: manga.title,
@@ -143,21 +135,9 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 		if (parts.size != 2) return emptyList()
 		val animeId = decode(parts[0])
 		val episodeId = decode(parts[1])
-		val fields = fetchDocument(
-			"anime_list",
-			animeId,
-			"episodes",
-			episodeId,
-			"servers2",
-			"all_servers",
-		).optJSONObject("fields") ?: return emptyList()
-		val servers = fields.firestoreArray("servers") ?: return emptyList()
+		val servers = loadServers(animeId, episodeId)
 		return buildList {
-			for (i in 0 until servers.length()) {
-				val server = servers.optJSONObject(i)
-					?.optJSONObject("mapValue")
-					?.optJSONObject("fields")
-					?: continue
+			for (server in servers) {
 				if (server.firestoreBoolean("visible") == false) continue
 				val link = server.firestoreString("link") ?: continue
 				val direct = toDirectVideoUrl(
@@ -171,12 +151,67 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 						name = listOfNotNull("AnimeWitcher", serverName, quality)
 							.joinToString(" • "),
 						url = direct,
-						headers = mapOf("User-Agent" to config[userAgentKey]),
+						headers = mapOf(
+							"Referer" to link,
+							"User-Agent" to config[userAgentKey],
+						),
 						quality = quality,
 					),
 				)
 			}
 		}.distinctBy(AnimeStream::url)
+	}
+
+	private suspend fun loadEpisodes(animeId: String): List<MangaChapter> {
+		val summary = runCatching {
+			fetchDocument(
+				"anime_list",
+				animeId,
+				"episodes_summery",
+				"summery",
+			)
+		}.getOrNull()
+		val summarizedEpisodes = parseEpisodes(animeId, summary?.optJSONObject("fields"))
+		if (summarizedEpisodes.isNotEmpty()) {
+			return summarizedEpisodes
+		}
+
+		val documents = runCatching {
+			fetchCollection(EPISODES_PAGE_SIZE, "anime_list", animeId, "episodes")
+		}.getOrDefault(emptyList())
+		return parseEpisodeDocuments(animeId, documents)
+	}
+
+	private suspend fun loadServers(animeId: String, episodeId: String): List<JSONObject> {
+		val summary = runCatching {
+			fetchDocument(
+				"anime_list",
+				animeId,
+				"episodes",
+				episodeId,
+				"servers2",
+				"all_servers",
+			)
+		}.getOrNull()
+		val values = summary?.optJSONObject("fields")?.firestoreArray("servers")
+		val summarizedServers = buildList {
+			if (values != null) {
+				for (i in 0 until values.length()) {
+					values.optJSONObject(i)
+						?.optJSONObject("mapValue")
+						?.optJSONObject("fields")
+						?.let(::add)
+				}
+			}
+		}
+		if (summarizedServers.isNotEmpty()) {
+			return summarizedServers
+		}
+
+		return runCatching {
+			fetchCollection(SERVERS_PAGE_SIZE, "anime_list", animeId, "episodes", episodeId, "servers")
+				.mapNotNull { it.optJSONObject("fields") }
+		}.getOrDefault(emptyList())
 	}
 
 	private fun parseCatalogItem(item: JSONObject): Manga? {
@@ -221,30 +256,48 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 					?.optJSONObject("fields")
 					?: continue
 				val episodeId = episode.firestoreString("doc_id") ?: continue
-				val name = episode.firestoreString("name")
-				val translatedTitle = episode.firestoreString("title_translated")
-				val number = firstNumber(name)
-					?: firstNumber(episodeId)
-					?: (i + 1).toFloat()
-				add(
-					MangaChapter(
-						id = generateUid("$animeId/$episodeId"),
-						title = listOfNotNull(name, translatedTitle)
-							.filter(String::isNotBlank)
-							.distinct()
-							.joinToString(" — ")
-							.ifBlank { "الحلقة ${formatNumber(number)}" },
-						number = number,
-						volume = 0,
-						url = "$EPISODE_PATH${animeId.urlEncoded()}/${episodeId.urlEncoded()}",
-						scanlator = "AnimeWitcher",
-						uploadDate = 0L,
-						branch = null,
-						source = source,
-					),
-				)
+				parseEpisode(animeId, episodeId, episode, i)?.let(::add)
 			}
 		}.distinctBy(MangaChapter::id).sortedBy(MangaChapter::number)
+	}
+
+	private fun parseEpisodeDocuments(animeId: String, documents: List<JSONObject>): List<MangaChapter> =
+		documents.mapIndexedNotNull { index, document ->
+			val fields = document.optJSONObject("fields") ?: return@mapIndexedNotNull null
+			val episodeId = fields.firestoreString("doc_id")
+				?: document.optString("name").substringAfterLast('/').takeIf(String::isNotBlank)
+				?: return@mapIndexedNotNull null
+			parseEpisode(animeId, episodeId, fields, index)
+		}.distinctBy(MangaChapter::id).sortedBy(MangaChapter::number)
+
+	private fun parseEpisode(
+		animeId: String,
+		episodeId: String,
+		fields: JSONObject,
+		index: Int,
+	): MangaChapter {
+		val name = fields.firestoreString("name")
+		val translatedTitle = fields.firestoreString("title_translated")
+			?: fields.firestoreMap("title_translated")?.firestoreString("ar")
+			?: fields.firestoreString("title_en")
+		val number = firstNumber(name)
+			?: firstNumber(episodeId)
+			?: (index + 1).toFloat()
+		return MangaChapter(
+			id = generateUid("$animeId/$episodeId"),
+			title = listOfNotNull(name, translatedTitle)
+				.filter(String::isNotBlank)
+				.distinct()
+				.joinToString(" — ")
+				.ifBlank { "الحلقة ${formatNumber(number)}" },
+			number = number,
+			volume = 0,
+			url = "$EPISODE_PATH${animeId.urlEncoded()}/${episodeId.urlEncoded()}",
+			scanlator = "AnimeWitcher",
+			uploadDate = 0L,
+			branch = null,
+			source = source,
+		)
 	}
 
 	private suspend fun fetchDocument(vararg segments: String): JSONObject {
@@ -252,7 +305,33 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 		for (segment in segments) {
 			builder.addPathSegment(segment)
 		}
+		builder.addQueryParameter("key", FIREBASE_API_KEY)
 		return webClient.httpGet(builder.build()).parseJson()
+	}
+
+	private suspend fun fetchCollection(pageSize: Int, vararg segments: String): List<JSONObject> {
+		val result = ArrayList<JSONObject>()
+		var pageToken: String? = null
+		var page = 0
+		do {
+			val builder = FIRESTORE_DOCUMENTS.toHttpUrl().newBuilder()
+			for (segment in segments) {
+				builder.addPathSegment(segment)
+			}
+			builder.addQueryParameter("key", FIREBASE_API_KEY)
+			builder.addQueryParameter("pageSize", pageSize.toString())
+			pageToken?.let { builder.addQueryParameter("pageToken", it) }
+			val response = webClient.httpGet(builder.build()).parseJson()
+			val documents = response.optJSONArray("documents")
+			if (documents != null) {
+				for (i in 0 until documents.length()) {
+					documents.optJSONObject(i)?.let(result::add)
+				}
+			}
+			pageToken = response.optString("nextPageToken").takeIf(String::isNotBlank)
+			page++
+		} while (pageToken != null && page < MAX_FIRESTORE_PAGES)
+		return result
 	}
 
 	private fun parseContentRating(
@@ -292,10 +371,14 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 
 	internal companion object {
 		private const val PAGE_SIZE = 30
+		private const val EPISODES_PAGE_SIZE = 1000
+		private const val SERVERS_PAGE_SIZE = 100
+		private const val MAX_FIRESTORE_PAGES = 20
 		private const val ANIME_PATH = "/anime/"
 		private const val EPISODE_PATH = "/episode/"
 		private const val ALGOLIA_APP_ID = "D8LH9I7ZL7"
 		private const val ALGOLIA_SEARCH_KEY = "b56c01ef52540ef334bcdbaa00ded9e4"
+		private const val FIREBASE_API_KEY = "AIzaSyAcbWRwfFNnCpoydDXlEALWnM_TYVcJOMU"
 		private const val FIRESTORE_DOCUMENTS =
 			"https://firestore.googleapis.com/v1/projects/animewitcher-1c66d/databases/(default)/documents"
 		private val NUMBER = Regex("""\d+(?:\.\d+)?""")
@@ -323,14 +406,30 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 		)
 
 		internal fun toDirectVideoUrl(link: String, directLink: Boolean): String? {
-			PIXEL_DRAIN.matchEntire(link)?.groupValues?.getOrNull(1)?.let {
+			val normalized = link.trim()
+			if (!normalized.startsWith("https://") && !normalized.startsWith("http://")) {
+				return null
+			}
+			PIXEL_DRAIN.matchEntire(normalized)?.groupValues?.getOrNull(1)?.let {
 				return "https://pixeldrain.com/api/file/$it"
 			}
-			return link.takeIf {
-				(directLink || DIRECT_VIDEO.containsMatchIn(it)) &&
-					(it.startsWith("https://") || it.startsWith("http://"))
+			if (!directLink && isKnownEmbedPage(normalized)) {
+				return null
 			}
+			return normalized.takeIf { directLink || DIRECT_VIDEO.containsMatchIn(it) }
 		}
+
+		private fun isKnownEmbedPage(link: String): Boolean = runCatching {
+			val url = link.toHttpUrl()
+			when {
+				url.host == "streamtape.com" || url.host.endsWith(".streamtape.com") -> true
+				url.host == "krakenfiles.com" || url.host.endsWith(".krakenfiles.com") ->
+					url.encodedPath.startsWith("/view/")
+				url.host == "mediafire.com" || url.host.endsWith(".mediafire.com") ->
+					url.encodedPath.startsWith("/file/")
+				else -> false
+			}
+		}.getOrDefault(true)
 
 		private fun normalizeRating(value: Double): Float =
 			(value / 10.0).coerceIn(0.0, 1.0).toFloat()
