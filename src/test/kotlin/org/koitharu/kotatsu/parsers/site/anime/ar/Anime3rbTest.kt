@@ -23,6 +23,7 @@ internal class Anime3rbTest {
 	fun extractsFreeQualitiesFromPlayer() {
 		val html = """
 			<script>
+			var video_sources = [];
 			var video_sources = [
 			  {"src":"https:\/\/video.vid3rb.com\/video\/720?token=a","label":"720p","res":"720","premium":false},
 			  {"src":"https:\/\/video.vid3rb.com\/video\/1080?token=b","label":"1080p","res":"1080","premium":true},
