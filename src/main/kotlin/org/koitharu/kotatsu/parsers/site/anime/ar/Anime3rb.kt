@@ -178,23 +178,7 @@ internal class Anime3rb(context: MangaLoaderContext) : PagedMangaParser(
 				)
 			}
 		}
-		if (result.isNotEmpty()) return result.distinctBy(AnimeStream::url)
-
-		// The signed direct-download endpoints redirect to the same MP4 files and
-		// remain a useful fallback if the player markup changes.
-		return document.select("a[href*='/download/']").mapNotNull { link ->
-			val url = link.attr("href").trim().takeIf(String::isNotEmpty) ?: return@mapNotNull null
-			val quality = QUALITY.find(link.parent()?.text().orEmpty())?.value ?: "Auto"
-			AnimeStream(
-				name = "Anime3rb • $quality",
-				url = url.toAbsoluteUrl(domain),
-				headers = mapOf(
-					"Referer" to episodeUrl,
-					"User-Agent" to config[userAgentKey],
-				),
-				quality = quality,
-			)
-		}.distinctBy(AnimeStream::url)
+		return result.distinctBy(AnimeStream::url)
 	}
 
 	private fun parseTitleCard(element: Element): Manga? {
@@ -319,7 +303,6 @@ internal class Anime3rb(context: MangaLoaderContext) : PagedMangaParser(
 		const val PAGE_SIZE = 20
 		const val SEARCH_PAGE_SIZE = 12
 		val NUMBER = Regex("""\d+(?:\.\d+)?""")
-		val QUALITY = Regex("""\d{3,4}p""", RegexOption.IGNORE_CASE)
 
 		fun findPlayerUrls(document: Document): List<String> =
 			document.getElementsByAttribute("wire:snapshot").mapNotNull { element ->
@@ -332,8 +315,10 @@ internal class Anime3rb(context: MangaLoaderContext) : PagedMangaParser(
 			}.distinct()
 
 		fun findVideoSources(raw: String): List<ParsedVideoSource> {
-			val array = findAssignedJsonArray(raw, "video_sources")
-				?.let { runCatching { JSONArray(it) }.getOrNull() }
+			val array = findAssignedJsonArrays(raw, "video_sources")
+				.asSequence()
+				.mapNotNull { runCatching { JSONArray(it) }.getOrNull() }
+				.firstOrNull { it.length() > 0 }
 				?: return emptyList()
 			return buildList {
 				for (index in 0 until array.length()) {
@@ -351,37 +336,49 @@ internal class Anime3rb(context: MangaLoaderContext) : PagedMangaParser(
 			}.distinctBy(ParsedVideoSource::url)
 		}
 
-		private fun findAssignedJsonArray(raw: String, variable: String): String? {
-			val variableIndex = raw.indexOf(variable)
-			if (variableIndex < 0) return null
-			val assignmentIndex = raw.indexOf('=', variableIndex + variable.length)
-			if (assignmentIndex < 0) return null
-			val arrayStart = raw.indexOf('[', assignmentIndex + 1)
-			if (arrayStart < 0) return null
+		private fun findAssignedJsonArrays(raw: String, variable: String): List<String> = buildList {
+			var searchFrom = 0
+			while (searchFrom < raw.length) {
+				val variableIndex = raw.indexOf(variable, searchFrom)
+				if (variableIndex < 0) break
+				searchFrom = variableIndex + variable.length
+				if (variableIndex > 0 && raw[variableIndex - 1].isJavaIdentifierPart()) continue
+				if (searchFrom < raw.length && raw[searchFrom].isJavaIdentifierPart()) continue
 
-			var depth = 0
-			var isInString = false
-			var isEscaped = false
-			for (index in arrayStart until raw.length) {
-				val character = raw[index]
-				if (isInString) {
-					when {
-						isEscaped -> isEscaped = false
-						character == '\\' -> isEscaped = true
-						character == '"' -> isInString = false
+				var assignmentIndex = searchFrom
+				while (assignmentIndex < raw.length && raw[assignmentIndex].isWhitespace()) assignmentIndex++
+				if (raw.getOrNull(assignmentIndex) != '=') continue
+				var arrayStart = assignmentIndex + 1
+				while (arrayStart < raw.length && raw[arrayStart].isWhitespace()) arrayStart++
+				if (raw.getOrNull(arrayStart) != '[') continue
+
+				var depth = 0
+				var isInString = false
+				var isEscaped = false
+				for (index in arrayStart until raw.length) {
+					val character = raw[index]
+					if (isInString) {
+						when {
+							isEscaped -> isEscaped = false
+							character == '\\' -> isEscaped = true
+							character == '"' -> isInString = false
+						}
+						continue
 					}
-					continue
-				}
-				when (character) {
-					'"' -> isInString = true
-					'[' -> depth++
-					']' -> {
-						depth--
-						if (depth == 0) return raw.substring(arrayStart, index + 1)
+					when (character) {
+						'"' -> isInString = true
+						'[' -> depth++
+						']' -> {
+							depth--
+							if (depth == 0) {
+								add(raw.substring(arrayStart, index + 1))
+								searchFrom = index + 1
+								break
+							}
+						}
 					}
 				}
 			}
-			return null
 		}
 	}
 }
