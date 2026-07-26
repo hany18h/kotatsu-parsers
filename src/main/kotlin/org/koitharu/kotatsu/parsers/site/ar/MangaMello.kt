@@ -129,13 +129,7 @@ internal abstract class MangaMelloParser(
 		filter: MangaListFilter,
 	): List<Manga> {
 		val query = filter.query?.trim().orEmpty()
-		val sort = if (order == SortOrder.POPULARITY) "views" else "last_update"
-		val path = if (query.isNotEmpty()) {
-			"mangas/search?per_page=40&page=$page&relations=genres,type,ageRate" +
-				"&sort_by=$sort&dir=desc&title=${query.urlEncoded()}"
-		} else {
-			"mangas?page=$page&per_page=40&relations=genres&sort_by=$sort&dir=desc"
-		}
+		val path = buildListPath(page, order, query)
 		val results = findDataArray(apiGet(path))
 		return (0 until results.length()).mapNotNull { index ->
 			results.optJSONObject(index)?.let(::parseManga)
@@ -327,6 +321,18 @@ internal abstract class MangaMelloParser(
 			"path",
 			"link",
 		)
+
+		internal fun buildListPath(page: Int, order: SortOrder, query: String): String {
+			if (query.isNotBlank()) {
+				// The Plus search endpoint validates sort_by against a different
+				// set than /mangas and returns HTTP 422 for last_update/views.
+				// Search relevance is controlled by the endpoint itself.
+				return "mangas/search?per_page=40&page=$page&relations=genres,type,ageRate" +
+					"&title=${query.urlEncoded()}"
+			}
+			val sort = if (order == SortOrder.POPULARITY) "views" else "last_update"
+			return "mangas?page=$page&per_page=40&relations=genres&sort_by=$sort&dir=desc"
+		}
 
 		private fun firstString(json: JSONObject, vararg keys: String): String? {
 			for (key in keys) {
