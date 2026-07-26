@@ -13,7 +13,10 @@ internal class MangaMelloTest {
 			{
 			  "data": {
 			    "chapterImages": [
-			      {"src": "https:\/\/cdn.example.org\/1.webp"},
+			      {
+			        "src": "https:\/\/cdn.example.org\/1.webp",
+			        "original_src": "https:\/\/cdn.example.org\/1-original.webp"
+			      },
 			      {"original_src": "//img.example.org/2.jpg"},
 			      "/storage/3.png"
 			    ]
@@ -28,7 +31,7 @@ internal class MangaMelloTest {
 				"https://img.example.org/2.jpg",
 				"https://api.mangamello.com/storage/3.png",
 			),
-			MangaMello.extractImageUrls(json, "https://api.mangamello.com/v1/"),
+			MangaMelloParser.extractImageUrls(json, "https://api.mangamello.com/v1/"),
 		)
 	}
 
@@ -36,14 +39,14 @@ internal class MangaMelloTest {
 	fun `normalizes escaped and protocol relative image urls`() {
 		assertEquals(
 			"https://cdn.example.org/page.webp?x=1&y=2",
-			MangaMello.normalizeImageUrl(
+			MangaMelloParser.normalizeImageUrl(
 				"https:\\/\\/cdn.example.org\\/page.webp?x=1\\u0026y=2",
 				"https://api.mangamello.com/v1/",
 			),
 		)
 		assertEquals(
 			"https://cdn.example.org/page.jpg",
-			MangaMello.normalizeImageUrl("//cdn.example.org/page.jpg", "https://api.mangamello.com/v1/"),
+			MangaMelloParser.normalizeImageUrl("//cdn.example.org/page.jpg", "https://api.mangamello.com/v1/"),
 		)
 	}
 }
