@@ -33,10 +33,25 @@ import java.util.TimeZone
 
 @MangaSourceParser("MANGAMELLO", "Manga Mello", "ar", ContentType.MANGA)
 internal class MangaMello(context: MangaLoaderContext) :
-	PagedMangaParser(context, MangaParserSource.MANGAMELLO, 40),
+	MangaMelloParser(context, MangaParserSource.MANGAMELLO, isPlus = false)
+
+@MangaSourceParser("MANGAMELLO_PLUS", "MangaMello Plus", "ar", ContentType.MANGA)
+internal class MangaMelloPlus(context: MangaLoaderContext) :
+	MangaMelloParser(context, MangaParserSource.MANGAMELLO_PLUS, isPlus = true)
+
+internal abstract class MangaMelloParser(
+	context: MangaLoaderContext,
+	source: MangaParserSource,
+	private val isPlus: Boolean,
+) :
+	PagedMangaParser(context, source, 40),
 	Interceptor {
 
-	override val configKeyDomain = ConfigKey.Domain("api.mangamello.com")
+	override val configKeyDomain = if (isPlus) {
+		ConfigKey.Domain("plus.mangamello.com")
+	} else {
+		ConfigKey.Domain("api.mangamello.com")
+	}
 
 	override val iconUrl =
 		"https://raw.githubusercontent.com/hany18h/kotatsu-parsers/master/src/main/kotlin/org/koitharu/kotatsu/parsers/icons/MangamelloPlus.webp"
@@ -65,25 +80,38 @@ internal class MangaMello(context: MangaLoaderContext) :
 		get() = Headers.Builder()
 			.add("Accept", "application/json")
 			.add("Content-Type", "application/json")
-			.add("App-Version", APP_VERSION)
-			.add("Time-Zone", TimeZone.getDefault().id)
-			.add("Device-Langs", "ar,en")
-			.add("X-app-installer", "com.android.vending")
-			// Kept for the legacy endpoint used by older MangaMello releases.
-			.add("installer", "com.android.vending")
-			.add("vsesion", APP_VERSION)
-			.add("User-Agent", config[userAgentKey])
+			.apply {
+				if (isPlus) {
+					add("app_version", PLUS_APP_VERSION)
+					add("installer", "com.android.vending")
+					add("lang", "ar")
+					add("device", "android")
+					add("time_zone", TimeZone.getDefault().id)
+					// The Plus API intentionally hides routes from browser user agents.
+					// Match the Flutter/Dart client shipped by the official app.
+					add("User-Agent", PLUS_API_USER_AGENT)
+				} else {
+					add("App-Version", LEGACY_APP_VERSION)
+					add("Time-Zone", TimeZone.getDefault().id)
+					add("Device-Langs", "ar,en")
+					add("X-app-installer", "com.android.vending")
+					add("installer", "com.android.vending")
+					add("vsesion", LEGACY_APP_VERSION)
+					add("User-Agent", config[userAgentKey])
+				}
+			}
 			.build()
 
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
 		val host = request.url.host.lowercase(Locale.US)
-		if (host in API_HOSTS) return chain.proceed(request)
+		if (host in API_HOSTS || request.header("app_version") != null) return chain.proceed(request)
 
 		val referer = when {
 			"lekmanga" in host -> "https://www.lekmanga.com/"
-			"azoramoon" in host -> "https://azoramoon.com/"
-			else -> "${request.url.scheme}://${request.url.host}/"
+			"azorafly" in host || "azoramoon" in host -> "https://azorafly.com/"
+			"olympustaff" in host -> "https://olympustaff.com/"
+			else -> if (isPlus) "https://plus.mangamello.com/" else "https://mangamello.com/"
 		}
 		return chain.proceed(
 			request.newBuilder()
@@ -198,7 +226,7 @@ internal class MangaMello(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val root = apiGet(chapter.url.trimStart('/'))
-		val urls = extractImageUrls(root, "$CURRENT_API_BASE/")
+		val urls = extractImageUrls(root, "${if (isPlus) PLUS_API_BASE else LEGACY_API_BASE}/")
 		return urls.mapIndexed { index, imageUrl ->
 			MangaPage(
 				id = generateUid("${chapter.id}-$index"),
@@ -211,7 +239,14 @@ internal class MangaMello(context: MangaLoaderContext) :
 
 	private suspend fun apiGet(path: String): JSONObject {
 		var lastError: Exception? = null
-		for (baseUrl in API_BASES) {
+		val configuredDomain = domain.trimEnd('/')
+		val configuredApiBase = if (isPlus) {
+			"https://$configuredDomain/api/v1"
+		} else {
+			"https://$configuredDomain/v1"
+		}
+		val officialApiBase = if (isPlus) PLUS_API_BASE else LEGACY_API_BASE
+		for (baseUrl in listOf(configuredApiBase, officialApiBase).distinct()) {
 			try {
 				return webClient.httpGet(
 					"${baseUrl.trimEnd('/')}/${path.trimStart('/')}",
@@ -266,16 +301,15 @@ internal class MangaMello(context: MangaLoaderContext) :
 
 	internal companion object {
 
-		private const val APP_VERSION = "2.0.9"
-		private const val CURRENT_API_BASE = "https://api.mangamello.com/v1"
-		private val API_BASES = listOf(
-			CURRENT_API_BASE,
-			"https://plus.mangamello.com/api/v1",
-		)
+		private const val LEGACY_APP_VERSION = "2.0.9"
+		private const val PLUS_APP_VERSION = "1.1.7"
+		private const val PLUS_API_BASE = "https://plus.mangamello.com/api/v1"
+		private const val LEGACY_API_BASE = "https://api.mangamello.com/v1"
 		private val API_HOSTS = setOf("api.mangamello.com", "plus.mangamello.com")
 		private const val IMAGE_USER_AGENT =
 			"Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
 				"(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+		private const val PLUS_API_USER_AGENT = "Dart/3.8 (dart:io)"
 		private val AUTHOR_KEYS = arrayOf("authors", "author", "translator", "editor")
 		private val IMAGE_CONTAINER_KEYS = arrayOf(
 			"chapterImages",
@@ -346,7 +380,13 @@ internal class MangaMello(context: MangaLoaderContext) :
 				is JSONObject -> {
 					for (key in IMAGE_VALUE_KEYS) {
 						val candidate = value.opt(key)
-						if (candidate is String) normalizeImageUrl(candidate, baseUrl)?.let(result::add)
+						if (candidate is String) {
+							val normalized = normalizeImageUrl(candidate, baseUrl)
+							if (normalized != null) {
+								result.add(normalized)
+								break
+							}
+						}
 					}
 					for (key in IMAGE_CONTAINER_KEYS) {
 						value.opt(key)?.let { collectImages(it, baseUrl, result, true) }
