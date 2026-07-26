@@ -1,267 +1,380 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import okhttp3.Headers
 import okhttp3.Interceptor
 import okhttp3.Response
+import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
-import org.koitharu.kotatsu.parsers.model.*
-import org.koitharu.kotatsu.parsers.util.*
+import org.koitharu.kotatsu.parsers.model.ContentRating
+import org.koitharu.kotatsu.parsers.model.ContentType
+import org.koitharu.kotatsu.parsers.model.Manga
+import org.koitharu.kotatsu.parsers.model.MangaChapter
+import org.koitharu.kotatsu.parsers.model.MangaListFilter
+import org.koitharu.kotatsu.parsers.model.MangaListFilterCapabilities
+import org.koitharu.kotatsu.parsers.model.MangaListFilterOptions
+import org.koitharu.kotatsu.parsers.model.MangaPage
+import org.koitharu.kotatsu.parsers.model.MangaParserSource
+import org.koitharu.kotatsu.parsers.model.MangaState
+import org.koitharu.kotatsu.parsers.model.MangaTag
+import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
+import org.koitharu.kotatsu.parsers.model.SortOrder
+import org.koitharu.kotatsu.parsers.util.generateUid
+import org.koitharu.kotatsu.parsers.util.nullIfEmpty
+import org.koitharu.kotatsu.parsers.util.parseJson
+import org.koitharu.kotatsu.parsers.util.urlEncoded
+import java.net.URI
 import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Locale
+import java.util.TimeZone
 
 @MangaSourceParser("MANGAMELLO", "Manga Mello", "ar", ContentType.MANGA)
 internal class MangaMello(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.MANGAMELLO, 20), Interceptor {
+	PagedMangaParser(context, MangaParserSource.MANGAMELLO, 40),
+	Interceptor {
 
-    override val configKeyDomain = ConfigKey.Domain("plus.mangamello.com")
+	override val configKeyDomain = ConfigKey.Domain("api.mangamello.com")
 
-    override val iconUrl =
-        "https://raw.githubusercontent.com/hany18h/kotatsu-parsers/master/src/main/kotlin/org/koitharu/kotatsu/parsers/icons/MangamelloPlus.webp"
+	override val iconUrl =
+		"https://raw.githubusercontent.com/hany18h/kotatsu-parsers/master/src/main/kotlin/org/koitharu/kotatsu/parsers/icons/MangamelloPlus.webp"
 
-    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
-        super.onCreateConfig(keys)
-        keys.add(userAgentKey)
-    }
+	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+		super.onCreateConfig(keys)
+		keys.add(userAgentKey)
+	}
 
-    override val filterCapabilities: MangaListFilterCapabilities
-        get() = MangaListFilterCapabilities(
-            isSearchSupported = true,
-            isSearchWithFiltersSupported = false,
-            isMultipleTagsSupported = false,
-            isTagsExclusionSupported = false,
-        )
+	override val filterCapabilities: MangaListFilterCapabilities
+		get() = MangaListFilterCapabilities(
+			isSearchSupported = true,
+			isSearchWithFiltersSupported = false,
+			isMultipleTagsSupported = false,
+			isTagsExclusionSupported = false,
+		)
 
-    override val availableSortOrders: Set<SortOrder> = LinkedHashSet(
-        listOf(
-            SortOrder.UPDATED,
-            SortOrder.POPULARITY,
-        )
-    )
+	override val availableSortOrders: Set<SortOrder> = linkedSetOf(
+		SortOrder.UPDATED,
+		SortOrder.POPULARITY,
+	)
 
-    override suspend fun getFilterOptions() = MangaListFilterOptions()
+	override suspend fun getFilterOptions() = MangaListFilterOptions()
 
-    private fun getApiHeaders(): Headers {
-        return Headers.Builder()
-            .add("accept", "application/json")
-            .add("authorization", "Bearer null")
-            .add("content-type", "application/json")
-            .add("installer", "com.google.android.packageinstaller")
-            .add("user-agent", "Dart/3.3 (dart:io)")
-            .add("vsesion", "1.1.7")
-            .add("zone", TimeZone.getDefault().id)
-            .build()
-    }
+	private val apiHeaders: Headers
+		get() = Headers.Builder()
+			.add("Accept", "application/json")
+			.add("Content-Type", "application/json")
+			.add("App-Version", APP_VERSION)
+			.add("Time-Zone", TimeZone.getDefault().id)
+			.add("Device-Langs", "ar,en")
+			.add("X-app-installer", "com.android.vending")
+			// Kept for the legacy endpoint used by older MangaMello releases.
+			.add("installer", "com.android.vending")
+			.add("vsesion", APP_VERSION)
+			.add("User-Agent", config[userAgentKey])
+			.build()
 
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        val url = request.url.toString()
+	override fun intercept(chain: Interceptor.Chain): Response {
+		val request = chain.request()
+		val host = request.url.host.lowercase(Locale.US)
+		if (host in API_HOSTS) return chain.proceed(request)
 
-        if (url.contains("azoramoon.com") ||
-            url.contains("/wp-content/uploads/") ||
-            url.endsWith(".jpeg") ||
-            url.endsWith(".jpg") ||
-            url.endsWith(".png") ||
-            url.endsWith(".webp")
-        ) {
-            val newRequest = request.newBuilder()
-                .header("Referer", "https://plus.mangamello.com/")
-                .header("User-Agent", "Dart/3.3 (dart:io)")
-                .header("Accept", "image/webp,image/apng,image/*,*/*;q=0.8")
-                .build()
-            return chain.proceed(newRequest)
-        }
+		val referer = when {
+			"lekmanga" in host -> "https://www.lekmanga.com/"
+			"azoramoon" in host -> "https://azoramoon.com/"
+			else -> "${request.url.scheme}://${request.url.host}/"
+		}
+		return chain.proceed(
+			request.newBuilder()
+				.header("Referer", referer)
+				.header("Origin", referer.trimEnd('/'))
+				.header("User-Agent", IMAGE_USER_AGENT)
+				.header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+				.build(),
+		)
+	}
 
-        return chain.proceed(request)
-    }
+	override suspend fun getListPage(
+		page: Int,
+		order: SortOrder,
+		filter: MangaListFilter,
+	): List<Manga> {
+		val query = filter.query?.trim().orEmpty()
+		val sort = if (order == SortOrder.POPULARITY) "views" else "last_update"
+		val path = if (query.isNotEmpty()) {
+			"mangas/search?per_page=40&page=$page&relations=genres,type,ageRate" +
+				"&sort_by=$sort&dir=desc&title=${query.urlEncoded()}"
+		} else {
+			"mangas?page=$page&per_page=40&relations=genres&sort_by=$sort&dir=desc"
+		}
+		val results = findDataArray(apiGet(path))
+		return (0 until results.length()).mapNotNull { index ->
+			results.optJSONObject(index)?.let(::parseManga)
+		}
+	}
 
-    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        val headers = getApiHeaders()
+	private fun parseManga(json: JSONObject): Manga {
+		val id = json.optString("id").ifBlank { json.optInt("id").toString() }
+		val title = firstString(json, "title", "name").orEmpty()
+		val cover = firstString(json, "img", "image", "cover", "poster")
+		val rawRating = firstString(json, "ten_rate", "average_rate", "rate")
+			?.toFloatOrNull()
+			?: 0f
+		val rating = when {
+			rawRating <= 0f -> RATING_UNKNOWN
+			rawRating > 1f -> rawRating / 10f
+			else -> rawRating
+		}
+		return Manga(
+			id = generateUid(id),
+			url = "/mangas/$id",
+			publicUrl = "https://mangamello.com/mangas/$id",
+			coverUrl = cover,
+			title = title,
+			altTitles = emptySet(),
+			rating = rating,
+			tags = parseTags(json.optJSONArray("genres")),
+			authors = parseAuthors(json),
+			state = parseState(json),
+			source = source,
+			contentRating = ContentRating.SAFE,
+		)
+	}
 
-        if (!filter.query.isNullOrEmpty()) {
-            val searchUrl =
-                "https://plus.mangamello.com/api/v1/mangas/search?per_page=40&title=${filter.query.urlEncoded()}"
-            val response = webClient.httpGet(searchUrl, headers).parseJson()
-            val results = response.getJSONArray("data")
-            return (0 until results.length()).map { i ->
-                parseMangaFromSearchJson(results.getJSONObject(i))
-            }
-        }
+	override suspend fun getDetails(manga: Manga): Manga {
+		val mangaId = manga.url.substringAfterLast('/')
+		val root = apiGet("mangas/$mangaId?relations=genres,chapters")
+		val data = findDataObject(root)
+		val parsed = parseManga(data)
+		val embeddedChapters = findChapterArray(data)
+		val chapters = if (embeddedChapters != null) {
+			parseChapters(embeddedChapters, mangaId)
+		} else {
+			val chaptersRoot = apiGet("mangas/$mangaId/chapters?per_page=2000")
+			parseChapters(findDataArray(chaptersRoot), mangaId)
+		}
+		return manga.copy(
+			title = parsed.title.ifBlank { manga.title },
+			coverUrl = parsed.coverUrl ?: manga.coverUrl,
+			description = firstString(data, "summary", "description")?.nullIfEmpty(),
+			altTitles = parsed.altTitles,
+			rating = if (parsed.rating == RATING_UNKNOWN) manga.rating else parsed.rating,
+			tags = parsed.tags.ifEmpty { manga.tags },
+			authors = parsed.authors.ifEmpty { manga.authors },
+			state = parsed.state ?: manga.state,
+			chapters = chapters,
+		)
+	}
 
-        val sortParam = when (order) {
-            SortOrder.POPULARITY -> "views"
-            else -> "updated_at"
-        }
+	private fun parseChapters(array: JSONArray, fallbackMangaId: String): List<MangaChapter> {
+		val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
+			timeZone = TimeZone.getTimeZone("UTC")
+		}
+		return (0 until array.length()).mapNotNull { index ->
+			val item = array.optJSONObject(index) ?: return@mapNotNull null
+			val chapterId = item.optString("id").ifBlank { item.optInt("id").toString() }
+			if (chapterId == "0" || chapterId.isBlank()) return@mapNotNull null
+			val mangaId = item.optString("manga_id").ifBlank { fallbackMangaId }
+			val number = firstString(item, "order", "chapter", "number")
+				?.toFloatOrNull()
+				?: (index + 1f)
+			val title = firstString(item, "title", "name").orEmpty()
+			val createdAt = firstString(item, "created_at", "createdAt")
+			val uploadDate = runCatching { dateFormat.parse(createdAt.orEmpty())?.time ?: 0L }.getOrDefault(0L)
+			MangaChapter(
+				id = generateUid(chapterId),
+				title = title,
+				number = number,
+				volume = 0,
+				url = "/mangas/$mangaId/chapters/$chapterId?relations=chapterImages",
+				uploadDate = uploadDate,
+				source = source,
+				scanlator = null,
+				branch = null,
+			)
+		}.sortedBy { it.number }
+	}
 
-        val url = "https://plus.mangamello.com/api/v1/mangas?sort_by=$sortParam&page=$page"
-        val response = webClient.httpGet(url, headers).parseJson()
-        val results = response.getJSONArray("data")
+	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+		val root = apiGet(chapter.url.trimStart('/'))
+		val urls = extractImageUrls(root, "$CURRENT_API_BASE/")
+		return urls.mapIndexed { index, imageUrl ->
+			MangaPage(
+				id = generateUid("${chapter.id}-$index"),
+				url = imageUrl,
+				preview = null,
+				source = source,
+			)
+		}
+	}
 
-        return (0 until results.length()).map { i ->
-            parseMangaFromJson(results.getJSONObject(i))
-        }
-    }
+	private suspend fun apiGet(path: String): JSONObject {
+		var lastError: Exception? = null
+		for (baseUrl in API_BASES) {
+			try {
+				return webClient.httpGet(
+					"${baseUrl.trimEnd('/')}/${path.trimStart('/')}",
+					apiHeaders,
+				).parseJson()
+			} catch (error: Exception) {
+				lastError = error
+			}
+		}
+		throw lastError ?: IllegalStateException("MangaMello API is unavailable")
+	}
 
-    private fun parseMangaFromJson(json: JSONObject): Manga {
-        val id = json.getInt("id")
-        val title = json.optString("title", "")
-        val imageUrl = json.optString("img", "")
-        val rate = json.optString("rate", "0").toFloatOrNull() ?: 0f
-        val normalizedRating = if (rate > 0) rate / 10f else RATING_UNKNOWN
+	private fun parseTags(array: JSONArray?): Set<MangaTag> {
+		if (array == null) return emptySet()
+		return (0 until array.length()).mapNotNullTo(LinkedHashSet()) { index ->
+			val item = array.optJSONObject(index) ?: return@mapNotNullTo null
+			val title = firstString(item, "name", "title") ?: return@mapNotNullTo null
+			MangaTag(
+				key = item.optString("id").ifBlank { title },
+				title = title,
+				source = source,
+			)
+		}
+	}
 
-        return Manga(
-            id = generateUid(id.toString()),
-            url = "/api/v1/mangas/$id",
-            publicUrl = "https://plus.mangamello.com/manga/$id",
-            coverUrl = imageUrl,
-            title = title,
-            altTitles = emptySet(),
-            rating = normalizedRating,
-            tags = emptySet(),
-            authors = emptySet(),
-            state = null,
-            source = source,
-            contentRating = ContentRating.SAFE,
-        )
-    }
+	private fun parseAuthors(json: JSONObject): Set<String> {
+		val result = LinkedHashSet<String>()
+		for (key in AUTHOR_KEYS) {
+			when (val value = json.opt(key)) {
+				is String -> value.nullIfEmpty()?.let(result::add)
+				is JSONObject -> firstString(value, "name", "title")?.let(result::add)
+				is JSONArray -> for (index in 0 until value.length()) {
+					when (val item = value.opt(index)) {
+						is String -> item.nullIfEmpty()?.let(result::add)
+						is JSONObject -> firstString(item, "name", "title")?.let(result::add)
+					}
+				}
+			}
+		}
+		return result
+	}
 
-    private fun parseMangaFromSearchJson(json: JSONObject): Manga {
-        val id = json.getInt("id")
-        val title = json.optString("title", "")
-        val imageUrl = json.optString("img", "")
-        val averageRate = json.optString("average_rate", "0").toFloatOrNull() ?: 0f
-        val normalizedRating = if (averageRate > 0) averageRate / 10f else RATING_UNKNOWN
+	private fun parseState(json: JSONObject): MangaState? {
+		if (json.optInt("is_completed", -1) == 1) return MangaState.FINISHED
+		return when (firstString(json, "status", "state")?.lowercase(Locale.US)) {
+			"completed", "complete", "finished", "مكتملة", "مكتمل" -> MangaState.FINISHED
+			"ongoing", "publishing", "مستمرة", "مستمر" -> MangaState.ONGOING
+			"hiatus", "متوقفة", "متوقف" -> MangaState.PAUSED
+			else -> null
+		}
+	}
 
-        val tags = mutableSetOf<MangaTag>()
-        val genresArray = json.optJSONArray("genres")
-        if (genresArray != null) {
-            for (i in 0 until genresArray.length()) {
-                val genre = genresArray.getJSONObject(i)
-                tags.add(
-                    MangaTag(
-                        key = genre.optInt("id", 0).toString(),
-                        title = genre.optString("name", ""),
-                        source = source
-                    )
-                )
-            }
-        }
+	internal companion object {
 
-        return Manga(
-            id = generateUid(id.toString()),
-            url = "/api/v1/mangas/$id",
-            publicUrl = "https://plus.mangamello.com/manga/$id",
-            coverUrl = imageUrl,
-            title = title,
-            altTitles = emptySet(),
-            rating = normalizedRating,
-            tags = tags,
-            authors = emptySet(),
-            state = null,
-            source = source,
-            contentRating = ContentRating.SAFE,
-        )
-    }
+		private const val APP_VERSION = "2.0.9"
+		private const val CURRENT_API_BASE = "https://api.mangamello.com/v1"
+		private val API_BASES = listOf(
+			CURRENT_API_BASE,
+			"https://plus.mangamello.com/api/v1",
+		)
+		private val API_HOSTS = setOf("api.mangamello.com", "plus.mangamello.com")
+		private const val IMAGE_USER_AGENT =
+			"Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
+				"(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+		private val AUTHOR_KEYS = arrayOf("authors", "author", "translator", "editor")
+		private val IMAGE_CONTAINER_KEYS = arrayOf(
+			"chapterImages",
+			"chapter_images",
+			"images",
+			"pages",
+			"data",
+		)
+		private val IMAGE_VALUE_KEYS = arrayOf(
+			"src",
+			"originalSrc",
+			"original_src",
+			"url",
+			"image",
+			"path",
+			"link",
+		)
 
-    override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
-        val mangaId = manga.url.substringAfterLast("/")
-        val headers = getApiHeaders()
-        val chaptersDeferred = async { getChapters(mangaId) }
+		private fun firstString(json: JSONObject, vararg keys: String): String? {
+			for (key in keys) {
+				val value = json.opt(key)
+				?.takeUnless { it == JSONObject.NULL }
+				?.toString()
+				?.trim()
+				?.nullIfEmpty()
+			if (value != null && value != "null") return value
+			}
+			return null
+		}
 
-        val detailUrl = "https://plus.mangamello.com${manga.url}"
-        val response = webClient.httpGet(detailUrl, headers).parseJson()
-        val data = response.getJSONObject("data")
+		private fun findDataObject(root: JSONObject): JSONObject =
+			root.optJSONObject("data") ?: root
 
-        val title = data.optString("title", manga.title)
-        val summary = data.optString("summary", "").nullIfEmpty()
-        val imageUrl = data.optString("img", manga.coverUrl)
+		private fun findDataArray(root: JSONObject): JSONArray {
+			root.optJSONArray("data")?.let { return it }
+			val dataObject = root.optJSONObject("data")
+			dataObject?.optJSONArray("data")?.let { return it }
+			dataObject?.optJSONArray("results")?.let { return it }
+			root.optJSONArray("results")?.let { return it }
+			return JSONArray()
+		}
 
-        val isCompleted = data.optInt("is_completed", 0)
-        val state = when (isCompleted) {
-            1 -> MangaState.FINISHED
-            else -> MangaState.ONGOING
-        }
+		private fun findChapterArray(data: JSONObject): JSONArray? {
+			data.optJSONArray("chapters")?.let { return it }
+			data.optJSONObject("chapters")?.let { nested ->
+				nested.optJSONArray("data")?.let { return it }
+			}
+			return null
+		}
 
-        val tenRate = data.optString("ten_rate", "0").toFloatOrNull() ?: 0f
-        val rating = if (tenRate > 0) tenRate / 10f else manga.rating
+		internal fun extractImageUrls(root: JSONObject, baseUrl: String): List<String> {
+			val result = LinkedHashSet<String>()
+			collectImages(root, baseUrl, result, false)
+			return result.toList()
+		}
 
-        manga.copy(
-            title = title,
-            description = summary,
-            coverUrl = imageUrl,
-            state = state,
-            rating = rating,
-            chapters = chaptersDeferred.await(),
-        )
-    }
+		private fun collectImages(
+			value: Any?,
+			baseUrl: String,
+			result: MutableSet<String>,
+			acceptStrings: Boolean,
+		) {
+			when (value) {
+				is JSONArray -> for (index in 0 until value.length()) {
+					collectImages(value.opt(index), baseUrl, result, acceptStrings)
+				}
 
-    private suspend fun getChapters(mangaId: String): List<MangaChapter> {
-        val headers = getApiHeaders()
-        val chaptersUrl = "https://plus.mangamello.com/api/v1/mangas/$mangaId/chapters?per_page=2000"
-        val response = webClient.httpGet(chaptersUrl, headers).parseJson()
-        val chaptersArray = response.getJSONArray("data")
+				is JSONObject -> {
+					for (key in IMAGE_VALUE_KEYS) {
+						val candidate = value.opt(key)
+						if (candidate is String) normalizeImageUrl(candidate, baseUrl)?.let(result::add)
+					}
+					for (key in IMAGE_CONTAINER_KEYS) {
+						value.opt(key)?.let { collectImages(it, baseUrl, result, true) }
+					}
+				}
 
-        val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
-        dateFormat.timeZone = TimeZone.getTimeZone("UTC")
+				is String -> if (acceptStrings) {
+					normalizeImageUrl(value, baseUrl)?.let(result::add)
+				}
+			}
+		}
 
-        val chapters = mutableListOf<MangaChapter>()
-
-        for (i in 0 until chaptersArray.length()) {
-            val item = chaptersArray.getJSONObject(i)
-            val chapterId = item.getInt("id")
-            val chapterMangaId = item.getInt("manga_id")
-            val order = item.optString("order", "").toFloatOrNull() ?: (i + 1f)
-            val title = item.optString("title", "")
-            val createdAt = item.optString("created_at", "")
-
-            val uploadDate = try {
-                dateFormat.parse(createdAt)?.time ?: 0L
-            } catch (e: Exception) {
-                0L
-            }
-
-            chapters.add(
-                MangaChapter(
-                    id = generateUid(chapterId.toString()),
-                    title = title,
-                    number = order,
-                    volume = 0,
-                    url = "/api/v1/mangas/$chapterMangaId/chapters/$chapterId?relations=chapterImages",
-                    uploadDate = uploadDate,
-                    source = source,
-                    scanlator = null,
-                    branch = null
-                )
-            )
-        }
-
-        return chapters.sortedBy { it.number }
-    }
-
-    override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val headers = getApiHeaders()
-        val fullUrl = "https://plus.mangamello.com${chapter.url}"
-        val response = webClient.httpGet(fullUrl, headers).parseJson()
-        val data = response.getJSONObject("data")
-        val imagesArray = data.getJSONArray("chapterImages")
-
-        return (0 until imagesArray.length()).mapNotNull { i ->
-            val imageObj = imagesArray.getJSONObject(i)
-            val imageUrl = imageObj.optString("src", "").nullIfEmpty()
-                ?: imageObj.optString("originalSrc", "").nullIfEmpty()
-                ?: return@mapNotNull null
-
-            MangaPage(
-                id = generateUid("${chapter.id}-$i"),
-                url = imageUrl,
-                preview = null,
-                source = source
-            )
-        }
-    }
+		internal fun normalizeImageUrl(value: String, baseUrl: String): String? {
+			val cleaned = value
+				.trim()
+				.trim('"', '\'')
+				.replace("\\/", "/")
+				.replace("\\u0026", "&")
+				.nullIfEmpty()
+				?: return null
+			if (cleaned.startsWith("data:", ignoreCase = true)) return null
+			return runCatching {
+				when {
+					cleaned.startsWith("//") -> "https:$cleaned"
+					cleaned.startsWith("http://", true) || cleaned.startsWith("https://", true) -> cleaned
+					else -> URI(baseUrl).resolve(cleaned).toString()
+				}
+			}.getOrNull()
+		}
+	}
 }
