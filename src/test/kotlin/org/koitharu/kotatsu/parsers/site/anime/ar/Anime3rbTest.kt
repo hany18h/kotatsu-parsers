@@ -1,10 +1,23 @@
 package org.koitharu.kotatsu.parsers.site.anime.ar
 
+import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
+import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.jsoup.Jsoup
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 internal class Anime3rbTest {
+
+	@Test
+	fun enablesCloudflareResolutionByDefault() {
+		val keys = mutableListOf<ConfigKey<*>>()
+		Anime3rb(MangaLoaderContextMock).onCreateConfig(keys)
+
+		assertTrue(
+			keys.filterIsInstance<ConfigKey.InterceptCloudflare>().single().defaultValue,
+		)
+	}
 
 	@Test
 	fun extractsPlayerUrlFromLivewireSnapshot() {
