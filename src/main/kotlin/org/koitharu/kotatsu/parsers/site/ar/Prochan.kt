@@ -2,6 +2,8 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONArray
@@ -37,6 +39,11 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			isSearchSupported = true,
 		)
 
+	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+		super.onCreateConfig(keys)
+		keys.add(userAgentKey)
+	}
+
 	private val dateFormat by lazy {
 		SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 	}
@@ -47,6 +54,10 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		"cdn2.procomic.pro",
 		"cdn3.procomic.pro",
 		"cdn4.procomic.pro",
+		"img1.procomic.pro",
+		"img2.procomic.pro",
+		"img3.procomic.pro",
+		"img4.procomic.pro",
 		"cdn2.prochan.net",
 		"cdn3.prochan.net",
 	)
@@ -71,8 +82,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			.header("Accept-Language", "en-US,en;q=0.9,ar;q=0.8")
 			.header(
 				"User-Agent",
-				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-					"(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+				config[userAgentKey],
 			)
 
 		if (isImageCdnRequest) {
@@ -307,11 +317,20 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val pages = mutableListOf<MangaPage>()
 		var pageIndex = 0
 
-		val allText = doc.select("script")
-			.joinToString("") { it.data() }
-			.replace("\\\"", "\"")
-			.replace("\\/", "/")
-			.replace("\\\\", "\\")
+		val allText = decodeProChanNextPayload(
+			doc.select("script").joinToString("") { it.data() },
+		)
+		val cdnPath = Regex(""""(?:cdnPath|cdn_path)":"([^"]+)"""")
+			.find(allText)
+			?.groupValues
+			?.getOrNull(1)
+			?.takeIf(String::isNotBlank)
+			?: when (parts.getOrNull(1)?.lowercase(Locale.ROOT)) {
+				"manga" -> "cdn1"
+				"manhua" -> "cdn2"
+				"manhwa" -> "cdn3"
+				else -> "cdn2"
+			}
 
 		val appImagesPattern = Regex(
 			""""appImages":\[(.*?)\]""",
@@ -357,10 +376,15 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			deferredData?.optJSONArray("images")?.let { images ->
 				for (i in 0 until images.length()) {
 					val imgUrl = images.optString(i).takeIf { it.isNotEmpty() } ?: continue
+					val playableUrl = if (isProtectedProComicImage(imgUrl)) {
+						signCdnImage(imgUrl, chapterUrl) ?: continue
+					} else {
+						imgUrl
+					}
 					pages.add(
 						MangaPage(
 							id = generateUid("${chapter.id}-def-$pageIndex"),
-							url = imgUrl,
+							url = playableUrl,
 							preview = null,
 							source = source,
 						),
@@ -371,7 +395,18 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 
 			deferredData?.optJSONArray("maps")?.let { maps ->
 				for (i in 0 until maps.length()) {
-					val map = maps.optJSONObject(i) ?: continue
+					val descriptor = maps.optJSONObject(i) ?: continue
+					val map = if (descriptor.optJSONArray("pieces") != null) {
+						descriptor
+					} else {
+						resolveProtectedMap(
+							chapterId = chapterId,
+							descriptor = descriptor,
+							cdnPath = cdnPath,
+							pageIndex = i,
+							referer = chapterUrl,
+						) ?: continue
+					}
 					val mapUrl = buildProChanStitchUrl(map, domain) ?: continue
 
 					pages.add(
@@ -407,8 +442,82 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		return pages
 	}
 
+	private suspend fun signCdnImage(rawUrl: String, referer: String): String? {
+		val result = runCatching {
+			webClient.httpPost(
+				"https://$domain/api/cdn-image/sign".toHttpUrl(),
+				JSONObject().put("url", rawUrl),
+				jsonHeaders(referer),
+			).parseJson()
+		}.getOrNull() ?: return null
+		val token = result.optString("token").takeIf(String::isNotBlank) ?: return null
+		val expires = result.optLong("expires").takeIf { it > 0L } ?: return null
+		return buildProChanSignedImageUrl(domain, rawUrl, token, expires)
+	}
+
+	private suspend fun resolveProtectedMap(
+		chapterId: String,
+		descriptor: JSONObject,
+		cdnPath: String,
+		pageIndex: Int,
+		referer: String,
+	): JSONObject? {
+		val token = descriptor.optString("token").takeIf(String::isNotBlank) ?: return null
+		val method = descriptor.optString("method", "browser_session")
+			.takeIf(String::isNotBlank)
+			?: "browser_session"
+		val payload = JSONObject()
+			.put("token", token)
+			.put("method", method)
+			.put("cdnPath", cdnPath)
+			.put("pageIndex", pageIndex)
+		val response = runCatching {
+			webClient.httpPost(
+				"https://$domain/chapter-map-proxy-plan/$chapterId".toHttpUrl(),
+				payload,
+				jsonHeaders(referer),
+			).parseJson()
+		}.getOrNull() ?: return null
+		return response.optJSONObject("data")?.optJSONObject("map")
+			?: response.optJSONObject("map")
+	}
+
+	private fun jsonHeaders(referer: String): Headers = Headers.Builder()
+		.add("Accept", "application/json, text/plain, */*")
+		.add("Content-Type", "application/json")
+		.add("Origin", "https://$domain")
+		.add("Referer", referer)
+		.add("User-Agent", config[userAgentKey])
+		.build()
+
 	override suspend fun getPageUrl(page: MangaPage): String = page.url
 }
+
+private fun isProtectedProComicImage(url: String): Boolean =
+	(url.contains(".procomic.pro/", ignoreCase = true) ||
+		url.contains(".prochan.net/", ignoreCase = true)) &&
+		(url.contains("/cdn", ignoreCase = true) || url.contains("cdn", ignoreCase = true))
+
+internal fun decodeProChanNextPayload(raw: String): String {
+	var result = raw
+	repeat(3) {
+		val decoded = result
+			.replace("\\\\", "\\")
+			.replace("\\\"", "\"")
+			.replace("\\/", "/")
+		if (decoded == result) return result
+		result = decoded
+	}
+	return result
+}
+
+internal fun buildProChanSignedImageUrl(
+	domain: String,
+	rawUrl: String,
+	token: String,
+	expires: Long,
+): String = "https://$domain/api/cdn-image?url=${rawUrl.urlEncoded()}" +
+	"&token=${token.urlEncoded()}&expires=$expires"
 
 internal fun buildProChanStitchUrl(map: JSONObject, domain: String): String? {
 	val pieces = map.optJSONArray("pieces") ?: return null
@@ -432,6 +541,13 @@ internal fun buildProChanStitchUrl(map: JSONObject, domain: String): String? {
 	val mode = map.optString("mode", "vertical").ifBlank { "vertical" }
 	val encodedPieces = Base64.getUrlEncoder().withoutPadding()
 		.encodeToString(orderedPieces.joinToString("|").toByteArray(Charsets.UTF_8))
+	val encodedRects = map.optJSONArray("rects")
+		?.takeIf { it.length() == orderedPieces.size }
+		?.toString()
+		?.toByteArray(Charsets.UTF_8)
+		?.let { Base64.getUrlEncoder().withoutPadding().encodeToString(it) }
+		?.let { "&rects=$it" }
+		.orEmpty()
 	return "prochan-map://stitch?w=$width&h=$height" +
-		"&mode=${mode.urlEncoded()}&pieces=$encodedPieces"
+		"&mode=${mode.urlEncoded()}&pieces=$encodedPieces$encodedRects"
 }
