@@ -2,7 +2,10 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import org.json.JSONObject
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.koitharu.kotatsu.parsers.model.SortOrder
 
 internal class MangaMelloTest {
 
@@ -48,5 +51,19 @@ internal class MangaMelloTest {
 			"https://cdn.example.org/page.jpg",
 			MangaMelloParser.normalizeImageUrl("//cdn.example.org/page.jpg", "https://api.mangamello.com/v1/"),
 		)
+	}
+
+	@Test
+	fun `search path omits sort parameters rejected by plus api`() {
+		val path = MangaMelloParser.buildListPath(
+			page = 1,
+			order = SortOrder.UPDATED,
+			query = "the",
+		)
+
+		assertTrue(path.startsWith("mangas/search?"))
+		assertTrue(path.contains("title=the"))
+		assertFalse(path.contains("sort_by"))
+		assertFalse(path.contains("dir="))
 	}
 }
