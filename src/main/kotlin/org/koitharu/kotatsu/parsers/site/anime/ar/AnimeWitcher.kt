@@ -1,5 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.anime.ar
 
+import kotlinx.coroutines.CancellationException
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -81,17 +82,31 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 			.add("X-Algolia-Application-Id", ALGOLIA_APP_ID)
 			.add("X-Algolia-API-Key", ALGOLIA_SEARCH_KEY)
 			.build()
-		val response = webClient.httpPost(
-			"https://$ALGOLIA_APP_ID-dsn.algolia.net/1/indexes/$index/query".toHttpUrl(),
-			body,
-			headers,
-		).parseJson()
+		val response = queryAlgolia(index, body, headers)
 		val hits = response.optJSONArray("hits") ?: return emptyList()
 		return buildList {
 			for (i in 0 until hits.length()) {
 				hits.optJSONObject(i)?.let(::parseCatalogItem)?.let(::add)
 			}
 		}.distinctBy(Manga::id)
+	}
+
+	private suspend fun queryAlgolia(index: String, body: JSONObject, headers: Headers): JSONObject {
+		var lastError: Exception? = null
+		for (host in ALGOLIA_READ_HOSTS) {
+			try {
+				return webClient.httpPost(
+					"https://$host/1/indexes/$index/query".toHttpUrl(),
+					body,
+					headers,
+				).parseJson()
+			} catch (error: CancellationException) {
+				throw error
+			} catch (error: Exception) {
+				lastError = error
+			}
+		}
+		throw lastError ?: IllegalStateException("AnimeWitcher catalog is unavailable")
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
@@ -378,6 +393,12 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 		private const val EPISODE_PATH = "/episode/"
 		private const val ALGOLIA_APP_ID = "D8LH9I7ZL7"
 		private const val ALGOLIA_SEARCH_KEY = "b56c01ef52540ef334bcdbaa00ded9e4"
+		internal val ALGOLIA_READ_HOSTS = listOf(
+			"$ALGOLIA_APP_ID-dsn.algolia.net",
+			"$ALGOLIA_APP_ID-1.algolianet.com",
+			"$ALGOLIA_APP_ID-2.algolianet.com",
+			"$ALGOLIA_APP_ID-3.algolianet.com",
+		)
 		private const val FIREBASE_API_KEY = "AIzaSyAcbWRwfFNnCpoydDXlEALWnM_TYVcJOMU"
 		private const val FIRESTORE_DOCUMENTS =
 			"https://firestore.googleapis.com/v1/projects/animewitcher-1c66d/databases/(default)/documents"
