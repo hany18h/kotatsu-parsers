@@ -31,10 +31,6 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 
-@MangaSourceParser("MANGAMELLO", "Manga Mello", "ar", ContentType.MANGA)
-internal class MangaMello(context: MangaLoaderContext) :
-	MangaMelloParser(context, MangaParserSource.MANGAMELLO, isPlus = false)
-
 @MangaSourceParser("MANGAMELLO_PLUS", "MangaMello Plus", "ar", ContentType.MANGA)
 internal class MangaMelloPlus(context: MangaLoaderContext) :
 	MangaMelloParser(context, MangaParserSource.MANGAMELLO_PLUS, isPlus = true)
