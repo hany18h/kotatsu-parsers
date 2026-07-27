@@ -33,29 +33,13 @@ import java.util.TimeZone
 
 @MangaSourceParser("MANGAMELLO_PLUS", "MangaMello Plus", "ar", ContentType.MANGA)
 internal class MangaMelloPlus(context: MangaLoaderContext) :
-	MangaMelloParser(context, MangaParserSource.MANGAMELLO_PLUS, isPlus = true)
-
-internal abstract class MangaMelloParser(
-	context: MangaLoaderContext,
-	source: MangaParserSource,
-	private val isPlus: Boolean,
-) :
-	PagedMangaParser(context, source, 40),
+	PagedMangaParser(context, MangaParserSource.MANGAMELLO_PLUS, 40),
 	Interceptor {
 
-	override val configKeyDomain = if (isPlus) {
-		ConfigKey.Domain("plus.mangamello.com")
-	} else {
-		ConfigKey.Domain("api.mangamello.com")
-	}
+	override val configKeyDomain = ConfigKey.Domain("plus.mangamello.com")
 
 	override val iconUrl =
 		"https://raw.githubusercontent.com/hany18h/kotatsu-parsers/master/src/main/kotlin/org/koitharu/kotatsu/parsers/icons/MangamelloPlus.webp"
-
-	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
-		super.onCreateConfig(keys)
-		keys.add(userAgentKey)
-	}
 
 	override val filterCapabilities: MangaListFilterCapabilities
 		get() = MangaListFilterCapabilities(
@@ -76,26 +60,14 @@ internal abstract class MangaMelloParser(
 		get() = Headers.Builder()
 			.add("Accept", "application/json")
 			.add("Content-Type", "application/json")
-			.apply {
-				if (isPlus) {
-					add("app_version", PLUS_APP_VERSION)
-					add("installer", "com.android.vending")
-					add("lang", "ar")
-					add("device", "android")
-					add("time_zone", TimeZone.getDefault().id)
-					// The Plus API intentionally hides routes from browser user agents.
-					// Match the Flutter/Dart client shipped by the official app.
-					add("User-Agent", PLUS_API_USER_AGENT)
-				} else {
-					add("App-Version", LEGACY_APP_VERSION)
-					add("Time-Zone", TimeZone.getDefault().id)
-					add("Device-Langs", "ar,en")
-					add("X-app-installer", "com.android.vending")
-					add("installer", "com.android.vending")
-					add("vsesion", LEGACY_APP_VERSION)
-					add("User-Agent", config[userAgentKey])
-				}
-			}
+			.add("app_version", PLUS_APP_VERSION)
+			.add("installer", "com.android.vending")
+			.add("lang", "ar")
+			.add("device", "android")
+			.add("time_zone", TimeZone.getDefault().id)
+			// The Plus API intentionally hides routes from browser user agents.
+			// Match the Flutter/Dart client shipped by the official app.
+			.add("User-Agent", PLUS_API_USER_AGENT)
 			.build()
 
 	override fun intercept(chain: Interceptor.Chain): Response {
@@ -107,7 +79,7 @@ internal abstract class MangaMelloParser(
 			"lekmanga" in host -> "https://www.lekmanga.com/"
 			"azorafly" in host || "azoramoon" in host -> "https://azorafly.com/"
 			"olympustaff" in host -> "https://olympustaff.com/"
-			else -> if (isPlus) "https://plus.mangamello.com/" else "https://mangamello.com/"
+			else -> "https://plus.mangamello.com/"
 		}
 		return chain.proceed(
 			request.newBuilder()
@@ -216,7 +188,7 @@ internal abstract class MangaMelloParser(
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val root = apiGet(chapter.url.trimStart('/'))
-		val urls = extractImageUrls(root, "${if (isPlus) PLUS_API_BASE else LEGACY_API_BASE}/")
+		val urls = extractImageUrls(root, "$PLUS_API_BASE/")
 		return urls.mapIndexed { index, imageUrl ->
 			MangaPage(
 				id = generateUid("${chapter.id}-$index"),
@@ -230,13 +202,8 @@ internal abstract class MangaMelloParser(
 	private suspend fun apiGet(path: String): JSONObject {
 		var lastError: Exception? = null
 		val configuredDomain = domain.trimEnd('/')
-		val configuredApiBase = if (isPlus) {
-			"https://$configuredDomain/api/v1"
-		} else {
-			"https://$configuredDomain/v1"
-		}
-		val officialApiBase = if (isPlus) PLUS_API_BASE else LEGACY_API_BASE
-		for (baseUrl in listOf(configuredApiBase, officialApiBase).distinct()) {
+		val configuredApiBase = "https://$configuredDomain/api/v1"
+		for (baseUrl in listOf(configuredApiBase, PLUS_API_BASE).distinct()) {
 			try {
 				return webClient.httpGet(
 					"${baseUrl.trimEnd('/')}/${path.trimStart('/')}",
@@ -291,11 +258,9 @@ internal abstract class MangaMelloParser(
 
 	internal companion object {
 
-		private const val LEGACY_APP_VERSION = "2.0.9"
 		private const val PLUS_APP_VERSION = "1.1.7"
 		private const val PLUS_API_BASE = "https://plus.mangamello.com/api/v1"
-		private const val LEGACY_API_BASE = "https://api.mangamello.com/v1"
-		private val API_HOSTS = setOf("api.mangamello.com", "plus.mangamello.com")
+		private val API_HOSTS = setOf("plus.mangamello.com")
 		private const val IMAGE_USER_AGENT =
 			"Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
 				"(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
@@ -320,9 +285,6 @@ internal abstract class MangaMelloParser(
 
 		internal fun buildListPath(page: Int, order: SortOrder, query: String): String {
 			if (query.isNotBlank()) {
-				// The Plus search endpoint validates sort_by against a different
-				// set than /mangas and returns HTTP 422 for last_update/views.
-				// Search relevance is controlled by the endpoint itself.
 				return "mangas/search?per_page=40&page=$page&relations=genres,type,ageRate" +
 					"&title=${query.urlEncoded()}"
 			}
