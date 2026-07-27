@@ -1,15 +1,26 @@
 package org.koitharu.kotatsu.parsers.site.anime.ar
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import okhttp3.Cookie
+import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import org.koitharu.kotatsu.parsers.MangaAuthAccount
+import org.koitharu.kotatsu.parsers.MangaAuthException
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
+import org.koitharu.kotatsu.parsers.MangaParserCredentialsAuthProvider
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.AuthRequiredException
 import org.koitharu.kotatsu.parsers.model.AnimeStream
 import org.koitharu.kotatsu.parsers.model.ContentRating
 import org.koitharu.kotatsu.parsers.model.ContentType
@@ -24,15 +35,21 @@ import org.koitharu.kotatsu.parsers.model.MangaState
 import org.koitharu.kotatsu.parsers.model.MangaTag
 import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
 import org.koitharu.kotatsu.parsers.model.SortOrder
+import org.koitharu.kotatsu.parsers.util.await
 import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.urlEncoded
 import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.EnumSet
+import java.util.Locale
+import java.util.TimeZone
 
 /**
  * AnimeWitcher's website is only a landing page. Its Android client reads the
- * public catalog from Algolia and episode data from public Firestore documents.
+ * public catalog from Algolia. Viewing servers require a verified Firebase account.
  */
 @MangaSourceParser("ANIME_WITCHER", "AnimeWitcher", "ar", ContentType.ANIME)
 internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
@@ -40,9 +57,12 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 	source = MangaParserSource.ANIME_WITCHER,
 	pageSize = PAGE_SIZE,
 	searchPageSize = PAGE_SIZE,
-) {
+), MangaParserCredentialsAuthProvider {
 
 	override val configKeyDomain = ConfigKey.Domain("www.animewitcher.com")
+	override val authUrl: String = "https://www.animewitcher.com/"
+
+	private val authMutex = Mutex()
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.NEWEST,
@@ -60,6 +80,91 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions()
+
+	override suspend fun isAuthorized(): Boolean =
+		getAccount()?.isEmailVerified == true
+
+	override suspend fun getUsername(): String =
+		getAccount()?.username ?: throw AuthRequiredException(source)
+
+	override suspend fun getAccount(): MangaAuthAccount? = authMutex.withLock {
+		getAccountLocked(forceRefresh = false)
+	}
+
+	override suspend fun refreshAccount(): MangaAuthAccount? = authMutex.withLock {
+		getAccountLocked(forceRefresh = true)
+	}
+
+	override suspend fun signIn(email: String, password: String): MangaAuthAccount = authMutex.withLock {
+		val normalizedEmail = email.trim().lowercase(Locale.US)
+		val response = authPost(
+			endpoint = "accounts:signInWithPassword",
+			body = JSONObject()
+				.put("email", normalizedEmail)
+				.put("password", password)
+				.put("returnSecureToken", true),
+		)
+		saveSession(response)
+		val token = response.getString("idToken")
+		val uid = response.getString("localId")
+		ensureUserDocument(
+			uid = uid,
+			email = normalizedEmail,
+			displayName = normalizedEmail.substringBefore('@'),
+			idToken = token,
+		)
+		lookupAccount(token) ?: throw MangaAuthException("USER_NOT_FOUND")
+	}
+
+	override suspend fun signUp(
+		displayName: String,
+		email: String,
+		password: String,
+	): MangaAuthAccount = authMutex.withLock {
+		val normalizedEmail = email.trim().lowercase(Locale.US)
+		val normalizedName = displayName.trim()
+		val response = authPost(
+			endpoint = "accounts:signUp",
+			body = JSONObject()
+				.put("email", normalizedEmail)
+				.put("password", password)
+				.put("returnSecureToken", true),
+		)
+		saveSession(response, normalizedName)
+		val token = response.getString("idToken")
+		ensureUserDocument(
+			uid = response.getString("localId"),
+			email = normalizedEmail,
+			displayName = normalizedName,
+			idToken = token,
+		)
+		sendVerificationEmailLocked(token)
+		lookupAccount(token)
+			?: MangaAuthAccount(normalizedEmail, normalizedName, isEmailVerified = false)
+	}
+
+	override suspend fun sendVerificationEmail() {
+		authMutex.withLock {
+			val token = validIdTokenLocked(forceRefresh = false)
+				?: throw AuthRequiredException(source)
+			sendVerificationEmailLocked(token)
+		}
+	}
+
+	override suspend fun sendPasswordReset(email: String) {
+		authPost(
+			endpoint = "accounts:sendOobCode",
+			body = JSONObject()
+				.put("requestType", "PASSWORD_RESET")
+				.put("email", email.trim().lowercase(Locale.US)),
+		)
+	}
+
+	override suspend fun signOut() {
+		authMutex.withLock {
+			clearSession()
+		}
+	}
 
 	override suspend fun getListPage(
 		page: Int,
@@ -198,8 +303,10 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	private suspend fun loadServers(animeId: String, episodeId: String): List<JSONObject> {
-		val summary = runCatching {
-			fetchDocument(
+		val authHeaders = firestoreAuthHeaders()
+		val summary = try {
+			fetchDocumentAuthenticated(
+				authHeaders,
 				"anime_list",
 				animeId,
 				"episodes",
@@ -207,7 +314,13 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 				"servers2",
 				"all_servers",
 			)
-		}.getOrNull()
+		} catch (error: CancellationException) {
+			throw error
+		} catch (error: AuthRequiredException) {
+			throw error
+		} catch (_: Exception) {
+			null
+		}
 		val values = summary?.optJSONObject("fields")?.firestoreArray("servers")
 		val summarizedServers = buildList {
 			if (values != null) {
@@ -223,10 +336,24 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 			return summarizedServers
 		}
 
-		return runCatching {
-			fetchCollection(SERVERS_PAGE_SIZE, "anime_list", animeId, "episodes", episodeId, "servers")
+		return try {
+			fetchCollectionAuthenticated(
+				SERVERS_PAGE_SIZE,
+				authHeaders,
+				"anime_list",
+				animeId,
+				"episodes",
+				episodeId,
+				"servers",
+			)
 				.mapNotNull { it.optJSONObject("fields") }
-		}.getOrDefault(emptyList())
+		} catch (error: CancellationException) {
+			throw error
+		} catch (error: AuthRequiredException) {
+			throw error
+		} catch (_: Exception) {
+			emptyList()
+		}
 	}
 
 	private fun parseCatalogItem(item: JSONObject): Manga? {
@@ -349,6 +476,302 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 		return result
 	}
 
+	private suspend fun fetchDocumentAuthenticated(
+		headers: Headers,
+		vararg segments: String,
+	): JSONObject {
+		val builder = FIRESTORE_DOCUMENTS.toHttpUrl().newBuilder()
+		for (segment in segments) {
+			builder.addPathSegment(segment)
+		}
+		builder.addQueryParameter("key", FIREBASE_API_KEY)
+		return webClient.httpGet(builder.build(), headers).parseJson()
+	}
+
+	private suspend fun fetchCollectionAuthenticated(
+		pageSize: Int,
+		headers: Headers,
+		vararg segments: String,
+	): List<JSONObject> {
+		val result = ArrayList<JSONObject>()
+		var pageToken: String? = null
+		var page = 0
+		do {
+			val builder = FIRESTORE_DOCUMENTS.toHttpUrl().newBuilder()
+			for (segment in segments) {
+				builder.addPathSegment(segment)
+			}
+			builder.addQueryParameter("key", FIREBASE_API_KEY)
+			builder.addQueryParameter("pageSize", pageSize.toString())
+			pageToken?.let { builder.addQueryParameter("pageToken", it) }
+			val response = webClient.httpGet(builder.build(), headers).parseJson()
+			val documents = response.optJSONArray("documents")
+			if (documents != null) {
+				for (i in 0 until documents.length()) {
+					documents.optJSONObject(i)?.let(result::add)
+				}
+			}
+			pageToken = response.optString("nextPageToken").takeIf(String::isNotBlank)
+			page++
+		} while (pageToken != null && page < MAX_FIRESTORE_PAGES)
+		return result
+	}
+
+	private suspend fun firestoreAuthHeaders(): Headers = authMutex.withLock {
+		var token = validIdTokenLocked(forceRefresh = false)
+			?: throw AuthRequiredException(source)
+		val account = if (readCookie(COOKIE_EMAIL_VERIFIED) == "1") {
+			null
+		} else {
+			token = validIdTokenLocked(forceRefresh = true)
+				?: throw AuthRequiredException(source)
+			lookupAccount(token)
+		}
+		if (account != null && !account.isEmailVerified) {
+			throw AuthRequiredException(source)
+		}
+		if (account == null && readCookie(COOKIE_EMAIL_VERIFIED) != "1") {
+			throw AuthRequiredException(source)
+		}
+		Headers.Builder()
+			.add("Authorization", "Bearer $token")
+			.add("Accept", "application/json")
+			.build()
+	}
+
+	private suspend fun getAccountLocked(forceRefresh: Boolean): MangaAuthAccount? {
+		val token = try {
+			validIdTokenLocked(forceRefresh)
+		} catch (error: MangaAuthException) {
+			if (error.code in SESSION_INVALID_ERRORS) {
+				clearSession()
+				return null
+			}
+			throw error
+		} ?: return null
+		return try {
+			lookupAccount(token)
+		} catch (error: MangaAuthException) {
+			if (error.code in SESSION_INVALID_ERRORS) {
+				clearSession()
+				null
+			} else {
+				throw error
+			}
+		}
+	}
+
+	private suspend fun validIdTokenLocked(forceRefresh: Boolean): String? {
+		if (!forceRefresh) {
+			readCookie(COOKIE_ID_TOKEN)?.let { return it }
+		}
+		val refreshToken = readCookie(COOKIE_REFRESH_TOKEN) ?: return null
+		val form = FormBody.Builder()
+			.add("grant_type", "refresh_token")
+			.add("refresh_token", refreshToken)
+			.build()
+		val request = Request.Builder()
+			.url("$SECURE_TOKEN_ENDPOINT?key=$FIREBASE_API_KEY")
+			.post(form)
+			.build()
+		val response = executeJsonRequest(request)
+			?: throw MangaAuthException("EMPTY_RESPONSE")
+		saveSession(response)
+		return response.optString("id_token").takeIf(String::isNotBlank)
+			?: response.optString("idToken").takeIf(String::isNotBlank)
+	}
+
+	private suspend fun lookupAccount(idToken: String): MangaAuthAccount? {
+		val response = authPost(
+			endpoint = "accounts:lookup",
+			body = JSONObject().put("idToken", idToken),
+		)
+		val user = response.optJSONArray("users")?.optJSONObject(0) ?: return null
+		val email = user.optString("email").takeIf(String::isNotBlank)
+			?: decodeCookie(readCookie(COOKIE_EMAIL))
+			?: return null
+		val displayName = user.optString("displayName").takeIf(String::isNotBlank)
+			?: decodeCookie(readCookie(COOKIE_DISPLAY_NAME))
+		val account = MangaAuthAccount(
+			username = email,
+			displayName = displayName,
+			isEmailVerified = user.optBoolean("emailVerified", false),
+		)
+		saveLongLivedCookie(COOKIE_EMAIL, encodeCookie(email))
+		displayName?.let { saveLongLivedCookie(COOKIE_DISPLAY_NAME, encodeCookie(it)) }
+		saveLongLivedCookie(COOKIE_EMAIL_VERIFIED, if (account.isEmailVerified) "1" else "0")
+		return account
+	}
+
+	private suspend fun sendVerificationEmailLocked(idToken: String) {
+		authPost(
+			endpoint = "accounts:sendOobCode",
+			body = JSONObject()
+				.put("requestType", "VERIFY_EMAIL")
+				.put("idToken", idToken),
+		)
+	}
+
+	private suspend fun ensureUserDocument(
+		uid: String,
+		email: String,
+		displayName: String,
+		idToken: String,
+	) {
+		val documentUrl = FIRESTORE_DOCUMENTS.toHttpUrl().newBuilder()
+			.addPathSegment("users")
+			.addPathSegment(uid)
+			.addQueryParameter("key", FIREBASE_API_KEY)
+			.build()
+		val getRequest = Request.Builder()
+			.url(documentUrl)
+			.header("Authorization", "Bearer $idToken")
+			.get()
+			.build()
+		if (executeJsonRequest(getRequest, allowNotFound = true) != null) {
+			return
+		}
+
+		val createUrl = FIRESTORE_DOCUMENTS.toHttpUrl().newBuilder()
+			.addPathSegment("users")
+			.addQueryParameter("documentId", uid)
+			.addQueryParameter("key", FIREBASE_API_KEY)
+			.build()
+		val fields = JSONObject()
+			.put("uid", firestoreString(uid))
+			.put("email", firestoreString(email))
+			.put("user_name", firestoreString(displayName))
+			.put("banned", JSONObject().put("booleanValue", false))
+			.put("app_version_code", JSONObject().put("integerValue", "0"))
+			.put("registration_date", JSONObject().put("timestampValue", firestoreTimestamp()))
+			.put("statistics", emptyFirestoreMap())
+			.put("settings", emptyFirestoreMap())
+			.put("statistics_user_anime", emptyFirestoreMap())
+		val requestBody = JSONObject()
+			.put("fields", fields)
+			.toString()
+			.toRequestBody(JSON_MEDIA_TYPE)
+		val createRequest = Request.Builder()
+			.url(createUrl)
+			.header("Authorization", "Bearer $idToken")
+			.post(requestBody)
+			.build()
+		try {
+			executeJsonRequest(createRequest)
+		} catch (error: MangaAuthException) {
+			if (error.code != "ALREADY_EXISTS") throw error
+		}
+	}
+
+	private suspend fun authPost(endpoint: String, body: JSONObject): JSONObject {
+		val request = Request.Builder()
+			.url("$IDENTITY_TOOLKIT_ENDPOINT/$endpoint?key=$FIREBASE_API_KEY")
+			.post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
+			.build()
+		return executeJsonRequest(request) ?: throw MangaAuthException("EMPTY_RESPONSE")
+	}
+
+	private suspend fun executeJsonRequest(
+		request: Request,
+		allowNotFound: Boolean = false,
+	): JSONObject? {
+		val response = context.httpClient.newCall(request).await()
+		response.use {
+			val payload = it.body.string()
+			val json = payload.takeIf(String::isNotBlank)?.let(::JSONObject) ?: JSONObject()
+			if (it.isSuccessful) return json
+			if (allowNotFound && it.code == 404) return null
+			val error = json.optJSONObject("error")
+			val rawCode = error?.optString("message").orEmpty()
+			val code = rawCode.substringBefore(" : ")
+				.ifBlank { error?.optString("status").orEmpty() }
+				.ifBlank { "HTTP_${it.code}" }
+			throw MangaAuthException(code, rawCode.ifBlank { it.message })
+		}
+	}
+
+	private fun saveSession(response: JSONObject, displayName: String? = null) {
+		val idToken = response.optString("idToken").takeIf(String::isNotBlank)
+			?: response.optString("id_token").takeIf(String::isNotBlank)
+			?: throw MangaAuthException("MISSING_ID_TOKEN")
+		val refreshToken = response.optString("refreshToken").takeIf(String::isNotBlank)
+			?: response.optString("refresh_token").takeIf(String::isNotBlank)
+			?: readCookie(COOKIE_REFRESH_TOKEN)
+			?: throw MangaAuthException("MISSING_REFRESH_TOKEN")
+		val expiresIn = response.optString("expiresIn")
+			.ifBlank { response.optString("expires_in") }
+			.toLongOrNull()
+			?: DEFAULT_TOKEN_LIFETIME_SECONDS
+		saveCookie(
+			name = COOKIE_ID_TOKEN,
+			value = idToken,
+			expiresAt = System.currentTimeMillis() + (expiresIn - TOKEN_EXPIRY_SKEW_SECONDS)
+				.coerceAtLeast(MIN_TOKEN_LIFETIME_SECONDS) * 1000L,
+		)
+		saveLongLivedCookie(COOKIE_REFRESH_TOKEN, refreshToken)
+		displayName?.takeIf(String::isNotBlank)?.let {
+			saveLongLivedCookie(COOKIE_DISPLAY_NAME, encodeCookie(it))
+		}
+		response.optString("email").takeIf(String::isNotBlank)?.let {
+			saveLongLivedCookie(COOKIE_EMAIL, encodeCookie(it))
+		}
+	}
+
+	private fun clearSession() {
+		for (name in AUTH_COOKIE_NAMES) {
+			saveCookie(name, "", expiresAt = 0L)
+		}
+	}
+
+	private fun readCookie(name: String): String? =
+		context.cookieJar.loadForRequest(AUTH_COOKIE_URL)
+			.firstOrNull { it.name == name }
+			?.value
+			?.takeIf(String::isNotBlank)
+
+	private fun saveLongLivedCookie(name: String, value: String) {
+		saveCookie(name, value, System.currentTimeMillis() + AUTH_COOKIE_LIFETIME_MS)
+	}
+
+	private fun saveCookie(name: String, value: String, expiresAt: Long) {
+		context.cookieJar.saveFromResponse(
+			AUTH_COOKIE_URL,
+			listOf(
+				Cookie.Builder()
+					.name(name)
+					.value(value)
+					.hostOnlyDomain(AUTH_COOKIE_URL.host)
+					.path("/")
+					.expiresAt(expiresAt)
+					.secure()
+					.httpOnly()
+					.build(),
+			),
+		)
+	}
+
+	private fun encodeCookie(value: String): String =
+		context.encodeBase64(value.toByteArray(StandardCharsets.UTF_8))
+
+	private fun decodeCookie(value: String?): String? = value?.let {
+		runCatching {
+			String(context.decodeBase64(it), StandardCharsets.UTF_8)
+		}.getOrNull()
+	}
+
+	private fun firestoreTimestamp(): String = SimpleDateFormat(
+		"yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+		Locale.US,
+	).apply {
+		timeZone = TimeZone.getTimeZone("UTC")
+	}.format(Date())
+
+	private fun firestoreString(value: String): JSONObject =
+		JSONObject().put("stringValue", value)
+
+	private fun emptyFirestoreMap(): JSONObject =
+		JSONObject().put("mapValue", JSONObject().put("fields", JSONObject()))
+
 	private fun parseContentRating(
 		age: String?,
 		tags: Set<MangaTag>,
@@ -402,6 +825,37 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 		private const val FIREBASE_API_KEY = "AIzaSyAcbWRwfFNnCpoydDXlEALWnM_TYVcJOMU"
 		private const val FIRESTORE_DOCUMENTS =
 			"https://firestore.googleapis.com/v1/projects/animewitcher-1c66d/databases/(default)/documents"
+		private const val IDENTITY_TOOLKIT_ENDPOINT =
+			"https://identitytoolkit.googleapis.com/v1"
+		private const val SECURE_TOKEN_ENDPOINT =
+			"https://securetoken.googleapis.com/v1/token"
+		private const val COOKIE_ID_TOKEN = "aw_id_token"
+		private const val COOKIE_REFRESH_TOKEN = "aw_refresh_token"
+		private const val COOKIE_EMAIL = "aw_email"
+		private const val COOKIE_DISPLAY_NAME = "aw_display_name"
+		private const val COOKIE_EMAIL_VERIFIED = "aw_email_verified"
+		private const val DEFAULT_TOKEN_LIFETIME_SECONDS = 3600L
+		private const val TOKEN_EXPIRY_SKEW_SECONDS = 60L
+		private const val MIN_TOKEN_LIFETIME_SECONDS = 30L
+		private const val AUTH_COOKIE_LIFETIME_MS = 10L * 365L * 24L * 60L * 60L * 1000L
+		// An internal-only cookie scope keeps session tokens in the app's cookie storage
+		// without ever attaching them to requests made to AnimeWitcher's public website.
+		private val AUTH_COOKIE_URL = "https://animewitcher-auth.invalid/".toHttpUrl()
+		private val AUTH_COOKIE_NAMES = arrayOf(
+			COOKIE_ID_TOKEN,
+			COOKIE_REFRESH_TOKEN,
+			COOKIE_EMAIL,
+			COOKIE_DISPLAY_NAME,
+			COOKIE_EMAIL_VERIFIED,
+		)
+		private val SESSION_INVALID_ERRORS = setOf(
+			"INVALID_ID_TOKEN",
+			"INVALID_REFRESH_TOKEN",
+			"TOKEN_EXPIRED",
+			"USER_DISABLED",
+			"USER_NOT_FOUND",
+		)
+		private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 		private val NUMBER = Regex("""\d+(?:\.\d+)?""")
 		private val PIXEL_DRAIN = Regex(
 			"""^https?://(?:www\.)?pixeldrain\.com/u/([A-Za-z0-9]+)(?:[/?#].*)?$""",
