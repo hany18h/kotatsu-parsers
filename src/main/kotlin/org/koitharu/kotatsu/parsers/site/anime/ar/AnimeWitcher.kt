@@ -82,7 +82,8 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 	override suspend fun getFilterOptions() = MangaListFilterOptions()
 
 	override suspend fun isAuthorized(): Boolean =
-		getAccount()?.isEmailVerified == true
+		readCookie(COOKIE_EMAIL_VERIFIED) == "1" &&
+			readCookie(COOKIE_REFRESH_TOKEN) != null
 
 	override suspend fun getUsername(): String =
 		getAccount()?.username ?: throw AuthRequiredException(source)
