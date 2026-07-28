@@ -102,16 +102,23 @@ internal class HizoManga(context: MangaLoaderContext) :
 		}.distinctBy(MangaChapter::id).sortedBy(MangaChapter::number)
 	}
 
-	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = emptyList()
+	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+		val document = webClient.httpGet(chapterUrl).parseHtml()
+		return extractHizoImageUrls(document, chapterUrl).mapIndexed { index, url ->
+			MangaPage(
+				id = generateUid("${chapter.id}:$index:$url"),
+				url = url,
+				preview = null,
+				source = source,
+			)
+		}
+	}
 
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
 		val document = webClient.httpGet(chapterUrl).parseHtml()
-		val content = document.selectFirst(
-			".reading-content.current > .text-left, " +
-				".reading-content.current .text-left, " +
-				".reading-content.current",
-		) ?: return null
+		val content = selectHizoChapterContent(document) ?: return null
 		sanitizeHizoChapterContent(content)
 		if (content.text().isBlank() && content.selectFirst("img") == null) return null
 
@@ -126,7 +133,7 @@ internal class HizoManga(context: MangaLoaderContext) :
 				append(content.html())
 			},
 			images = content.select("img").mapNotNull { image ->
-				image.src()?.let { imageUrl ->
+				resolveHizoImageUrl(image, chapterUrl)?.let { imageUrl ->
 					NovelImage(
 						url = imageUrl,
 						headers = mapOf(
@@ -145,6 +152,27 @@ internal class HizoManga(context: MangaLoaderContext) :
 
 		internal fun countCurrentListingCards(document: Document): Int =
 			document.select("div.page-item-detail").size
+
+		internal fun selectHizoChapterContent(document: Document): Element? =
+			document.selectFirst(
+				".reading-content.current > .text-left, " +
+					".reading-content.current .text-left, " +
+					".read-container > .text-left, " +
+					".reading-content.current, " +
+					".read-container > .reading-content, " +
+					".entry-content_wrap .reading-content",
+			)
+
+		internal fun extractHizoImageUrls(document: Document, chapterUrl: String): List<String> {
+			val content = selectHizoChapterContent(document) ?: return emptyList()
+			return content.select(
+				"div.page-break img, img.wp-manga-chapter-img, img[data-src], " +
+					"img[data-lazy-src], img[data-original], img[data-url], " +
+					"img[data-cfsrc], img[data-srcset], img[srcset], img[src]",
+			).mapNotNull { image ->
+				resolveHizoImageUrl(image, chapterUrl)
+			}.distinct()
+		}
 
 		internal fun sanitizeHizoChapterContent(content: Element): Element {
 			content.select(
@@ -171,23 +199,42 @@ internal class HizoManga(context: MangaLoaderContext) :
 		}
 
 		private fun promoteLazyImage(image: Element) {
-			val current = image.attr("src").trim()
-			val value = current.takeIf {
-				it.isNotEmpty() && it != "#" && !it.startsWith("data:", ignoreCase = true)
-			} ?: sequenceOf(
+			val value = sequenceOf(
 				"data-src",
 				"data-lazy-src",
 				"data-original",
 				"data-url",
+				"data-cfsrc",
+				"src",
+				"data-srcset",
+				"srcset",
 			).map { image.attr(it).trim() }.firstOrNull {
-				it.isNotEmpty() && !it.startsWith("data:", ignoreCase = true)
-			} ?: return
+				it.isNotEmpty() &&
+					it != "#" &&
+					!it.startsWith("data:", ignoreCase = true) &&
+					!it.contains("placeholder", ignoreCase = true)
+			}?.substringBefore(',')
+				?.trim()
+				?.substringBefore(' ')
+				?.trim()
+				?.takeIf(String::isNotEmpty)
+				?: return
 			image.attr("src", value)
 				.removeAttr("srcset")
 				.removeAttr("data-src")
 				.removeAttr("data-lazy-src")
 				.removeAttr("data-original")
 				.removeAttr("data-url")
+		}
+
+		private fun resolveHizoImageUrl(image: Element, chapterUrl: String): String? {
+			promoteLazyImage(image)
+			val value = image.attr("src").trim().takeIf(String::isNotEmpty) ?: return null
+			return runCatching {
+				value.toAbsoluteUrl(java.net.URI(chapterUrl).host)
+			}.getOrElse {
+				runCatching { java.net.URI(chapterUrl).resolve(value).toString() }.getOrDefault(value)
+			}
 		}
 	}
 }

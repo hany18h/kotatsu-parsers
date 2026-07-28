@@ -91,15 +91,7 @@ internal class AnyoneManga(context: MangaLoaderContext) :
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
 		val document = webClient.httpGet(chapterUrl).parseHtml()
-		val root = document.selectFirst(
-			".reading-content.current, .main-col-inner .reading-content, .reading-content",
-		) ?: throw ParseException("Chapter content not found", chapterUrl)
-		val urls = root.select(
-			"div.page-break img, img.wp-manga-chapter-img, img[data-src], " +
-				"img[data-lazy-src], img[data-original], img[src]",
-		).mapNotNull { image ->
-			resolveAnyoneImageUrl(image, chapterUrl)
-		}.distinct()
+		val urls = extractAnyoneChapterImageUrls(document, chapterUrl)
 		if (urls.isEmpty()) throw ParseException("Image src not found", chapterUrl)
 		return urls.mapIndexed { index, url ->
 			MangaPage(
@@ -156,13 +148,21 @@ internal class AnyoneManga(context: MangaLoaderContext) :
 				"data-lazy-src",
 				"data-original",
 				"data-url",
+				"data-cfsrc",
 				"src",
+				"data-srcset",
+				"srcset",
 			).map { image.attr(it).trim() }.firstOrNull { value ->
 				value.isNotEmpty() &&
 					value != "#" &&
 					!value.startsWith("data:", ignoreCase = true) &&
 					!value.contains("placeholder", ignoreCase = true)
-			} ?: return null
+			}?.substringBefore(',')
+				?.trim()
+				?.substringBefore(' ')
+				?.trim()
+				?.takeIf(String::isNotEmpty)
+				?: return null
 			return runCatching {
 				when {
 					raw.startsWith("//") -> "https:$raw"
@@ -170,6 +170,26 @@ internal class AnyoneManga(context: MangaLoaderContext) :
 					else -> URI(baseUrl).resolve(raw).toString()
 				}
 			}.getOrDefault(raw)
+		}
+
+		internal fun extractAnyoneChapterImageUrls(
+			document: Document,
+			chapterUrl: String,
+		): List<String> {
+			// AnyoneManga's custom theme now uses am-reading-content instead of
+			// Madara's traditional reading-content wrapper.
+			val root = document.selectFirst(
+				".am-reading-content, .am-reading-wrap .reading-content, " +
+					".reading-content.current, .main-col-inner .reading-content, " +
+					".read-container .reading-content, .reading-content",
+			) ?: return emptyList()
+			return root.select(
+				"div.page-break img, img.wp-manga-chapter-img, img[data-src], " +
+					"img[data-lazy-src], img[data-original], img[data-url], " +
+					"img[data-cfsrc], img[data-srcset], img[srcset], img[src]",
+			).mapNotNull { image ->
+				resolveAnyoneImageUrl(image, chapterUrl)
+			}.distinct()
 		}
 	}
 }
