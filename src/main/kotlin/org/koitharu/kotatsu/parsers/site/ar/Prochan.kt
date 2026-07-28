@@ -519,7 +519,10 @@ internal fun filterAndSortProChanChapters(data: JSONArray): List<JSONObject> {
 			.ifBlank { item.optString("number") }
 			.toFloatOrNull()
 			?: return@mapJSONNotNull null
-		item.put("_normalized_chapter_number", number)
+		// Android's org.json.JSONObject has no put(String, Float) overload.
+		// Force the API-compatible Number overload instead of emitting a JVM-only
+		// Float method call that crashes while the chapter list is being built.
+		item.put("_normalized_chapter_number", number.toDouble())
 	}.distinctBy { it.optInt("id") }
 		.sortedWith(
 			compareBy<JSONObject> { it.optDouble("_normalized_chapter_number", Double.MAX_VALUE) }

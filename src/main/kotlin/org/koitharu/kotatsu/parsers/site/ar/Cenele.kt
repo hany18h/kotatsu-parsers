@@ -337,14 +337,10 @@ internal class Cenele(context: MangaLoaderContext) :
 		private val ZERO_WIDTH_MARKS = Regex("[\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\uFEFF]")
 
 		internal fun sanitizeChapterContent(content: Element): Element {
-			// Do not remove every paragraph following the bait marker: Cenele uses
-			// more than one layout and, in one of them, the real paragraph follows
-			// the marker. Remove only nodes whose normalized text is actually bait.
-			content.select("p, span, div").forEach { element ->
-				if (isAntiCopyText(element.text())) {
-					element.remove()
-				}
-			}
+			// Cenele injects the anti-copy span inside the same <p> as the real text.
+			// Remove hidden descendants first; checking the parent before this would
+			// classify the complete real paragraph (or even the whole chapter div)
+			// as bait and delete it.
 			content.select(
 				"span[aria-hidden=true], " +
 					"p[aria-hidden=true], " +
@@ -357,6 +353,17 @@ internal class Cenele(context: MangaLoaderContext) :
 					".adsbygoogle, .google-auto-placed, " +
 					"[id^=ezoic], [id^=pf-], [id^=bg-ssp]",
 			).remove()
+			content.select("template[data-nhv-rb]").forEach { marker ->
+				val bait = marker.nextElementSibling()
+				?.takeIf { it.tagName() == "p" && isAntiCopyText(it.text()) }
+			bait?.remove()
+				marker.remove()
+			}
+			content.select("p, span").forEach { element ->
+				if (isAntiCopyText(element.text())) {
+					element.remove()
+				}
+			}
 			content.select("img").forEach(::promoteLazyImageSource)
 			content.select("p").forEach { paragraph ->
 				if (paragraph.text().trim().isEmpty() && paragraph.selectFirst("img") == null) {
