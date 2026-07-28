@@ -14,6 +14,7 @@ import org.koitharu.kotatsu.parsers.model.MangaParserSource
 import org.koitharu.kotatsu.parsers.model.NovelChapterContent
 import org.koitharu.kotatsu.parsers.model.NovelImage
 import org.koitharu.kotatsu.parsers.model.SortOrder
+import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 import org.koitharu.kotatsu.parsers.util.attrAsRelativeUrlOrNull
 import org.koitharu.kotatsu.parsers.util.generateUid
@@ -25,6 +26,11 @@ import org.koitharu.kotatsu.parsers.util.urlEncoded
 @MangaSourceParser("HIZOMANGA", "Hizo Manga", "ar", ContentType.NOVEL)
 internal class HizoManga(context: MangaLoaderContext) :
 	MadaraParser(context, MangaParserSource.HIZOMANGA, "hizomanga.net", pageSize = 10) {
+
+	// Hizo rejects Android WebView user agents and redirects them to
+	// /no-webview.html, which itself redirects forever. Use an ordinary
+	// mobile Chrome identity for this source only.
+	override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_MOBILE)
 
 	override val stylePage = ""
 	override val datePattern = "yyyy-MM-dd"
