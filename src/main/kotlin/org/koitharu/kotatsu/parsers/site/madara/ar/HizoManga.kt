@@ -1,0 +1,152 @@
+package org.koitharu.kotatsu.parsers.site.madara.ar
+
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import org.koitharu.kotatsu.parsers.MangaLoaderContext
+import org.koitharu.kotatsu.parsers.MangaSourceParser
+import org.koitharu.kotatsu.parsers.config.ConfigKey
+import org.koitharu.kotatsu.parsers.model.ContentType
+import org.koitharu.kotatsu.parsers.model.Manga
+import org.koitharu.kotatsu.parsers.model.MangaChapter
+import org.koitharu.kotatsu.parsers.model.MangaPage
+import org.koitharu.kotatsu.parsers.model.MangaParserSource
+import org.koitharu.kotatsu.parsers.model.NovelChapterContent
+import org.koitharu.kotatsu.parsers.model.NovelImage
+import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
+import org.koitharu.kotatsu.parsers.util.attrAsRelativeUrlOrNull
+import org.koitharu.kotatsu.parsers.util.generateUid
+import org.koitharu.kotatsu.parsers.util.parseHtml
+import org.koitharu.kotatsu.parsers.util.src
+import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
+
+@MangaSourceParser("HIZOMANGA", "Hizo Manga", "ar", ContentType.NOVEL)
+internal class HizoManga(context: MangaLoaderContext) :
+	MadaraParser(context, MangaParserSource.HIZOMANGA, "hizomanga.net", pageSize = 12) {
+
+	override val stylePage = ""
+	override val datePattern = "yyyy-MM-dd"
+
+	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+		super.onCreateConfig(keys)
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
+	}
+
+	override suspend fun getChapters(manga: Manga, doc: Document): List<MangaChapter> =
+		parseHizoChapters(doc)
+
+	override suspend fun loadChapters(mangaUrl: String, document: Document): List<MangaChapter> {
+		val url = mangaUrl.toAbsoluteUrl(domain).trimEnd('/') + "/ajax/chapters/"
+		val chapterDocument = runCatching {
+			webClient.httpPost(url, emptyMap()).parseHtml()
+		}.getOrNull()
+		return parseHizoChapters(chapterDocument ?: document)
+	}
+
+	private fun parseHizoChapters(document: Document): List<MangaChapter> {
+		return document.select("li.wp-manga-chapter").mapIndexedNotNull { index, item ->
+			val anchor = item.selectFirst("a[href]") ?: return@mapIndexedNotNull null
+			val href = anchor.attrAsRelativeUrlOrNull("href") ?: return@mapIndexedNotNull null
+			val title = anchor.text().trim().ifEmpty { "الفصل ${index + 1}" }
+			val number = NUMBER.find(title)?.value?.toFloatOrNull()
+				?: NUMBER.find(href.substringAfterLast('/'))?.value?.toFloatOrNull()
+				?: (index + 1).toFloat()
+			MangaChapter(
+				id = generateUid(href),
+				title = title,
+				number = number,
+				volume = 0,
+				url = href,
+				scanlator = null,
+				uploadDate = 0L,
+				branch = null,
+				source = source,
+			)
+		}.distinctBy(MangaChapter::id).sortedBy(MangaChapter::number)
+	}
+
+	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = emptyList()
+
+	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
+		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+		val document = webClient.httpGet(chapterUrl).parseHtml()
+		val content = document.selectFirst(
+			".reading-content.current > .text-left, " +
+				".reading-content.current .text-left, " +
+				".reading-content.current",
+		) ?: return null
+		sanitizeHizoChapterContent(content)
+		if (content.text().isBlank() && content.selectFirst("img") == null) return null
+
+		val title = document.selectFirst(".reading-content.current h3.chapter-name")
+			?.text()
+			?.trim()
+			?.takeIf(String::isNotEmpty)
+			?: chapter.title.orEmpty()
+		return NovelChapterContent(
+			html = buildString {
+				if (title.isNotEmpty()) append(Element("h1").text(title).outerHtml())
+				append(content.html())
+			},
+			images = content.select("img").mapNotNull { image ->
+				image.src()?.let { imageUrl ->
+					NovelImage(
+						url = imageUrl,
+						headers = mapOf(
+							"Referer" to chapterUrl,
+							"User-Agent" to config[userAgentKey],
+						),
+					)
+				}
+			}.distinctBy(NovelImage::url),
+		)
+	}
+
+	internal companion object {
+
+		private val NUMBER = Regex("""\d+(?:\.\d+)?""")
+
+		internal fun sanitizeHizoChapterContent(content: Element): Element {
+			content.select(
+				"script, style, iframe, noscript, form, input, select, option, textarea, button, " +
+					"svg, canvas, ins, .adsbygoogle, [class*=advert], [id*=advert], " +
+					"[hidden], [aria-hidden=true], .d-none",
+			).remove()
+			content.select("img").forEach(::promoteLazyImage)
+			content.select("p, div, span").forEach { element ->
+				if (element.text().trim().isEmpty() && element.selectFirst("img") == null) {
+					element.remove()
+				}
+			}
+			content.select("*").forEach { element ->
+				element.removeAttr("class")
+					.removeAttr("id")
+					.removeAttr("style")
+					.removeAttr("width")
+					.removeAttr("height")
+					.removeAttr("loading")
+					.removeAttr("decoding")
+			}
+			return content
+		}
+
+		private fun promoteLazyImage(image: Element) {
+			val current = image.attr("src").trim()
+			val value = current.takeIf {
+				it.isNotEmpty() && it != "#" && !it.startsWith("data:", ignoreCase = true)
+			} ?: sequenceOf(
+				"data-src",
+				"data-lazy-src",
+				"data-original",
+				"data-url",
+			).map { image.attr(it).trim() }.firstOrNull {
+				it.isNotEmpty() && !it.startsWith("data:", ignoreCase = true)
+			} ?: return
+			image.attr("src", value)
+				.removeAttr("srcset")
+				.removeAttr("data-src")
+				.removeAttr("data-lazy-src")
+				.removeAttr("data-original")
+				.removeAttr("data-url")
+		}
+	}
+}
