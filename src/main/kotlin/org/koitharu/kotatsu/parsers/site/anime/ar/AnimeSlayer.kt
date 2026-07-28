@@ -3,6 +3,7 @@ package org.koitharu.kotatsu.parsers.site.anime.ar
 import okhttp3.Headers
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.parser.Parser
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -46,6 +47,9 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 
 	override val configKeyDomain = ConfigKey.Domain("anslayer.com")
 
+	override val iconUrl =
+		"https://raw.githubusercontent.com/hany18h/kotatsu-parsers/master/src/main/kotlin/org/koitharu/kotatsu/parsers/icons/AnimeSlayer.png"
+
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,
 		SortOrder.NEWEST,
@@ -58,6 +62,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions()
@@ -270,7 +275,10 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 
 	private suspend fun resolveStreamTape(url: String, serverName: String): AnimeStream? {
 		val raw = webClient.httpGet(url, pageHeaders("https://anslayer.com/")).parseRaw()
-		val direct = findStreamTapeUrl(raw) ?: findDirectMediaUrls(raw).firstOrNull() ?: return null
+		val direct = extractStreamTapeDirectUrl(Jsoup.parse(raw, url), url)
+			?: findStreamTapeUrl(raw)
+			?: findDirectMediaUrls(raw).firstOrNull()
+			?: return null
 		return createStream("$serverName • StreamTape", direct, url)
 	}
 
@@ -370,6 +378,21 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			document.selectFirst("#downloadButton[href]")?.attr("href")
 				?.takeIf { isDirectMediaUrl(it) }
 
+		fun extractStreamTapeDirectUrl(document: Document, baseUrl: String): String? {
+			val value = document.select("#ideoooolink, #norobotlink, #robotlink")
+				.asSequence()
+				.map { it.text().trim() }
+				.firstOrNull { "/get_video?" in it }
+				?: return null
+			return when {
+				value.startsWith("//") -> "https:$value"
+				value.matches(Regex("""^/streamtape\.[^/]+/get_video\?.+""", RegexOption.IGNORE_CASE)) ->
+					"https:/$value"
+				value.startsWith("/get_video?") -> URI(baseUrl).resolve(value).toString()
+				else -> absoluteUrl(value, baseUrl)
+			}
+		}
+
 		fun findDirectMediaUrls(raw: String): List<String> {
 			val decoded = Parser.unescapeEntities(raw, false)
 				.replace("\\/", "/")
@@ -384,6 +407,8 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			val decoded = Parser.unescapeEntities(raw, false)
 				.replace("\\/", "/")
 				.replace("\\u0026", "&", ignoreCase = true)
+			extractStreamTapeDirectUrl(Jsoup.parse(decoded, "https://streamtape.com/"), "https://streamtape.com/")
+				?.let { return it }
 			STREAM_TAPE_URL.find(decoded)?.value?.let { return absoluteUrl(it, "https://streamtape.com/") }
 			val fragment = ROBOT_LINK.find(decoded)?.groupValues?.getOrNull(1) ?: return null
 			return fragment.takeIf { "/get_video?" in it }?.let {
