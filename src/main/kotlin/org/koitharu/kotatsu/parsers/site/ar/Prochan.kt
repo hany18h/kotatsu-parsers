@@ -42,6 +42,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
 
 	private val dateFormat by lazy {
@@ -262,23 +263,19 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val chaptersData = chaptersJson.optJSONArray("chapters") ?: JSONArray()
 
 		return manga.copy(
-			chapters = parseChapters(chaptersData, manga.url).reversed(),
+			chapters = parseChapters(chaptersData, manga.url),
 		)
 	}
 
 	private fun parseChapters(data: JSONArray, mangaUrl: String): List<MangaChapter> {
-		return data.mapJSONNotNull { item ->
-			val coinsRequired = item.optInt("coins_required", 0)
-			val lockedForever = item.optBoolean("lockedForever", false)
-			if (coinsRequired > 0 || lockedForever) return@mapJSONNotNull null
-
-			val chapterId = item.optInt("id").takeIf { it > 0 } ?: return@mapJSONNotNull null
+		return filterAndSortProChanChapters(data).mapNotNull { item ->
+			val chapterId = item.optInt("id").takeIf { it > 0 } ?: return@mapNotNull null
 
 			val chapterNumber = item.optString("chapter_number").takeIf { it.isNotEmpty() }
-				?: item.optString("title").takeIf { it.isNotEmpty() }
-				?: return@mapJSONNotNull null
+				?: item.optString("number").takeIf { it.isNotEmpty() }
+				?: return@mapNotNull null
 
-			val chapterNum = chapterNumber.toFloatOrNull() ?: return@mapJSONNotNull null
+			val chapterNum = chapterNumber.toFloatOrNull() ?: return@mapNotNull null
 
 			val title = item.optString("title").takeIf {
 				it.isNotEmpty() && it != "null" && it != chapterNumber
@@ -370,7 +367,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 				"?token=$token&split=$splitIndex"
 
 			val deferredData = runCatching {
-				webClient.httpGet(deferredUrl).parseJson()
+				webClient.httpGet(deferredUrl, pageHeaders(chapterUrl)).parseJson()
 			}.getOrNull()?.optJSONObject("data")
 
 			deferredData?.optJSONArray("images")?.let { images ->
@@ -490,7 +487,44 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		.add("User-Agent", config[userAgentKey])
 		.build()
 
+	private fun pageHeaders(referer: String): Headers = Headers.Builder()
+		.add("Accept", "application/json,text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+		.add("Accept-Language", "ar,en-US;q=0.8,en;q=0.7")
+		.add("Referer", referer)
+		.add("User-Agent", config[userAgentKey])
+		.build()
+
 	override suspend fun getPageUrl(page: MangaPage): String = page.url
+}
+
+internal fun filterAndSortProChanChapters(data: JSONArray): List<JSONObject> {
+	return data.mapJSONNotNull { item ->
+		val language = item.optString("language").trim()
+		if (language.isNotEmpty() && !language.equals("AR", ignoreCase = true)) {
+			return@mapJSONNotNull null
+		}
+		val coinsRequired = maxOf(
+			item.optInt("coins_required", 0),
+			item.optInt("coinsRequired", 0),
+		)
+		if (
+			coinsRequired > 0 ||
+			item.optBoolean("lockedForever", false) ||
+			item.optBoolean("lockedByCoins", false) ||
+			item.optBoolean("lockedByExclusive", false)
+		) {
+			return@mapJSONNotNull null
+		}
+		val number = item.optString("chapter_number")
+			.ifBlank { item.optString("number") }
+			.toFloatOrNull()
+			?: return@mapJSONNotNull null
+		item.put("_normalized_chapter_number", number)
+	}.distinctBy { it.optInt("id") }
+		.sortedWith(
+			compareBy<JSONObject> { it.optDouble("_normalized_chapter_number", Double.MAX_VALUE) }
+				.thenBy { it.optInt("id") },
+		)
 }
 
 private fun isProtectedProComicImage(url: String): Boolean =

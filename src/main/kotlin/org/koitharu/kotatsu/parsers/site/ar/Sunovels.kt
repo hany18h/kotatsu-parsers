@@ -29,6 +29,12 @@ internal class Sunovels(context: MangaLoaderContext) : PagedMangaParser(
 	override val filterCapabilities: MangaListFilterCapabilities
 		get() = MangaListFilterCapabilities(isSearchSupported = true)
 
+	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+		super.onCreateConfig(keys)
+		keys.add(userAgentKey)
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
+	}
+
 	private val chapterDateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSX", Locale.US)
 
 	init {
@@ -150,10 +156,7 @@ internal class Sunovels(context: MangaLoaderContext) : PagedMangaParser(
 
 	private suspend fun loadAllChapters(mangaUrl: String): List<MangaChapter> {
 		val firstDoc = webClient.httpGet("$mangaUrl?activeTab=chapters&page=0&sort=asc").parseHtml()
-		val totalPages = firstDoc.select(".pagination a[aria-label^=Page]")
-			.mapNotNull { Regex("""\d+""").find(it.attr("aria-label"))?.value?.toIntOrNull() }
-			.maxOrNull()
-			?: 1
+		val totalPages = findTotalChapterPages(firstDoc)
 		val result = ArrayList(parseChapters(firstDoc))
 		for (batch in (1 until totalPages).chunked(CHAPTER_PAGE_BATCH_SIZE)) {
 			val chapters = coroutineScope {
@@ -167,9 +170,6 @@ internal class Sunovels(context: MangaLoaderContext) : PagedMangaParser(
 				}.awaitAll()
 			}
 			chapters.flattenTo(result)
-			// Locked chapters are ordered after the public ones. Once a complete batch
-			// contains no readable chapters, later pages only repeat the paywalled range.
-			if (chapters.all { it.isEmpty() }) break
 		}
 		return result.distinctBy(MangaChapter::url).sortedBy(MangaChapter::number)
 	}
@@ -267,10 +267,41 @@ internal class Sunovels(context: MangaLoaderContext) : PagedMangaParser(
 		}
 	}
 
-	private companion object {
+	internal companion object {
 		const val CHAPTER_PAGE_BATCH_SIZE = 5
 		val ANTI_COPY_MARKER = Regex(
 			"""^[0-9a-fA-F]{12,64}\s*شمس الروايات\s*[0-9a-fA-F]{12,64}$""",
 		)
+
+		internal fun findTotalChapterPages(document: Document): Int {
+			val labelCount = document.select(".pagination a[aria-label]")
+				.mapNotNull { Regex("""\d+""").find(it.attr("aria-label"))?.value?.toIntOrNull() }
+				.maxOrNull()
+				?: 1
+			val hrefCount = document.select(".pagination a[href*=page]")
+				.mapNotNull { anchor ->
+					Regex("""(?:[?&]|&amp;)page=(\d+)""")
+						.find(anchor.attr("href"))
+						?.groupValues
+						?.getOrNull(1)
+						?.toIntOrNull()
+						?.plus(1)
+				}
+				.maxOrNull()
+				?: 1
+			val payloadCount = document.select("script")
+				.asSequence()
+				.map { it.data() }
+				.mapNotNull { script ->
+					Regex("""\\"totalPages\\":(\d+)""")
+						.find(script)
+						?.groupValues
+						?.getOrNull(1)
+						?.toIntOrNull()
+				}
+				.maxOrNull()
+				?: 1
+			return maxOf(1, labelCount, hrefCount, payloadCount)
+		}
 	}
 }

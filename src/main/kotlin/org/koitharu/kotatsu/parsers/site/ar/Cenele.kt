@@ -34,6 +34,12 @@ internal class Cenele(context: MangaLoaderContext) :
 			isSearchSupported = true,
 		)
 
+	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+		super.onCreateConfig(keys)
+		keys.add(userAgentKey)
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
+	}
+
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
 		availableTags = fetchAvailableTags(),
 		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED),
@@ -300,42 +306,7 @@ internal class Cenele(context: MangaLoaderContext) :
 			".reading-content.current div.text-left, div.text-left, .reading-content.current",
 		) ?: return null
 
-		// Cenele inserts an anti-copy paragraph after each marker. CSS hides it in a browser,
-		// but a native novel reader would otherwise display it between every real paragraph.
-		content.select("template[data-nhv-rb] + p").remove()
-		content.select("template[data-nhv-rb], template").remove()
-		content.select("p, span, div").forEach { element ->
-			val text = element.ownText().trim()
-			if (
-				text.contains("هذا تنبيه من موقع فضاء الروايات") &&
-				text.contains("cenele.com")
-			) {
-				element.remove()
-			}
-		}
-
-		// إزالة كل العناصر المخفية (حماية الموقع من السرقة بـ spans/paragraphs مع aria-hidden)
-		content.select(
-			"span[aria-hidden=true], " +
-				"p[aria-hidden=true], " +
-				"span[role=presentation], " +
-				"p[role=presentation], " +
-				"input[type=hidden], [hidden], .d-none, " +
-				"[style*=\"display:none\"], [style*=\"display: none\"], " +
-				"[style*=\"visibility:hidden\"], [style*=\"visibility: hidden\"], " +
-				"script, style, ins, iframe, noscript, template, " +
-				".adsbygoogle, .google-auto-placed, " +
-				"[id^=ezoic], [id^=pf-], [id^=bg-ssp]",
-		).remove()
-
-		content.select("img").forEach { image ->
-			promoteLazyImageSource(image)
-		}
-
-		// إزالة الفقرات الفارغة
-		content.select("p").forEach { p ->
-			if (p.text().trim().isEmpty()) p.remove()
-		}
+		sanitizeChapterContent(content)
 
 		// عنوان الفصل
 		val title = doc.selectFirst("h3.chapter-name")?.text()?.trim()
@@ -361,12 +332,65 @@ internal class Cenele(context: MangaLoaderContext) :
 		)
 	}
 
-	private fun promoteLazyImageSource(image: Element) {
-		if (image.attr("src").isNotBlank() && !image.attr("src").startsWith("data:")) return
-		for (attribute in arrayOf("data-src", "data-lazy-src", "data-original", "data-url")) {
-			val value = image.attr(attribute).trim()
-			if (value.isNotEmpty()) {
+	internal companion object {
+
+		private val ZERO_WIDTH_MARKS = Regex("[\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\uFEFF]")
+
+		internal fun sanitizeChapterContent(content: Element): Element {
+			// Do not remove every paragraph following the bait marker: Cenele uses
+			// more than one layout and, in one of them, the real paragraph follows
+			// the marker. Remove only nodes whose normalized text is actually bait.
+			content.select("p, span, div").forEach { element ->
+				if (isAntiCopyText(element.text())) {
+					element.remove()
+				}
+			}
+			content.select(
+				"span[aria-hidden=true], " +
+					"p[aria-hidden=true], " +
+					"span[role=presentation], " +
+					"p[role=presentation], " +
+					"input[type=hidden], [hidden], .d-none, " +
+					"[style*=\"display:none\"], [style*=\"display: none\"], " +
+					"[style*=\"visibility:hidden\"], [style*=\"visibility: hidden\"], " +
+					"script, style, ins, iframe, noscript, template, " +
+					".adsbygoogle, .google-auto-placed, " +
+					"[id^=ezoic], [id^=pf-], [id^=bg-ssp]",
+			).remove()
+			content.select("img").forEach(::promoteLazyImageSource)
+			content.select("p").forEach { paragraph ->
+				if (paragraph.text().trim().isEmpty() && paragraph.selectFirst("img") == null) {
+					paragraph.remove()
+				}
+			}
+			return content
+		}
+
+		internal fun isAntiCopyText(value: String): Boolean {
+			val normalized = ZERO_WIDTH_MARKS.replace(value, "")
+				.replace(Regex("\\s+"), " ")
+				.trim()
+				.lowercase(Locale.ROOT)
+			if ("فضاء الروايات" !in normalized && "cenele.com" !in normalized) return false
+			return "نص تمويهي" in normalized ||
+				"هذا تنبيه" in normalized ||
+				"تطبيق سارق" in normalized ||
+				"المصدر مسروق" in normalized
+		}
+
+		private fun promoteLazyImageSource(image: Element) {
+			val current = image.attr("src").trim()
+			if (current.isNotEmpty() && !current.startsWith("data:", true) && current != "#") return
+			for (attribute in arrayOf("data-src", "data-lazy-src", "data-original", "data-url")) {
+				val value = image.attr(attribute).trim()
+				.takeIf { it.isNotEmpty() && !it.startsWith("data:", true) }
+				?: continue
 				image.attr("src", value)
+					.removeAttr("srcset")
+					.removeAttr("data-src")
+					.removeAttr("data-lazy-src")
+					.removeAttr("data-original")
+					.removeAttr("data-url")
 				return
 			}
 		}
