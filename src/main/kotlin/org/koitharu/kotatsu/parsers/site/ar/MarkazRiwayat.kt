@@ -1,5 +1,8 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import okhttp3.Headers
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Element
@@ -41,6 +44,11 @@ internal class MarkazRiwayat(context: MangaLoaderContext) : PagedMangaParser(
 	searchPageSize = PAGE_SIZE,
 ) {
 
+	private val sessionMutex = Mutex()
+
+	@Volatile
+	private var isSiteSessionReady = false
+
 	override val configKeyDomain = ConfigKey.Domain("markazriwayat.com")
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
@@ -58,10 +66,12 @@ internal class MarkazRiwayat(context: MangaLoaderContext) : PagedMangaParser(
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions {
-		val response = webClient.httpGet("$REST_BASE/filters").parseJson()
+		ensureSiteSession()
+		val response = webClient.httpGet("$REST_BASE/filters", requestHeaders()).parseJson()
 		val tags = parseFilterTags(response.optJSONArray("genres"))
 		return MangaListFilterOptions(
 			availableTags = tags,
@@ -74,6 +84,7 @@ internal class MarkazRiwayat(context: MangaLoaderContext) : PagedMangaParser(
 		order: SortOrder,
 		filter: MangaListFilter,
 	): List<Manga> {
+		ensureSiteSession()
 		val url = buildString {
 			append(REST_BASE)
 			append("/library?page=")
@@ -98,7 +109,7 @@ internal class MarkazRiwayat(context: MangaLoaderContext) : PagedMangaParser(
 				else -> Unit
 			}
 		}
-		val items = webClient.httpGet(url).parseJson().optJSONArray("items") ?: return emptyList()
+		val items = webClient.httpGet(url, requestHeaders()).parseJson().optJSONArray("items") ?: return emptyList()
 		return buildList {
 			for (index in 0 until items.length()) {
 				items.optJSONObject(index)?.let(::parseLibraryItem)?.let(::add)
@@ -108,7 +119,7 @@ internal class MarkazRiwayat(context: MangaLoaderContext) : PagedMangaParser(
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val mangaId = manga.url.substringAfterLast('/').toIntOrNull() ?: return manga
-		val document = webClient.httpGet(manga.publicUrl).parseHtml()
+		val document = webClient.httpGet(manga.publicUrl, requestHeaders()).parseHtml()
 		val cover = document.selectFirst(".manga-cover-wrap > img")
 			?.let(::promoteLazyImage)
 			?: document.selectFirst("meta[property=og:image]")?.attr("content")
@@ -149,7 +160,7 @@ internal class MarkazRiwayat(context: MangaLoaderContext) : PagedMangaParser(
 
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
-		val document = webClient.httpGet(chapterUrl).parseHtml()
+		val document = webClient.httpGet(chapterUrl, requestHeaders(chapterUrl)).parseHtml()
 		val content = document.selectFirst(".reading-content .text-right")
 			?: document.selectFirst(".reading-content")
 			?: return null
@@ -175,6 +186,7 @@ internal class MarkazRiwayat(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	private suspend fun loadAllChapters(mangaId: Int): List<MangaChapter> {
+		ensureSiteSession()
 		val result = ArrayList<MangaChapter>()
 		var page = 1
 		var hasMore = false
@@ -182,6 +194,7 @@ internal class MarkazRiwayat(context: MangaLoaderContext) : PagedMangaParser(
 			val response = webClient.httpGet(
 				"$REST_BASE/manga-chapters?manga_id=$mangaId&page=$page" +
 					"&per_page=$CHAPTER_PAGE_SIZE&order=asc",
+				requestHeaders(),
 			).parseJson()
 			val items = response.optJSONArray("items") ?: break
 			for (index in 0 until items.length()) {
@@ -284,6 +297,44 @@ internal class MarkazRiwayat(context: MangaLoaderContext) : PagedMangaParser(
 	private fun formatNumber(number: Float): String =
 		if (number % 1f == 0f) number.toInt().toString() else number.toString()
 
+	private suspend fun ensureSiteSession() {
+		if (isSiteSessionReady) return
+		sessionMutex.withLock {
+			if (isSiteSessionReady) return@withLock
+			// Cloudflare may allow a normal document navigation while rejecting a
+			// cold OkHttp request made directly to wp-json. Opening the public
+			// library first also gives the app's Cloudflare resolver a real HTML
+			// page on which it can complete a managed challenge and persist the
+			// resulting cookies before the REST request is retried.
+			webClient.httpGet(
+				"https://$domain/library/",
+				browserHeaders(),
+			).parseHtml()
+			isSiteSessionReady = true
+		}
+	}
+
+	private fun browserHeaders(): Headers = Headers.Builder()
+		.add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+		.add("Accept-Language", "ar,en-US;q=0.8,en;q=0.7")
+		.add("Sec-Fetch-Dest", "document")
+		.add("Sec-Fetch-Mode", "navigate")
+		.add("Sec-Fetch-Site", "none")
+		.add("Upgrade-Insecure-Requests", "1")
+		.add("User-Agent", config[userAgentKey])
+		.build()
+
+	private fun requestHeaders(referer: String = "https://$domain/library/"): Headers = Headers.Builder()
+		.add("Accept", "application/json, text/plain, */*")
+		.add("Accept-Language", "ar,en-US;q=0.8,en;q=0.7")
+		.add("Origin", "https://$domain")
+		.add("Referer", referer)
+		.add("Sec-Fetch-Dest", "empty")
+		.add("Sec-Fetch-Mode", "cors")
+		.add("Sec-Fetch-Site", "same-origin")
+		.add("User-Agent", config[userAgentKey])
+		.build()
+
 	internal companion object {
 		const val PAGE_SIZE = 24
 		const val CHAPTER_PAGE_SIZE = 200
@@ -296,7 +347,9 @@ internal class MarkazRiwayat(context: MangaLoaderContext) : PagedMangaParser(
 
 		fun sanitizeChapterContent(content: Element): Element {
 			content.select(
-				"script, style, iframe, noscript, form, input, button, svg, canvas, " +
+				"script, style, iframe, noscript, form, input, select, option, textarea, button, label, svg, canvas, " +
+					"[class*=donat], [id*=donat], [class*=support], [id*=support], " +
+					"[class*=paypal], [id*=paypal], [class*=vip], [id*=vip], " +
 					".theam-chobf, [data-theam-chobf], [hidden], [aria-hidden=true]",
 			).remove()
 			content.select("img").forEach { promoteLazyImage(it) }
