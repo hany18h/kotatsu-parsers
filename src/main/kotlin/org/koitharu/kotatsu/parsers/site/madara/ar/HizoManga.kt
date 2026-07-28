@@ -73,6 +73,10 @@ internal class HizoManga(context: MangaLoaderContext) :
 		parseHizoChapters(doc)
 
 	override suspend fun loadChapters(mangaUrl: String, document: Document): List<MangaChapter> {
+		// Current Hizo detail pages already contain the complete chapter list.
+		// Prefer it so devices with stricter redirect/cookie handling never enter
+		// a WordPress AJAX redirect loop. Keep AJAX only for older/partial pages.
+		parseHizoChapters(document).takeIf(List<MangaChapter>::isNotEmpty)?.let { return it }
 		val url = mangaUrl.toAbsoluteUrl(domain).trimEnd('/') + "/ajax/chapters/"
 		val chapterDocument = runCatching {
 			webClient.httpPost(url, emptyMap()).parseHtml()
