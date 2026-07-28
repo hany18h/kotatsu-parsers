@@ -1,5 +1,5 @@
 plugins {
-    `kotlin-dsl`
+    alias(libs.plugins.kotlin.jvm)
 }
 
 repositories {
@@ -11,6 +11,7 @@ kotlin {
 }
 
 dependencies {
+    implementation(gradleApi())
     implementation(libs.korte)
     implementation(libs.simplexml)
     implementation(libs.kotlinx.coroutines.core)
