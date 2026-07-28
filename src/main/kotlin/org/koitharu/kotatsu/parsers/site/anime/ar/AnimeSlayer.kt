@@ -236,35 +236,53 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		val candidates = when {
 			isDirectMediaUrl(serverUrl) -> listOf(serverUrl)
 			serverUrl.contains("a-reslayer.com", ignoreCase = true) -> {
-				val raw = webClient.httpGet(
-					serverUrl.replace("\\", "%5C"),
-					pageHeaders("https://anslayer.com/"),
-				).parseRaw()
-				parseAlternativeLinks(raw)
+				loadAlternativeLinks(serverUrl)
 			}
 			else -> extractPageLinks(serverUrl, "https://anslayer.com/")
 		}
 
 		return buildList {
 			for (candidate in candidates) {
-				when {
-					candidate.contains("mediafire.com", ignoreCase = true) -> {
-						resolveMediaFire(candidate, serverName)?.let(::add)
-					}
-					candidate.contains("streamtape.", ignoreCase = true) -> {
-						resolveStreamTape(candidate, serverName)?.let(::add)
-					}
-					isDirectMediaUrl(candidate) || candidate.contains("/get_video?", ignoreCase = true) -> {
-						add(createStream(serverName, candidate, serverUrl))
-					}
-					else -> {
-						extractPageLinks(candidate, serverUrl).forEach { direct ->
-							add(createStream(serverName, direct, candidate))
+				// One blocked provider must not discard all remaining servers.
+				// MediaFire, in particular, can be unavailable on one network while
+				// StreamTape from the same response is still playable.
+				addAll(
+					runCatching {
+						when {
+							candidate.contains("mediafire.com", ignoreCase = true) -> {
+								listOfNotNull(resolveMediaFire(candidate, serverName))
+							}
+							candidate.contains("streamtape.", ignoreCase = true) -> {
+								listOfNotNull(resolveStreamTape(candidate, serverName))
+							}
+							isDirectMediaUrl(candidate) ||
+								candidate.contains("/get_video?", ignoreCase = true) -> {
+								listOf(createStream(serverName, candidate, serverUrl))
+							}
+							else -> {
+								extractPageLinks(candidate, serverUrl).map { direct ->
+									createStream(serverName, direct, candidate)
+								}
+							}
 						}
-					}
-				}
+					}.getOrDefault(emptyList()),
+				)
 			}
 		}
+	}
+
+	private suspend fun loadAlternativeLinks(serverUrl: String): List<String> {
+		for (requestUrl in alternativeEndpointCandidates(serverUrl)) {
+			val raw = runCatching {
+				webClient.httpGet(
+					requestUrl,
+					pageHeaders("https://anslayer.com/"),
+				).parseRaw()
+			}.getOrNull() ?: continue
+			val links = parseAlternativeLinks(raw)
+			if (links.isNotEmpty()) return links
+		}
+		return emptyList()
 	}
 
 	private suspend fun resolveMediaFire(url: String, serverName: String): AnimeStream? {
@@ -307,6 +325,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 
 	private fun pageHeaders(referer: String): Headers = Headers.Builder()
 		.add("Accept", "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8")
+		.add("Accept-Language", "ar,en-US;q=0.8,en;q=0.7")
 		.add("Referer", referer)
 		.add("User-Agent", config[userAgentKey])
 		.build()
@@ -362,17 +381,43 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			"""(?:robotlink|norobotlink)[^=]{0,100}=\s*["']([^"']+)["']""",
 			setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
 		)
+		val ABSOLUTE_URL = Regex(
+			"""(?:(?:https?:)?//)[^\s"'<>\\]+""",
+			RegexOption.IGNORE_CASE,
+		)
+
+		fun alternativeEndpointCandidates(serverUrl: String): List<String> = buildList {
+			add(serverUrl.replace("\\", "%5C"))
+			add(serverUrl.replace("\\", "/"))
+			add(serverUrl)
+		}.distinct()
 
 		fun parseAlternativeLinks(raw: String): List<String> {
-			val array = runCatching { JSONArray(raw.trim()) }.getOrNull() ?: return emptyList()
-			return buildList {
-				for (index in 0 until array.length()) {
-					array.optString(index).takeIf {
-						it.startsWith("https://") || it.startsWith("http://") || it.startsWith("//")
-					}?.let(::add)
+			val decoded = Parser.unescapeEntities(raw, false)
+				.replace("\\/", "/")
+				.replace("\\u0026", "&", ignoreCase = true)
+			val fromJson = runCatching { JSONArray(decoded.trim()) }.getOrNull()?.let { array ->
+				buildList {
+					for (index in 0 until array.length()) {
+						when (val value = array.opt(index)) {
+							is String -> value.takeIf(::isWebUrl)?.let(::add)
+							is JSONObject -> value.keys().forEach { key ->
+								value.optString(key).takeIf(::isWebUrl)?.let(::add)
+							}
+						}
+					}
 				}
-			}.distinct()
+			}.orEmpty()
+			if (fromJson.isNotEmpty()) return fromJson.distinct()
+			return ABSOLUTE_URL.findAll(decoded)
+				.map { it.value.trimEnd('\\', '"', '\'', ')', ']') }
+				.filter(::isWebUrl)
+				.distinct()
+				.toList()
 		}
+
+		private fun isWebUrl(value: String): Boolean =
+			value.startsWith("https://") || value.startsWith("http://") || value.startsWith("//")
 
 		fun extractMediaFireDirectUrl(document: Document): String? =
 			document.selectFirst("#downloadButton[href]")?.attr("href")
