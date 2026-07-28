@@ -8,20 +8,23 @@ import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.model.ContentType
 import org.koitharu.kotatsu.parsers.model.Manga
 import org.koitharu.kotatsu.parsers.model.MangaChapter
+import org.koitharu.kotatsu.parsers.model.MangaListFilter
 import org.koitharu.kotatsu.parsers.model.MangaPage
 import org.koitharu.kotatsu.parsers.model.MangaParserSource
 import org.koitharu.kotatsu.parsers.model.NovelChapterContent
 import org.koitharu.kotatsu.parsers.model.NovelImage
+import org.koitharu.kotatsu.parsers.model.SortOrder
 import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 import org.koitharu.kotatsu.parsers.util.attrAsRelativeUrlOrNull
 import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.src
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
+import org.koitharu.kotatsu.parsers.util.urlEncoded
 
 @MangaSourceParser("HIZOMANGA", "Hizo Manga", "ar", ContentType.NOVEL)
 internal class HizoManga(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.HIZOMANGA, "hizomanga.net", pageSize = 12) {
+	MadaraParser(context, MangaParserSource.HIZOMANGA, "hizomanga.net", pageSize = 10) {
 
 	override val stylePage = ""
 	override val datePattern = "yyyy-MM-dd"
@@ -29,6 +32,41 @@ internal class HizoManga(context: MangaLoaderContext) :
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
+	}
+
+	override suspend fun getListPage(
+		page: Int,
+		order: SortOrder,
+		filter: MangaListFilter,
+	): List<Manga> {
+		val pageNumber = page.coerceAtLeast(1)
+		val query = filter.query?.trim()
+		val url = if (query.isNullOrEmpty()) {
+			buildString {
+				append("https://$domain/series/")
+				if (pageNumber > 1) {
+					clear()
+					append("https://$domain/series/page/$pageNumber/")
+				}
+				append("?m_orderby=")
+				append(
+					when (order) {
+						SortOrder.POPULARITY -> "views"
+						SortOrder.NEWEST -> "new-manga"
+						SortOrder.ALPHABETICAL -> "alphabet"
+						SortOrder.RATING -> "rating"
+						else -> "latest"
+					},
+				)
+			}
+		} else {
+			buildString {
+				append("https://$domain")
+				if (pageNumber > 1) append("/page/$pageNumber")
+				append("/?s=${query.urlEncoded()}&post_type=wp-manga")
+			}
+		}
+		return parseMangaList(webClient.httpGet(url).parseHtml())
 	}
 
 	override suspend fun getChapters(manga: Manga, doc: Document): List<MangaChapter> =
@@ -104,6 +142,9 @@ internal class HizoManga(context: MangaLoaderContext) :
 	internal companion object {
 
 		private val NUMBER = Regex("""\d+(?:\.\d+)?""")
+
+		internal fun countCurrentListingCards(document: Document): Int =
+			document.select("div.page-item-detail").size
 
 		internal fun sanitizeHizoChapterContent(content: Element): Element {
 			content.select(
