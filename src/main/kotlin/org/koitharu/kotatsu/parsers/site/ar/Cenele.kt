@@ -338,9 +338,19 @@ internal class Cenele(context: MangaLoaderContext) :
 
 		internal fun sanitizeChapterContent(content: Element): Element {
 			// Cenele injects the anti-copy span inside the same <p> as the real text.
-			// Remove hidden descendants first; checking the parent before this would
-			// classify the complete real paragraph (or even the whole chapter div)
-			// as bait and delete it.
+			// Remove the marker's following bait paragraph before deleting generic
+			// templates. This keeps the relationship intact even if the warning text
+			// changes while still preserving the surrounding real paragraphs.
+			content.select("template[data-nhv-rb]").forEach { marker ->
+				val bait = marker.nextElementSibling()
+					?.takeIf { it.tagName() == "p" && isAntiCopyText(it.text()) }
+				bait?.remove()
+				marker.remove()
+			}
+
+			// Remove hidden descendants before examining visible paragraphs; checking
+			// a parent's full text first would include the injected hidden watermark
+			// and could classify a complete real paragraph as bait.
 			content.select(
 				"span[aria-hidden=true], " +
 					"p[aria-hidden=true], " +
@@ -353,14 +363,14 @@ internal class Cenele(context: MangaLoaderContext) :
 					".adsbygoogle, .google-auto-placed, " +
 					"[id^=ezoic], [id^=pf-], [id^=bg-ssp]",
 			).remove()
-			content.select("template[data-nhv-rb]").forEach { marker ->
-				val bait = marker.nextElementSibling()
-				?.takeIf { it.tagName() == "p" && isAntiCopyText(it.text()) }
-			bait?.remove()
-				marker.remove()
-			}
+
+			// Use ownText first so a future unrecognised hidden child cannot cause a
+			// real paragraph to be deleted together with the watermark.
 			content.select("p, span").forEach { element ->
-				if (isAntiCopyText(element.text())) {
+				if (
+					isAntiCopyText(element.ownText()) ||
+					(element.children().isEmpty() && isAntiCopyText(element.text()))
+				) {
 					element.remove()
 				}
 			}
