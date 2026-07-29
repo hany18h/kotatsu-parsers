@@ -34,7 +34,7 @@ internal class MangaMelloTest {
 				"https://img.example.org/2.jpg",
 				"https://api.mangamello.com/storage/3.png",
 			),
-			MangaMelloParser.extractImageUrls(json, "https://api.mangamello.com/v1/"),
+			MangaMelloPlus.extractImageUrls(json, "https://api.mangamello.com/v1/"),
 		)
 	}
 
@@ -42,20 +42,48 @@ internal class MangaMelloTest {
 	fun `normalizes escaped and protocol relative image urls`() {
 		assertEquals(
 			"https://cdn.example.org/page.webp?x=1&y=2",
-			MangaMelloParser.normalizeImageUrl(
+			MangaMelloPlus.normalizeImageUrl(
 				"https:\\/\\/cdn.example.org\\/page.webp?x=1\\u0026y=2",
 				"https://api.mangamello.com/v1/",
 			),
 		)
 		assertEquals(
 			"https://cdn.example.org/page.jpg",
-			MangaMelloParser.normalizeImageUrl("//cdn.example.org/page.jpg", "https://api.mangamello.com/v1/"),
+			MangaMelloPlus.normalizeImageUrl("//cdn.example.org/page.jpg", "https://api.mangamello.com/v1/"),
 		)
 	}
 
 	@Test
+	fun `rewrites retired lekmanga image hosts`() {
+		assertEquals(
+			"https://s2storm.lekmanga.site/manga/arb12/data/chapter/image-01.jpg",
+			MangaMelloPlus.normalizeImageUrl(
+				"https://s2lekmangas.lekmanga.site/manga/arb12/data/chapter/image-01.jpg",
+				"https://plus.mangamello.com/api/v1/",
+			),
+		)
+		assertEquals(
+			"https://s17storm.lekmanga.site/manga/arb1/data/chapter/page.webp?width=1200",
+			MangaMelloPlus.rewriteLegacyImageUrl(
+				"https://s17lekmangas.lekmanga.site/manga/arb1/data/chapter/page.webp?width=1200",
+			),
+		)
+	}
+
+	@Test
+	fun `keeps current image hosts unchanged`() {
+		val currentLekMangaUrl =
+			"https://s3storm.lekmanga.site/manga/arb13/data/chapter/image-1.jpg"
+		val olympusUrl =
+			"https://olympustaff.com/uploads/manga_7d771/0/page.webp"
+
+		assertEquals(currentLekMangaUrl, MangaMelloPlus.rewriteLegacyImageUrl(currentLekMangaUrl))
+		assertEquals(olympusUrl, MangaMelloPlus.rewriteLegacyImageUrl(olympusUrl))
+	}
+
+	@Test
 	fun `search path omits sort parameters rejected by plus api`() {
-		val path = MangaMelloParser.buildListPath(
+		val path = MangaMelloPlus.buildListPath(
 			page = 1,
 			order = SortOrder.UPDATED,
 			query = "the",

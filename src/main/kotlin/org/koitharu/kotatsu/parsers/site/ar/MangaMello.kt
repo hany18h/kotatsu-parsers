@@ -74,6 +74,7 @@ internal class MangaMelloPlus(context: MangaLoaderContext) :
 		val request = chain.request()
 		val host = request.url.host.lowercase(Locale.US)
 		if (host in API_HOSTS || request.header("app_version") != null) return chain.proceed(request)
+		val rewrittenUrl = rewriteLegacyImageUrl(request.url.toString())
 
 		val referer = when {
 			"lekmanga" in host -> "https://www.lekmanga.com/"
@@ -83,6 +84,7 @@ internal class MangaMelloPlus(context: MangaLoaderContext) :
 		}
 		return chain.proceed(
 			request.newBuilder()
+				.url(rewrittenUrl)
 				.header("Referer", referer)
 				.header("Origin", referer.trimEnd('/'))
 				.header("User-Agent", IMAGE_USER_AGENT)
@@ -373,12 +375,24 @@ internal class MangaMelloPlus(context: MangaLoaderContext) :
 				?: return null
 			if (cleaned.startsWith("data:", ignoreCase = true)) return null
 			return runCatching {
-				when {
+				val resolved = when {
 					cleaned.startsWith("//") -> "https:$cleaned"
 					cleaned.startsWith("http://", true) || cleaned.startsWith("https://", true) -> cleaned
 					else -> URI(baseUrl).resolve(cleaned).toString()
 				}
+				rewriteLegacyImageUrl(resolved)
 			}.getOrNull()
 		}
+
+		internal fun rewriteLegacyImageUrl(url: String): String {
+			val host = runCatching { URI(url).host }.getOrNull()
+				?.lowercase(Locale.US)
+				?: return url
+			val match = LEGACY_LEKMANGA_HOST.matchEntire(host) ?: return url
+			val currentHost = "s${match.groupValues[1]}storm.lekmanga.site"
+			return url.replaceFirst(host, currentHost, ignoreCase = true)
+		}
+
+		private val LEGACY_LEKMANGA_HOST = Regex("""s(\d+)lekmangas\.lekmanga\.site""")
 	}
 }
