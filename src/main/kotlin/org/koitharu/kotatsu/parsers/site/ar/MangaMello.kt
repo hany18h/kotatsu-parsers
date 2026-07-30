@@ -385,14 +385,29 @@ internal class MangaMelloPlus(context: MangaLoaderContext) :
 		}
 
 		internal fun rewriteLegacyImageUrl(url: String): String {
-			val host = runCatching { URI(url).host }.getOrNull()
+			val uri = runCatching { URI(url) }.getOrNull() ?: return url
+			val host = uri.host
 				?.lowercase(Locale.US)
 				?: return url
+			if (host == TEMP_LEKMANGA_HOST) {
+				val shard = TEMP_LEKMANGA_PATH.find(uri.path)
+					?.groupValues
+					?.getOrNull(1)
+					?.takeIf(String::isNotBlank)
+					?: return url
+				return url.replaceFirst(
+					host,
+					"s${shard}storm.lekmanga.site",
+					ignoreCase = true,
+				)
+			}
 			val match = LEGACY_LEKMANGA_HOST.matchEntire(host) ?: return url
 			val currentHost = "s${match.groupValues[1]}storm.lekmanga.site"
 			return url.replaceFirst(host, currentHost, ignoreCase = true)
 		}
 
+		private const val TEMP_LEKMANGA_HOST = "tempstorm.lekmanga.site"
+		private val TEMP_LEKMANGA_PATH = Regex("""^/manga/arb1(\d+)/""", RegexOption.IGNORE_CASE)
 		private val LEGACY_LEKMANGA_HOST = Regex("""s(\d+)lekmangas\.lekmanga\.site""")
 	}
 }
