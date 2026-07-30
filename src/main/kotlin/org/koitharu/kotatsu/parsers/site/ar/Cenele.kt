@@ -1,5 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
+import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -230,9 +232,13 @@ internal class Cenele(context: MangaLoaderContext) :
 	}
 
 	private suspend fun loadChapters(mangaUrl: String, doc: Document): List<MangaChapter> {
+		val mangaId = doc.selectFirst("[data-manga-id]")?.attr("data-manga-id")
+			?.takeIf(String::isNotBlank)
+			?: doc.selectFirst("#manga-chapters-holder")?.attr("data-id")?.takeIf(String::isNotBlank)
+
 		// أولاً جرب inline chapters
 		val inline = doc.select("ul.main li.wp-manga-chapter")
-		if (inline.isNotEmpty()) return parseChapterElements(inline)
+		if (inline.isNotEmpty()) return parseChapterElements(inline, mangaId)
 
 		// ثم جرب ajax/chapters/ (الطريقة الأحدث في Madara)
 		val ajaxDoc = runCatching {
@@ -242,19 +248,27 @@ internal class Cenele(context: MangaLoaderContext) :
 
 		if (ajaxDoc != null) {
 			val items = ajaxDoc.select("ul.main li.wp-manga-chapter")
-			if (items.isNotEmpty()) return parseChapterElements(items)
+			if (items.isNotEmpty()) {
+				val ajaxMangaId = ajaxDoc.selectFirst("[data-manga-id]")?.attr("data-manga-id")
+					?.takeIf(String::isNotBlank)
+					?: mangaId
+				return parseChapterElements(items, ajaxMangaId)
+			}
 		}
 
 		// أخيراً جرب admin-ajax.php
-		val mangaId = doc.selectFirst("#manga-chapters-holder")?.attr("data-id") ?: return emptyList()
+		if (mangaId == null) return emptyList()
 		val adminDoc = webClient.httpPost(
 			"https://$domain/wp-admin/admin-ajax.php",
 			mapOf("action" to "manga_get_chapters", "manga" to mangaId),
 		).parseHtml()
-		return parseChapterElements(adminDoc.select("ul.main li.wp-manga-chapter"))
+		return parseChapterElements(adminDoc.select("ul.main li.wp-manga-chapter"), mangaId)
 	}
 
-	private fun parseChapterElements(elements: org.jsoup.select.Elements): List<MangaChapter> {
+	private fun parseChapterElements(
+		elements: org.jsoup.select.Elements,
+		mangaId: String?,
+	): List<MangaChapter> {
 		val dateFormat = SimpleDateFormat("MMMM dd, yyyy", Locale("ar"))
 		val dateFormatEn = SimpleDateFormat("MMMM dd, yyyy", Locale.ENGLISH)
 		val dateFormatShort = SimpleDateFormat("MMM dd, yyyy", Locale.ENGLISH)
@@ -263,6 +277,8 @@ internal class Cenele(context: MangaLoaderContext) :
 			val a = li.selectFirst("a") ?: return@mapIndexedNotNull null
 			// نأخذ href النظيف بدون ?style=list
 			val href = a.attrAsRelativeUrlOrNull("href") ?: return@mapIndexedNotNull null
+			val chapterId = li.attr("data-chapter-id").takeIf(String::isNotBlank)
+			val parserUrl = attachCeneleChapterLocator(href, mangaId, chapterId)
 			val chapterName = a.text().trim()
 			val dateText = li.selectFirst(".chapter-release-date i, .chapter-release-date")
 				?.text()?.trim().orEmpty()
@@ -282,7 +298,7 @@ internal class Cenele(context: MangaLoaderContext) :
 				title = chapterName,
 				number = number,
 				volume = 0,
-				url = href, // بدون ?style=list
+				url = parserUrl,
 				scanlator = null,
 				uploadDate = uploadDate,
 				branch = null,
@@ -296,15 +312,17 @@ internal class Cenele(context: MangaLoaderContext) :
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		// نضمن إزالة ?style=list من أي URL قديم مخزن
 		val cleanUrl = chapter.url
+			.substringBefore('#')
 			.replace("?style=list", "")
 			.replace("&style=list", "")
 			.toAbsoluteUrl(domain)
 
 		val doc = webClient.httpGet(cleanUrl).parseHtml()
-
-		val content = doc.selectFirst(
-			".reading-content.current div.text-left, div.text-left, .reading-content.current",
-		) ?: return null
+		val locator = parseCeneleChapterLocator(chapter.url)
+		val content = locator?.let {
+			loadChapterViaAjax(doc, cleanUrl, it)
+		} ?: findDirectChapterContent(doc, locator)
+		?: return null
 
 		sanitizeChapterContent(content)
 
@@ -332,9 +350,48 @@ internal class Cenele(context: MangaLoaderContext) :
 		)
 	}
 
+	private suspend fun loadChapterViaAjax(
+		doc: Document,
+		referer: String,
+		locator: CeneleChapterLocator,
+	): Element? {
+		val scripts = doc.select("script").joinToString("\n") { it.data() }
+		val nonce = LOAD_NONCE.find(scripts)?.groupValues?.getOrNull(1)
+			?.takeIf(String::isNotBlank)
+			?: return null
+		return runCatching {
+			webClient.httpPost(
+				"https://$domain/wp-admin/admin-ajax.php".toHttpUrl(),
+				mapOf(
+					"action" to "load_chapter",
+					"manga_id" to locator.mangaId,
+					"chapter_id" to locator.chapterId,
+					"nonce" to nonce,
+				),
+				Headers.Builder()
+					.add("Accept", "text/html, */*;q=0.8")
+					.add("Referer", referer)
+					.add("X-Requested-With", "XMLHttpRequest")
+					.add("User-Agent", config[userAgentKey])
+					.build(),
+			).parseHtml().selectFirst("div.text-left")
+		}.getOrNull()
+	}
+
 	internal companion object {
 
 		private val ZERO_WIDTH_MARKS = Regex("[\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\uFEFF]")
+		private val LOAD_NONCE = Regex("""["']load_nonce["']\s*:\s*["']([^"']+)""")
+
+		internal fun findDirectChapterContent(
+			doc: Document,
+			locator: CeneleChapterLocator?,
+		): Element? {
+			if (locator != null) {
+				return doc.selectFirst("#chapter-${locator.chapterId} div.text-left")
+			}
+			return doc.selectFirst("div.reading-content.current div.text-left")
+		}
 
 		internal fun sanitizeChapterContent(content: Element): Element {
 			// Cenele injects the anti-copy span inside the same <p> as the real text.
@@ -412,4 +469,26 @@ internal class Cenele(context: MangaLoaderContext) :
 			}
 		}
 	}
+}
+
+internal data class CeneleChapterLocator(
+	val mangaId: String,
+	val chapterId: String,
+)
+
+internal fun attachCeneleChapterLocator(
+	url: String,
+	mangaId: String?,
+	chapterId: String?,
+): String {
+	if (mangaId.isNullOrBlank() || chapterId.isNullOrBlank()) return url
+	return "${url.substringBefore('#')}#cenele=$mangaId:$chapterId"
+}
+
+internal fun parseCeneleChapterLocator(url: String): CeneleChapterLocator? {
+	val value = url.substringAfter("#cenele=", missingDelimiterValue = "")
+	if (value.isEmpty()) return null
+	val mangaId = value.substringBefore(':').takeIf(String::isNotBlank) ?: return null
+	val chapterId = value.substringAfter(':', missingDelimiterValue = "").takeIf(String::isNotBlank) ?: return null
+	return CeneleChapterLocator(mangaId, chapterId)
 }

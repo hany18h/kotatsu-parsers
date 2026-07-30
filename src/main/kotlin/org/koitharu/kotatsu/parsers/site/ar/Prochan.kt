@@ -4,6 +4,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONArray
@@ -52,9 +53,17 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	private val imageCdnHosts = setOf(
 		"app.procomic.net",
 		"app.procomic.pro",
+		"cdn1.procomic.net",
+		"cdn2.procomic.net",
+		"cdn3.procomic.net",
+		"cdn4.procomic.net",
 		"cdn2.procomic.pro",
 		"cdn3.procomic.pro",
 		"cdn4.procomic.pro",
+		"img1.procomic.net",
+		"img2.procomic.net",
+		"img3.procomic.net",
+		"img4.procomic.net",
 		"img1.procomic.pro",
 		"img2.procomic.pro",
 		"img3.procomic.pro",
@@ -76,10 +85,15 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val host = request.url.host
 		val isProcomicHost = host.contains("procomic") || host.contains("prochan")
 		val isImageCdnRequest = host in imageCdnHosts
+		val websiteOrigin = if (host == PROCOMIC_NET || host.endsWith(".$PROCOMIC_NET")) {
+			"https://$PROCOMIC_NET"
+		} else {
+			"https://$domain"
+		}
 
 		val newRequestBuilder = request.newBuilder()
-			.header("Referer", "https://procomic.pro/")
-			.header("Origin", "https://procomic.pro")
+			.header("Referer", "$websiteOrigin/")
+			.header("Origin", websiteOrigin)
 			.header("Accept-Language", "en-US,en;q=0.9,ar;q=0.8")
 			.header(
 				"User-Agent",
@@ -204,13 +218,14 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val coverUrl = getBestCover(item)
 		val status = item.optString("status", "")
 		val mangaUrl = "/series/$type/$id/$slug"
+		val contentDomain = getProChanContentDomain(item, domain)
 
 		return Manga(
 			id = generateUid(mangaUrl),
 			title = title,
 			altTitles = emptySet(),
 			url = mangaUrl,
-			publicUrl = "https://$domain$mangaUrl",
+			publicUrl = "https://$contentDomain$mangaUrl",
 			rating = RATING_UNKNOWN,
 			contentRating = if (item.optBoolean("isSensitiveImage")) {
 				ContentRating.ADULT
@@ -249,25 +264,52 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val parts = manga.url.split("/").filter { it.isNotEmpty() }
+		val publicUrl = manga.publicUrl.toHttpUrlOrNull()
+		val mangaPath = publicUrl?.encodedPath
+			?: manga.url.substringBefore('?').substringBefore('#')
+		val parts = mangaPath.split("/").filter { it.isNotEmpty() }
 		if (parts.size < 4) return manga
 		val id = parts[2]
+		val contentDomain = when {
+			manga.coverUrl?.contains(".$PROCOMIC_NET/", ignoreCase = true) == true -> PROCOMIC_NET
+			else -> publicUrl?.host ?: domain
+		}
 
-		val chaptersUrl = "https://$domain/api/public/chapters" +
-			"?contentId=$id&page=1&limit=2000&order=asc"
-
-		val chaptersJson = runCatching {
-			webClient.httpGet(chaptersUrl).parseJson()
+		val chaptersData = runCatching {
+			loadAllChapters(contentDomain, id)
 		}.getOrElse { return manga }
 
-		val chaptersData = chaptersJson.optJSONArray("chapters") ?: JSONArray()
-
 		return manga.copy(
-			chapters = parseChapters(chaptersData, manga.url),
+			chapters = parseChapters(chaptersData, mangaPath, contentDomain),
 		)
 	}
 
-	private fun parseChapters(data: JSONArray, mangaUrl: String): List<MangaChapter> {
+	private suspend fun loadAllChapters(contentDomain: String, contentId: String): JSONArray {
+		val result = JSONArray()
+		val seenIds = HashSet<Int>()
+		val seenPageSignatures = HashSet<String>()
+		var page = 1
+		while (page <= MAX_CHAPTER_PAGES) {
+			val chaptersUrl = "https://$contentDomain/api/public/chapters" +
+				"?contentId=$contentId&page=$page&limit=$CHAPTER_PAGE_SIZE&order=asc"
+			val response = webClient.httpGet(chaptersUrl).parseJson()
+			val chapters = response.optJSONArray("chapters") ?: break
+			if (chapters.length() == 0) break
+			val signature = (0 until chapters.length())
+				.joinToString(",") { index -> chapters.optJSONObject(index)?.optInt("id").toString() }
+			if (!seenPageSignatures.add(signature)) break
+			appendUniqueProChanChapters(result, chapters, seenIds)
+			if (!response.optBoolean("hasMore", chapters.length() >= CHAPTER_PAGE_SIZE)) break
+			page++
+		}
+		return result
+	}
+
+	private fun parseChapters(
+		data: JSONArray,
+		mangaPath: String,
+		contentDomain: String,
+	): List<MangaChapter> {
 		return filterAndSortProChanChapters(data).mapNotNull { item ->
 			val chapterId = item.optInt("id").takeIf { it > 0 } ?: return@mapNotNull null
 
@@ -289,10 +331,11 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 				dateFormat.parse(publishedAt)?.time ?: 0L
 			}.getOrDefault(0L)
 
-			val chapterUrl = "$mangaUrl/$chapterId/$chapterNumber"
+			val chapterPath = "${mangaPath.trimEnd('/')}/$chapterId/$chapterNumber"
+			val chapterUrl = "https://$contentDomain$chapterPath"
 
 			MangaChapter(
-				id = generateUid(chapterUrl),
+				id = generateUid(chapterPath),
 				title = title,
 				number = chapterNum,
 				volume = 0,
@@ -306,9 +349,11 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val parts = chapter.url.split("/").filter { it.isNotEmpty() }
+		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+		val parsedChapterUrl = chapterUrl.toHttpUrlOrNull() ?: return emptyList()
+		val parts = parsedChapterUrl.pathSegments
 		val chapterId = parts.getOrNull(4) ?: return emptyList()
-		val chapterUrl = "https://$domain${chapter.url}"
+		val contentDomain = parsedChapterUrl.host
 		val doc = webClient.httpGet(chapterUrl).parseHtml()
 
 		val pages = mutableListOf<MangaPage>()
@@ -363,7 +408,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		val splitIndex = splitPattern.find(allText)?.groupValues?.get(1) ?: "3"
 
 		if (!token.isNullOrEmpty()) {
-			val deferredUrl = "https://$domain/chapter-deferred-media/$chapterId" +
+			val deferredUrl = "https://$contentDomain/chapter-deferred-media/$chapterId" +
 				"?token=$token&split=$splitIndex"
 
 			val deferredData = runCatching {
@@ -374,7 +419,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 				for (i in 0 until images.length()) {
 					val imgUrl = images.optString(i).takeIf { it.isNotEmpty() } ?: continue
 					val playableUrl = if (isProtectedProComicImage(imgUrl)) {
-						signCdnImage(imgUrl, chapterUrl) ?: continue
+						signCdnImage(imgUrl, chapterUrl, contentDomain) ?: continue
 					} else {
 						imgUrl
 					}
@@ -402,9 +447,10 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 							cdnPath = cdnPath,
 							pageIndex = i,
 							referer = chapterUrl,
+							contentDomain = contentDomain,
 						) ?: continue
 					}
-					val mapUrl = buildProChanStitchUrl(map, domain) ?: continue
+					val mapUrl = buildProChanStitchUrl(map, contentDomain) ?: continue
 
 					pages.add(
 						MangaPage(
@@ -439,17 +485,21 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		return pages
 	}
 
-	private suspend fun signCdnImage(rawUrl: String, referer: String): String? {
+	private suspend fun signCdnImage(
+		rawUrl: String,
+		referer: String,
+		contentDomain: String,
+	): String? {
 		val result = runCatching {
 			webClient.httpPost(
-				"https://$domain/api/cdn-image/sign".toHttpUrl(),
+				"https://$contentDomain/api/cdn-image/sign".toHttpUrl(),
 				JSONObject().put("url", rawUrl),
 				jsonHeaders(referer),
 			).parseJson()
 		}.getOrNull() ?: return null
 		val token = result.optString("token").takeIf(String::isNotBlank) ?: return null
 		val expires = result.optLong("expires").takeIf { it > 0L } ?: return null
-		return buildProChanSignedImageUrl(domain, rawUrl, token, expires)
+		return buildProChanSignedImageUrl(contentDomain, rawUrl, token, expires)
 	}
 
 	private suspend fun resolveProtectedMap(
@@ -458,6 +508,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		cdnPath: String,
 		pageIndex: Int,
 		referer: String,
+		contentDomain: String,
 	): JSONObject? {
 		val token = descriptor.optString("token").takeIf(String::isNotBlank) ?: return null
 		val method = descriptor.optString("method", "browser_session")
@@ -470,7 +521,7 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 			.put("pageIndex", pageIndex)
 		val response = runCatching {
 			webClient.httpPost(
-				"https://$domain/chapter-map-proxy-plan/$chapterId".toHttpUrl(),
+				"https://$contentDomain/chapter-map-proxy-plan/$chapterId".toHttpUrl(),
 				payload,
 				jsonHeaders(referer),
 			).parseJson()
@@ -482,7 +533,10 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 	private fun jsonHeaders(referer: String): Headers = Headers.Builder()
 		.add("Accept", "application/json, text/plain, */*")
 		.add("Content-Type", "application/json")
-		.add("Origin", "https://$domain")
+		.add(
+			"Origin",
+			referer.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}" } ?: "https://$domain",
+		)
 		.add("Referer", referer)
 		.add("User-Agent", config[userAgentKey])
 		.build()
@@ -494,7 +548,32 @@ internal class ProChan(context: MangaLoaderContext) : PagedMangaParser(
 		.add("User-Agent", config[userAgentKey])
 		.build()
 
+	private companion object {
+		const val PROCOMIC_NET = "procomic.net"
+		const val CHAPTER_PAGE_SIZE = 50
+		const val MAX_CHAPTER_PAGES = 100
+	}
+
 	override suspend fun getPageUrl(page: MangaPage): String = page.url
+}
+
+internal fun getProChanContentDomain(item: JSONObject, fallbackDomain: String): String =
+	if (item.optBoolean("isBlockedSeries", false)) "procomic.net" else fallbackDomain
+
+internal fun appendUniqueProChanChapters(
+	target: JSONArray,
+	page: JSONArray,
+	seenIds: MutableSet<Int>,
+): Int {
+	var added = 0
+	for (i in 0 until page.length()) {
+		val item = page.optJSONObject(i) ?: continue
+		val chapterId = item.optInt("id")
+		if (chapterId > 0 && !seenIds.add(chapterId)) continue
+		target.put(item)
+		added++
+	}
+	return added
 }
 
 internal fun filterAndSortProChanChapters(data: JSONArray): List<JSONObject> {
@@ -532,6 +611,7 @@ internal fun filterAndSortProChanChapters(data: JSONArray): List<JSONObject> {
 
 private fun isProtectedProComicImage(url: String): Boolean =
 	(url.contains(".procomic.pro/", ignoreCase = true) ||
+		url.contains(".procomic.net/", ignoreCase = true) ||
 		url.contains(".prochan.net/", ignoreCase = true)) &&
 		(url.contains("/cdn", ignoreCase = true) || url.contains("cdn", ignoreCase = true))
 
