@@ -305,19 +305,55 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 		const val PAGE_SIZE = 25
 		private val EPISODE_NUMBER = Regex("""episode-(\d+(?:\.\d+)?)(?:/)?$""", RegexOption.IGNORE_CASE)
 		private val QUALITY_NUMBER = Regex("""(?:^|[^\d])(\d{3,4})p(?:[^\d]|$)""", RegexOption.IGNORE_CASE)
-		private val SEARCH_CONFIG = Regex(
-			"""fjSearchPageData\s*=\s*(\{.*?})\s*;""",
-			setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-		)
+		private const val SEARCH_CONFIG_VARIABLE = "fjSearchPageData"
 
 		internal fun extractSearchConfig(document: Document): JSONObject? {
 			val script = document.select("script")
 				.asSequence()
 				.map { it.data() }
-				.firstOrNull { "fjSearchPageData" in it }
+				.firstOrNull { SEARCH_CONFIG_VARIABLE in it }
 				?: return null
-			val raw = SEARCH_CONFIG.find(script)?.groupValues?.getOrNull(1) ?: return null
+			val raw = extractAssignedJsonObject(script, SEARCH_CONFIG_VARIABLE) ?: return null
 			return runCatching { JSONObject(raw) }.getOrNull()
+		}
+
+		/**
+		 * Extracts an object assigned to a JavaScript variable without relying on
+		 * regex handling of escaped braces. Android's ICU regex rejects the former
+		 * `\{.*?}` pattern during class initialization, crashing the whole source.
+		 */
+		internal fun extractAssignedJsonObject(script: String, variableName: String): String? {
+			val variableIndex = script.indexOf(variableName)
+			if (variableIndex < 0) return null
+			val assignmentIndex = script.indexOf('=', variableIndex + variableName.length)
+			if (assignmentIndex < 0) return null
+			val objectStart = script.indexOf('{', assignmentIndex + 1)
+			if (objectStart < 0) return null
+
+			var depth = 0
+			var quote = '\u0000'
+			var escaped = false
+			for (index in objectStart until script.length) {
+				val char = script[index]
+				if (quote != '\u0000') {
+					when {
+						escaped -> escaped = false
+						char == '\\' -> escaped = true
+						char == quote -> quote = '\u0000'
+					}
+					continue
+				}
+				when (char) {
+					'"', '\'' -> quote = char
+					'{' -> depth++
+					'}' -> {
+						depth--
+						if (depth == 0) return script.substring(objectStart, index + 1)
+						if (depth < 0) return null
+					}
+				}
+			}
+			return null
 		}
 
 		internal fun findSeriesJson(document: Document): JSONObject? {
