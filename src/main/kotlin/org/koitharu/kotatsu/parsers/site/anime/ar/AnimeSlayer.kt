@@ -30,6 +30,8 @@ import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.parseRaw
 import org.koitharu.kotatsu.parsers.util.urlEncoded
 import java.net.URI
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
 import java.util.EnumSet
 import java.util.Locale
 
@@ -238,7 +240,12 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			serverUrl.contains("a-reslayer.com", ignoreCase = true) -> {
 				loadAlternativeLinks(serverUrl)
 			}
-			else -> extractPageLinks(serverUrl, "https://anslayer.com/")
+			else -> buildList {
+				addAll(extractPageLinks(serverUrl, "https://anslayer.com/"))
+				alternativeUrlFromCdn(serverUrl)?.let { fallbackUrl ->
+					addAll(loadAlternativeLinks(fallbackUrl))
+				}
+			}.distinct()
 		}
 
 		return buildList {
@@ -293,7 +300,8 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 
 	private suspend fun resolveStreamTape(url: String, serverName: String): AnimeStream? {
 		val raw = webClient.httpGet(url, pageHeaders("https://anslayer.com/")).parseRaw()
-		val direct = extractStreamTapeDirectUrl(Jsoup.parse(raw, url), url)
+		val direct = extractStreamTapeScriptUrl(raw, url)
+			?: extractStreamTapeDirectUrl(Jsoup.parse(raw, url), url)
 			?: findStreamTapeUrl(raw)
 			?: findDirectMediaUrls(raw).firstOrNull()
 			?: return null
@@ -381,6 +389,16 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			"""(?:robotlink|norobotlink)[^=]{0,100}=\s*["']([^"']+)["']""",
 			setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
 		)
+		val STREAM_TAPE_ASSIGNMENT = Regex(
+			"""document\.getElementById\(\s*(["'])(captchalink|ideoooolink|norobotlink)\1\s*\)""" +
+				"""\.innerHTML\s*=\s*([^;]+);""",
+			setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+		)
+		val JS_STRING_TERM = Regex(
+			"""(["'])(.*?)\1\s*\)?((?:\s*\.substring\(\s*\d+\s*\))*)""",
+			RegexOption.DOT_MATCHES_ALL,
+		)
+		val JS_SUBSTRING_CALL = Regex("""\.substring\(\s*(\d+)\s*\)""")
 		val ABSOLUTE_URL = Regex(
 			"""(?:(?:https?:)?//)[^\s"'<>\\]+""",
 			RegexOption.IGNORE_CASE,
@@ -391,6 +409,35 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			add(serverUrl.replace("\\", "/"))
 			add(serverUrl)
 		}.distinct()
+
+		/**
+		 * Anime Slayer's legacy CDN endpoint frequently returns 404 while the same
+		 * episode remains available through the alternative-server endpoint. Both
+		 * URLs carry the anime slug and episode number, so keep the working endpoint
+		 * as a fallback instead of losing the whole server list.
+		 */
+		fun alternativeUrlFromCdn(serverUrl: String): String? {
+			val uri = runCatching { URI(serverUrl) }.getOrNull() ?: return null
+			if (!uri.path.orEmpty().endsWith("/vq.php", ignoreCase = true)) return null
+			val query = uri.rawQuery.orEmpty()
+				.split('&')
+				.mapNotNull { part ->
+					val separator = part.indexOf('=')
+					if (separator <= 0) return@mapNotNull null
+					part.substring(0, separator) to URLDecoder.decode(
+						part.substring(separator + 1),
+						StandardCharsets.UTF_8.name(),
+					)
+				}
+				.toMap()
+			val anime = query["f"]?.trim()?.takeIf(String::isNotEmpty) ?: return null
+			val episode = query["e"]
+				?.substringBefore('|')
+				?.trim()
+				?.takeIf(String::isNotEmpty)
+				?: return null
+			return "https://a-reslayer.com/la/public/api/f?n=${"$anime\\$episode".urlEncoded()}"
+		}
 
 		fun parseAlternativeLinks(raw: String): List<String> {
 			val decoded = Parser.unescapeEntities(raw, false)
@@ -429,13 +476,71 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 				.map { it.text().trim() }
 				.firstOrNull { "/get_video?" in it }
 				?: return null
-			return when {
+			val absolute = when {
 				value.startsWith("//") -> "https:$value"
 				value.matches(Regex("""^/streamtape\.[^/]+/get_video\?.+""", RegexOption.IGNORE_CASE)) ->
 					"https:/$value"
 				value.startsWith("/get_video?") -> URI(baseUrl).resolve(value).toString()
 				else -> absoluteUrl(value, baseUrl)
 			}
+			return ensureStreamTapeStreamingUrl(absolute)
+		}
+
+		/**
+		 * StreamTape intentionally leaves invalid tokens in its hidden nodes.
+		 * The working URL is assembled by a small script such as:
+		 *
+		 * `'//stre' + ('xxxxamtape.to/get_video?...').substring(4)`
+		 *
+		 * Reading #ideoooolink directly therefore yields a URL which returns a
+		 * 500 response. Reproduce only the string concatenation/substring
+		 * operations instead of executing arbitrary page JavaScript.
+		 */
+		fun extractStreamTapeScriptUrl(raw: String, baseUrl: String): String? {
+			val decoded = Parser.unescapeEntities(raw, false)
+				.replace("\\/", "/")
+				.replace("\\u0026", "&", ignoreCase = true)
+			val assignments = STREAM_TAPE_ASSIGNMENT.findAll(decoded).toList()
+				.sortedBy { match ->
+					when (match.groupValues[2].lowercase(Locale.ROOT)) {
+						"captchalink" -> 0
+						"ideoooolink" -> 1
+						else -> 2
+					}
+				}
+			for (assignment in assignments) {
+				val expression = assignment.groupValues[3]
+				val value = buildString {
+					for (term in JS_STRING_TERM.findAll(expression)) {
+						var part = term.groupValues[2]
+							.replace("\\/", "/")
+							.replace("\\u0026", "&", ignoreCase = true)
+						for (substring in JS_SUBSTRING_CALL.findAll(term.groupValues[3])) {
+							val offset = substring.groupValues[1].toIntOrNull() ?: continue
+							if (offset > part.length) {
+								part = ""
+								break
+							}
+							part = part.substring(offset)
+						}
+						append(part)
+					}
+				}
+				if ("/get_video?" !in value) continue
+				return ensureStreamTapeStreamingUrl(
+					when {
+						value.startsWith("//") -> "https:$value"
+						value.matches(
+							Regex(
+								"""^/streamtape\.[^/]+/get_video\?.+""",
+								RegexOption.IGNORE_CASE,
+							),
+						) -> "https:/$value"
+						else -> absoluteUrl(value, baseUrl)
+					},
+				)
+			}
+			return null
 		}
 
 		fun findDirectMediaUrls(raw: String): List<String> {
@@ -452,13 +557,24 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			val decoded = Parser.unescapeEntities(raw, false)
 				.replace("\\/", "/")
 				.replace("\\u0026", "&", ignoreCase = true)
+			extractStreamTapeScriptUrl(decoded, "https://streamtape.com/")
+				?.let { return it }
 			extractStreamTapeDirectUrl(Jsoup.parse(decoded, "https://streamtape.com/"), "https://streamtape.com/")
 				?.let { return it }
-			STREAM_TAPE_URL.find(decoded)?.value?.let { return absoluteUrl(it, "https://streamtape.com/") }
+			STREAM_TAPE_URL.find(decoded)?.value?.let {
+				return ensureStreamTapeStreamingUrl(absoluteUrl(it, "https://streamtape.com/"))
+			}
 			val fragment = ROBOT_LINK.find(decoded)?.groupValues?.getOrNull(1) ?: return null
 			return fragment.takeIf { "/get_video?" in it }?.let {
-				absoluteUrl(it, "https://streamtape.com/")
+				ensureStreamTapeStreamingUrl(absoluteUrl(it, "https://streamtape.com/"))
 			}
+		}
+
+		private fun ensureStreamTapeStreamingUrl(url: String): String {
+			if (Regex("""(?:[?&])stream=""", RegexOption.IGNORE_CASE).containsMatchIn(url)) {
+				return url
+			}
+			return "$url${if ('?' in url) '&' else '?'}stream=1"
 		}
 
 		fun isDirectMediaUrl(value: String): Boolean {
