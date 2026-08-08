@@ -169,6 +169,8 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 
 	private fun apiHeaders(): Headers = Headers.Builder()
 		.add("Accept", "application/*+json")
+		.add("Cache-Control", "no-cache, no-store")
+		.add("Pragma", "no-cache")
 		.add("Client-Id", CLIENT_ID)
 		.add("Client-Secret", CLIENT_SECRET)
 		.add("User-Agent", config[userAgentKey])
@@ -230,13 +232,18 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	private suspend fun resolveServer(server: JSONObject): List<AnimeStream> {
-		val serverName = server.optString("episode_server_name")
+		val serverName = sequenceOf("episode_server_name", "server_name", "name")
+			.map { key -> server.optString(key) }
+			.firstOrNull(String::isNotBlank)
+			.orEmpty()
 			.trim()
 			.ifEmpty { "Server" }
-		val serverUrl = server.optString("episode_url").takeIf(String::isNotBlank)
+		val serverUrl = sequenceOf("episode_url", "url", "file", "link")
+			.map { key -> server.optString(key) }
+			.firstOrNull(String::isNotBlank)
 			?: return emptyList()
 		val candidates = when {
-			isDirectMediaUrl(serverUrl) -> listOf(serverUrl)
+			isDirectMediaUrl(serverUrl) || serverUrl.contains("/get_video?", ignoreCase = true) -> listOf(serverUrl)
 			serverUrl.contains("a-reslayer.com", ignoreCase = true) -> {
 				loadAlternativeLinks(serverUrl)
 			}
@@ -326,6 +333,8 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			headers = mapOf(
 				"Referer" to referer,
 				"User-Agent" to config[userAgentKey],
+				"Cache-Control" to "no-cache",
+				"Pragma" to "no-cache",
 			),
 			quality = quality,
 		)
@@ -334,6 +343,8 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 	private fun pageHeaders(referer: String): Headers = Headers.Builder()
 		.add("Accept", "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8")
 		.add("Accept-Language", "ar,en-US;q=0.8,en;q=0.7")
+		.add("Cache-Control", "no-cache, no-store")
+		.add("Pragma", "no-cache")
 		.add("Referer", referer)
 		.add("User-Agent", config[userAgentKey])
 		.build()
@@ -395,10 +406,13 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
 		)
 		val JS_STRING_TERM = Regex(
-			"""(["'])(.*?)\1\s*\)?((?:\s*\.substring\(\s*\d+\s*\))*)""",
+			"""(["'])(.*?)\1\s*\)?((?:\s*\.(?:substring|substr|slice)\(\s*-?\d+(?:\s*,\s*-?\d+)?\s*\))*)""",
 			RegexOption.DOT_MATCHES_ALL,
 		)
-		val JS_SUBSTRING_CALL = Regex("""\.substring\(\s*(\d+)\s*\)""")
+		val JS_STRING_TRANSFORM = Regex(
+			"""\.(substring|substr|slice)\(\s*(-?\d+)(?:\s*,\s*(-?\d+))?\s*\)""",
+			RegexOption.IGNORE_CASE,
+		)
 		val ABSOLUTE_URL = Regex(
 			"""(?:(?:https?:)?//)[^\s"'<>\\]+""",
 			RegexOption.IGNORE_CASE,
@@ -443,18 +457,11 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			val decoded = Parser.unescapeEntities(raw, false)
 				.replace("\\/", "/")
 				.replace("\\u0026", "&", ignoreCase = true)
-			val fromJson = runCatching { JSONArray(decoded.trim()) }.getOrNull()?.let { array ->
-				buildList {
-					for (index in 0 until array.length()) {
-						when (val value = array.opt(index)) {
-							is String -> value.takeIf(::isWebUrl)?.let(::add)
-							is JSONObject -> value.keys().forEach { key ->
-								value.optString(key).takeIf(::isWebUrl)?.let(::add)
-							}
-						}
-					}
-				}
-			}.orEmpty()
+			val root = runCatching<Any> { JSONArray(decoded.trim()) }.getOrNull()
+				?: runCatching<Any> { JSONObject(decoded.trim()) }.getOrNull()
+			val fromJson = buildList {
+				collectWebLinks(root, this)
+			}
 			if (fromJson.isNotEmpty()) return fromJson.distinct()
 			return ABSOLUTE_URL.findAll(decoded)
 				.map { it.value.trimEnd('\\', '"', '\'', ')', ']') }
@@ -466,9 +473,24 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		private fun isWebUrl(value: String): Boolean =
 			value.startsWith("https://") || value.startsWith("http://") || value.startsWith("//")
 
-		fun extractMediaFireDirectUrl(document: Document): String? =
-			document.selectFirst("#downloadButton[href]")?.attr("href")
-				?.takeIf { isDirectMediaUrl(it) }
+		private fun collectWebLinks(value: Any?, output: MutableList<String>) {
+			when (value) {
+				is String -> value.trim().takeIf(::isWebUrl)?.let(output::add)
+				is JSONArray -> for (index in 0 until value.length()) {
+					collectWebLinks(value.opt(index), output)
+				}
+				is JSONObject -> value.keys().forEach { key ->
+					collectWebLinks(value.opt(key), output)
+				}
+			}
+		}
+
+		fun extractMediaFireDirectUrl(document: Document): String? = document
+			.select("#downloadButton[href], .download_link a[href], a[href]")
+			.asSequence()
+			.map { element -> element.attr("abs:href").ifBlank { element.attr("href") } }
+			.firstOrNull(::isDirectMediaUrl)
+			?: findDirectMediaUrls(document.html()).firstOrNull()
 
 		fun extractStreamTapeDirectUrl(document: Document, baseUrl: String): String? {
 			val value = document.select("#ideoooolink, #norobotlink, #robotlink")
@@ -515,14 +537,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 						var part = term.groupValues[2]
 							.replace("\\/", "/")
 							.replace("\\u0026", "&", ignoreCase = true)
-						for (substring in JS_SUBSTRING_CALL.findAll(term.groupValues[3])) {
-							val offset = substring.groupValues[1].toIntOrNull() ?: continue
-							if (offset > part.length) {
-								part = ""
-								break
-							}
-							part = part.substring(offset)
-						}
+						part = applyJsStringTransforms(part, term.groupValues[3])
 						append(part)
 					}
 				}
@@ -541,6 +556,36 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 				)
 			}
 			return null
+		}
+
+		private fun applyJsStringTransforms(value: String, calls: String): String {
+			var result = value
+			for (call in JS_STRING_TRANSFORM.findAll(calls)) {
+				val operation = call.groupValues[1].lowercase(Locale.ROOT)
+				val first = call.groupValues[2].toIntOrNull() ?: continue
+				val second = call.groupValues[3].toIntOrNull()
+				result = when (operation) {
+					"substring" -> {
+						val start = first.coerceIn(0, result.length)
+						val end = (second ?: result.length).coerceIn(0, result.length)
+						result.substring(minOf(start, end), maxOf(start, end))
+					}
+					"substr" -> {
+						val start = (if (first < 0) result.length + first else first).coerceIn(0, result.length)
+						val end = second?.coerceAtLeast(0)?.let { (start + it).coerceAtMost(result.length) }
+							?: result.length
+						result.substring(start, end)
+					}
+					"slice" -> {
+						val start = (if (first < 0) result.length + first else first).coerceIn(0, result.length)
+						val rawEnd = second ?: result.length
+						val end = (if (rawEnd < 0) result.length + rawEnd else rawEnd).coerceIn(0, result.length)
+						if (end < start) "" else result.substring(start, end)
+					}
+					else -> result
+				}
+			}
+			return result
 		}
 
 		fun findDirectMediaUrls(raw: String): List<String> {
