@@ -133,7 +133,7 @@ internal class RistoAnime(context: MangaLoaderContext) :
 			.sortedBy { serverPriority(it.url) }
 
 		val result = ArrayList<AnimeStream>()
-		for (server in servers) {
+		for (server in servers.take(MAX_SERVER_PROBES)) {
 			val directUrls = runCatching { extractDirectMediaUrls(server.url) }.getOrDefault(emptyList())
 			for ((index, directUrl) in directUrls.withIndex()) {
 				result += AnimeStream(
@@ -145,7 +145,10 @@ internal class RistoAnime(context: MangaLoaderContext) :
 					),
 				)
 			}
-			if (result.size >= MAX_STREAMS) break
+			// Resolving every embed page is expensive and was the reason this source
+			// kept phones hot even before playback started. The servers are already
+			// priority-sorted, so stop after the first working provider.
+			if (result.isNotEmpty()) break
 		}
 		return result.distinctBy(AnimeStream::url)
 	}
@@ -283,6 +286,7 @@ internal class RistoAnime(context: MangaLoaderContext) :
 	internal companion object {
 		const val PAGE_SIZE = 25
 		const val MAX_STREAMS = 8
+		const val MAX_SERVER_PROBES = 3
 		const val MAX_URLS_PER_SERVER = 3
 		val BACKGROUND_URL = Regex("""url\((['\"]?)(.*?)\1\)""", RegexOption.IGNORE_CASE)
 		val RATING_NUMBER = Regex("""\d+(?:\.\d+)?""")
