@@ -9,6 +9,7 @@ import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.ContentRating
 import org.koitharu.kotatsu.parsers.model.ContentType
 import org.koitharu.kotatsu.parsers.model.Manga
@@ -191,6 +192,12 @@ internal class MangaMelloPlus(context: MangaLoaderContext) :
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val root = apiGet(chapter.url.trimStart('/'))
 		val urls = extractImageUrls(root, "$PLUS_API_BASE/")
+		if (urls.isNotEmpty() && urls.all(::isRetiredImageUrl)) {
+			throw ParseException(
+				"This chapter is stored on the retired GManga image server and is no longer available from MangaMello Plus",
+				chapter.url,
+			)
+		}
 		return urls.mapIndexed { index, imageUrl ->
 			MangaPage(
 				id = generateUid("${chapter.id}-$index"),
@@ -406,7 +413,12 @@ internal class MangaMelloPlus(context: MangaLoaderContext) :
 			return url.replaceFirst(host, currentHost, ignoreCase = true)
 		}
 
+		internal fun isRetiredImageUrl(url: String): Boolean = runCatching {
+			URI(url).host.equals(RETIRED_GMANGA_IMAGE_HOST, ignoreCase = true)
+		}.getOrDefault(false)
+
 		private const val TEMP_LEKMANGA_HOST = "tempstorm.lekmanga.site"
+		private const val RETIRED_GMANGA_IMAGE_HOST = "media.gmanga.me"
 		private val TEMP_LEKMANGA_PATH = Regex("""^/manga/arb1(\d+)/""", RegexOption.IGNORE_CASE)
 		private val LEGACY_LEKMANGA_HOST = Regex("""s(\d+)lekmangas\.lekmanga\.site""")
 	}
