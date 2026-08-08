@@ -8,6 +8,18 @@ import org.junit.jupiter.api.Test
 internal class CeneleTest {
 
 	@Test
+	fun acceptsArticleAsChapterContentContainer() {
+		val document = Jsoup.parse(
+			"""<article class="text-left"><p>chapter body</p></article>""",
+		)
+
+		val content = document.selectFirst(".text-left")
+
+		assertTrue(content != null)
+		assertTrue(content?.tagName() == "article")
+	}
+
+	@Test
 	fun keepsRealTextWhenHiddenBaitIsInsideTheSameParagraph() {
 		val document = Jsoup.parse(
 			"""
