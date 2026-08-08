@@ -71,6 +71,30 @@ internal class MangaMelloTest {
 	}
 
 	@Test
+	fun `rewrites temporary lekmanga host from the path shard`() {
+		assertEquals(
+			"https://s3storm.lekmanga.site/manga/arb13/data/manga_6918b29dc1718/" +
+				"7d0dc3d3b012217de1766da4b45a97a0/image-01.png",
+			MangaMelloPlus.rewriteLegacyImageUrl(
+				"https://tempstorm.lekmanga.site/manga/arb13/data/manga_6918b29dc1718/" +
+					"7d0dc3d3b012217de1766da4b45a97a0/image-01.png",
+			),
+		)
+		assertEquals(
+			"https://s17storm.lekmanga.site/manga/arb117/data/chapter/page.webp",
+			MangaMelloPlus.rewriteLegacyImageUrl(
+				"https://tempstorm.lekmanga.site/manga/arb117/data/chapter/page.webp",
+			),
+		)
+	}
+
+	@Test
+	fun `keeps unknown temporary lekmanga paths unchanged`() {
+		val url = "https://tempstorm.lekmanga.site/uploads/chapter/page.webp"
+		assertEquals(url, MangaMelloPlus.rewriteLegacyImageUrl(url))
+	}
+
+	@Test
 	fun `keeps current image hosts unchanged`() {
 		val currentLekMangaUrl =
 			"https://s3storm.lekmanga.site/manga/arb13/data/chapter/image-1.jpg"
@@ -79,6 +103,20 @@ internal class MangaMelloTest {
 
 		assertEquals(currentLekMangaUrl, MangaMelloPlus.rewriteLegacyImageUrl(currentLekMangaUrl))
 		assertEquals(olympusUrl, MangaMelloPlus.rewriteLegacyImageUrl(olympusUrl))
+	}
+
+	@Test
+	fun `recognizes chapters hosted only on the retired gmanga server`() {
+		assertTrue(
+			MangaMelloPlus.isRetiredImageUrl(
+				"https://media.gmanga.me/uploads/releases/team/chapter/1.webp",
+			),
+		)
+		assertFalse(
+			MangaMelloPlus.isRetiredImageUrl(
+				"https://s3storm.lekmanga.site/manga/chapter/1.webp",
+			),
+		)
 	}
 
 	@Test
