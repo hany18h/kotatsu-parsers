@@ -374,7 +374,7 @@ internal class Cenele(context: MangaLoaderContext) :
 					.add("X-Requested-With", "XMLHttpRequest")
 					.add("User-Agent", config[userAgentKey])
 					.build(),
-			).parseHtml().selectFirst("div.text-left")
+			).parseHtml().selectFirst(".text-left")
 		}.getOrNull()
 	}
 
@@ -388,9 +388,9 @@ internal class Cenele(context: MangaLoaderContext) :
 			locator: CeneleChapterLocator?,
 		): Element? {
 			if (locator != null) {
-				return doc.selectFirst("#chapter-${locator.chapterId} div.text-left")
+				doc.selectFirst("#chapter-${locator.chapterId} .text-left")?.let { return it }
 			}
-			return doc.selectFirst("div.reading-content.current div.text-left")
+			return doc.selectFirst(".reading-content.current .text-left")
 		}
 
 		internal fun sanitizeChapterContent(content: Element): Element {
