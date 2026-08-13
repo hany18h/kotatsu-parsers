@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -15,11 +16,10 @@ import java.util.*
 
 @MangaSourceParser("CENELE", "فضاء الروايات", "ar", ContentType.NOVEL)
 internal class Cenele(context: MangaLoaderContext) :
-	PagedMangaParser(context, MangaParserSource.CENELE, pageSize = 12) {
+	PagedMangaParser(context, MangaParserSource.CENELE, pageSize = 10) {
 
 	init {
-		// Madara's load-more endpoint is zero based, while the regular search is one based.
-		setFirstPage(firstPage = 0, firstPageForSearch = 1)
+		setFirstPage(firstPage = 1, firstPageForSearch = 1)
 	}
 
 	override val configKeyDomain = ConfigKey.Domain("cenele.com")
@@ -48,94 +48,32 @@ internal class Cenele(context: MangaLoaderContext) :
 	)
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val url = buildString {
-			append("https://")
-			append(domain)
-			when {
-				!filter.query.isNullOrEmpty() -> {
-					append("/?s=")
-					append(filter.query.urlEncoded())
-					append("&post_type=wp-manga&page=")
-					append(page)
-				}
-				else -> {
-					// استخدام AJAX مثل MadaraParser
-				}
-			}
+		val query = filter.query?.trim().orEmpty()
+		val sort = when (order) {
+			SortOrder.POPULARITY -> "views"
+			SortOrder.ALPHABETICAL -> "alphabet"
+			else -> "latest"
 		}
-
-		// للبحث استخدم GET، لغيره استخدم AJAX POST
-		val doc = if (!filter.query.isNullOrEmpty()) {
-			webClient.httpGet(url).parseHtml()
+		val url = if (query.isNotEmpty()) {
+			"https://$domain/?s=${query.urlEncoded()}&post_type=wp-manga&page=$page"
 		} else {
-			val payload = buildString {
-				append("action=madara_load_more")
-				append("&page=").append(page)
-				append("&template=madara-core%2Fcontent%2Fcontent-search")
-				append("&vars%5Bs%5D=")
-				append("&vars%5Bpaged%5D=1")
-				append("&vars%5Btemplate%5D=search")
-				append("&vars%5Bmeta_query%5D%5B0%5D%5Brelation%5D=AND")
-				append("&vars%5Bmeta_query%5D%5Brelation%5D=AND")
-				append("&vars%5Bpost_type%5D=wp-manga")
-				append("&vars%5Bpost_status%5D=publish")
-				append("&vars%5Bmanga_archives_item_layout%5D=default")
-
-				// ترتيب
-				when (order) {
-					SortOrder.UPDATED -> {
-						append("&vars%5Bmeta_key%5D=_latest_update")
-						append("&vars%5Borderby%5D=meta_value_num")
-						append("&vars%5Border%5D=desc")
-					}
-					SortOrder.POPULARITY -> {
-						append("&vars%5Bmeta_key%5D=_wp_manga_views")
-						append("&vars%5Borderby%5D=meta_value_num")
-						append("&vars%5Border%5D=desc")
-					}
-					SortOrder.NEWEST -> {
-						append("&vars%5Borderby%5D=date")
-						append("&vars%5Border%5D=desc")
-					}
-					SortOrder.ALPHABETICAL -> {
-						append("&vars%5Borderby%5D=post_title")
-						append("&vars%5Border%5D=asc")
-					}
-					else -> {
-						append("&vars%5Bmeta_key%5D=_latest_update")
-						append("&vars%5Borderby%5D=meta_value_num")
-						append("&vars%5Border%5D=desc")
-					}
-				}
-
-				// تصفية حسب التصنيف
-				filter.tags.oneOrThrowIfMany()?.let {
-					append("&vars%5Btax_query%5D%5B0%5D%5Btaxonomy%5D=wp-manga-genre")
-					append("&vars%5Btax_query%5D%5B0%5D%5Bfield%5D=slug")
-					append("&vars%5Btax_query%5D%5B0%5D%5Bterms%5D%5B0%5D=").append(it.key)
-					append("&vars%5Btax_query%5D%5B0%5D%5Boperator%5D=IN")
-				}
-
-				// تصفية حسب الحالة
-				filter.states.oneOrThrowIfMany()?.let {
-					append("&vars%5Bmeta_query%5D%5B0%5D%5B0%5D%5Bkey%5D=_wp_manga_status")
-					append("&vars%5Bmeta_query%5D%5B0%5D%5B0%5D%5Bcompare%5D=IN")
-					append("&vars%5Bmeta_query%5D%5B0%5D%5B0%5D%5Bvalue%5D%5B%5D=")
-					append(if (it == MangaState.FINISHED) "end" else "on-going")
-				}
-			}
-			webClient.httpPost(
-				"https://$domain/wp-admin/admin-ajax.php",
-				payload,
-			).parseHtml()
+			val tag = filter.tags.oneOrThrowIfMany()?.key
+			val root = if (tag == null) "/novel/" else "/cont-genre/${tag.urlEncoded()}/"
+			val path = if (page <= 1) root else "${root}page/$page/"
+			"https://$domain$path?m_orderby=$sort"
 		}
+		val doc = webClient.httpGet(url).parseHtml()
 
-		return doc.select("div.page-item-detail, div.row.c-tabs-item__content").map { div ->
-			val a = div.selectFirstOrThrow("a")
+		return doc.select("article.nhv-library-card, div.row.c-tabs-item__content").mapNotNull { div ->
+			val a = div.selectFirst(".nhv-library-card__title a, .post-title a, h3 a, h4 a")
+				?: div.selectFirst("a[href*=/cont/]")
+				?: return@mapNotNull null
 			val href = a.attrAsRelativeUrl("href")
-			val img = div.selectFirst("img")
-			val title = div.selectFirst("h3, h4, .manga-name")?.text()?.trim().orEmpty()
+			val img = div.selectFirst(".nhv-library-card__cover img, .tab-thumb img, img")
+			val title = div.selectFirst(".nhv-library-card__title, .post-title, h3, h4, .manga-name")
+				?.text()?.trim().orEmpty()
 				.ifEmpty { a.attr("title") }
+			val status = div.selectFirst(".nhv-library-card__status, .summary-content")?.text().orEmpty()
 			Manga(
 				id = generateUid(href),
 				title = title,
@@ -146,7 +84,7 @@ internal class Cenele(context: MangaLoaderContext) :
 				contentRating = null,
 				coverUrl = img?.src(),
 				tags = emptySet(),
-				state = null,
+				state = parseState(status),
 				authors = emptySet(),
 				source = source,
 			)
@@ -169,18 +107,14 @@ internal class Cenele(context: MangaLoaderContext) :
 	override suspend fun getDetails(manga: Manga): Manga {
 		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
 
-		val statusText = doc.selectFirst(".post-status .summary-content")
-			?.text()?.trim().orEmpty().lowercase()
-		val state = when {
-			statusText.contains("مستمر") || statusText.contains("ongoing") -> MangaState.ONGOING
-			statusText.contains("مكتمل") || statusText.contains("completed") || statusText.contains("end") -> MangaState.FINISHED
-			else -> null
-		}
+		val state = parseState(
+			doc.selectFirst(".nhv-novel-status, .post-status .summary-content")?.text().orEmpty(),
+		)
 
-		val authors = doc.select(".author-content a")
+		val authors = doc.select(".nhv-novel-integrations a[href*=/cont-artist/], .author-content a")
 			.mapNotNullToSet { it.text().trim().ifEmpty { null } }
 
-		val tags = doc.select(".genres-content a").mapToSet { a ->
+		val tags = doc.select(".nhv-novel-genres a, .genres-content a").mapToSet { a ->
 			MangaTag(
 				key = a.attr("href").removeSuffix("/").substringAfterLast("/"),
 				title = a.text().trim(),
@@ -188,7 +122,7 @@ internal class Cenele(context: MangaLoaderContext) :
 			)
 		}
 
-		val coverUrl = doc.selectFirst(".summary_image img")?.src() ?: manga.coverUrl
+		val coverUrl = doc.selectFirst(".nhv-novel-cover img, .summary_image img")?.src() ?: manga.coverUrl
 		val altTitle = doc.selectFirst(".manga-name-or, .post-content_item:contains(Alt) .summary-content")
 			?.text()?.trim()
 
@@ -196,7 +130,7 @@ internal class Cenele(context: MangaLoaderContext) :
 		val chapters = loadChapters(manga.url.toAbsoluteUrl(domain), doc)
 
 		return manga.copy(
-			title = doc.selectFirst("div.post-title h1")?.text()?.trim() ?: manga.title,
+			title = doc.selectFirst("h1.nhv-novel-title, div.post-title h1")?.text()?.trim() ?: manga.title,
 			altTitles = setOfNotNull(altTitle?.ifEmpty { null }),
 			description = loadDescription(doc),
 			coverUrl = coverUrl,
@@ -209,7 +143,7 @@ internal class Cenele(context: MangaLoaderContext) :
 	}
 
 	private suspend fun loadDescription(doc: Document): String? {
-		val fallback = doc.selectFirst("div.summary__content, .manga-excerpt .excerpt-content")
+		val fallback = doc.selectFirst(".nhv-novel-synopsis, div.summary__content, .manga-excerpt .excerpt-content")
 			?.html()?.trim()?.takeIf(String::isNotEmpty)
 		val readMore = doc.selectFirst("#nhv-synopsis-readmore") ?: return fallback
 		val postId = readMore.attr("data-post-id").trim().takeIf(String::isNotEmpty) ?: return fallback
@@ -232,6 +166,48 @@ internal class Cenele(context: MangaLoaderContext) :
 	}
 
 	private suspend fun loadChapters(mangaUrl: String, doc: Document): List<MangaChapter> {
+		val scripts = doc.select("script").joinToString("\n") { it.data() + it.html() }
+		val mangaId = CHAPTERS_POST_ID.find(scripts)?.groupValues?.getOrNull(1)
+			?.takeIf(String::isNotBlank)
+			?: doc.selectFirst("[data-manga-id]")?.attr("data-manga-id")?.takeIf(String::isNotBlank)
+			?: doc.selectFirst("#manga-chapters-holder")?.attr("data-id")?.takeIf(String::isNotBlank)
+		val nonce = CHAPTERS_NONCE.find(scripts)?.groupValues?.getOrNull(1)?.takeIf(String::isNotBlank)
+		if (mangaId == null || nonce == null) return loadChaptersLegacy(mangaUrl, doc)
+
+		val items = org.jsoup.select.Elements()
+		var page = 1
+		do {
+			val response = webClient.httpPost(
+				"https://$domain/wp-admin/admin-ajax.php".toHttpUrl(),
+				mapOf(
+					"action" to "nhv_manga_single_chapters_page",
+					"nonce" to nonce,
+					"manga_id" to mangaId,
+					"volume" to "-1",
+					"page" to page.toString(),
+					"per_page" to CHAPTERS_PER_PAGE.toString(),
+					"order" to "desc",
+				),
+				Headers.Builder()
+					.add("Accept", "application/json")
+					.add("Referer", mangaUrl)
+					.add("X-Requested-With", "XMLHttpRequest")
+					.add("User-Agent", config[userAgentKey])
+					.build(),
+			).parseJson()
+			if (!response.optBoolean("success")) break
+			val fragment = Jsoup.parseBodyFragment(response.optString("html"), mangaUrl)
+			val pageItems = fragment.select("li.wp-manga-chapter[data-chapter-id]")
+			if (pageItems.isEmpty()) break
+			items.addAll(pageItems)
+			page++
+			val hasMore = response.optBoolean("has_more")
+		} while (hasMore && page <= MAX_CHAPTER_PAGES)
+
+		return if (items.isEmpty()) loadChaptersLegacy(mangaUrl, doc) else parseChapterElements(items, mangaId)
+	}
+
+	private suspend fun loadChaptersLegacy(mangaUrl: String, doc: Document): List<MangaChapter> {
 		val mangaId = doc.selectFirst("[data-manga-id]")?.attr("data-manga-id")
 			?.takeIf(String::isNotBlank)
 			?: doc.selectFirst("#manga-chapters-holder")?.attr("data-id")?.takeIf(String::isNotBlank)
@@ -319,9 +295,8 @@ internal class Cenele(context: MangaLoaderContext) :
 
 		val doc = webClient.httpGet(cleanUrl).parseHtml()
 		val locator = parseCeneleChapterLocator(chapter.url)
-		val content = locator?.let {
-			loadChapterViaAjax(doc, cleanUrl, it)
-		} ?: findDirectChapterContent(doc, locator)
+		val content = findDirectChapterContent(doc, locator)
+			?: locator?.let { loadChapterViaAjax(doc, cleanUrl, it) }
 		?: return null
 
 		sanitizeChapterContent(content)
@@ -382,18 +357,37 @@ internal class Cenele(context: MangaLoaderContext) :
 
 		private val ZERO_WIDTH_MARKS = Regex("[\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\uFEFF]")
 		private val LOAD_NONCE = Regex("""["']load_nonce["']\s*:\s*["']([^"']+)""")
+		private val CHAPTERS_POST_ID = Regex("""["']postId["']\s*:\s*["']?(\d+)""")
+		private val CHAPTERS_NONCE = Regex("""["']chaptersNonce["']\s*:\s*["']([^"']+)""")
+		private val HIDDEN_CSS_CLASS = Regex(
+			"""\.([A-Za-z][\w-]*)\s*\{[^{}]*display\s*:\s*none(?:\s*!important)?[^{}]*}""",
+			RegexOption.IGNORE_CASE,
+		)
+		private const val CHAPTERS_PER_PAGE = 100
+		private const val MAX_CHAPTER_PAGES = 50
 
 		internal fun findDirectChapterContent(
 			doc: Document,
 			locator: CeneleChapterLocator?,
 		): Element? {
 			if (locator != null) {
-				doc.selectFirst("#chapter-${locator.chapterId} .text-left")?.let { return it }
+				return doc.selectFirst(
+					"#chapter-${locator.chapterId} > article, #chapter-${locator.chapterId} .text-left",
+				)
 			}
-			return doc.selectFirst(".reading-content.current .text-left")
+			return doc.selectFirst(
+				".reading-content.current > article, " +
+					".reading-content.current .text-left, " +
+					".reading-content[data-block-chapter-id] > article",
+			)
 		}
 
 		internal fun sanitizeChapterContent(content: Element): Element {
+			val hiddenClasses = content.select("style").flatMap { style ->
+				HIDDEN_CSS_CLASS.findAll(style.data() + style.html()).map { it.groupValues[1] }.toList()
+			}.distinct()
+			hiddenClasses.forEach { className -> content.getElementsByClass(className).remove() }
+
 			// Cenele injects the anti-copy span inside the same <p> as the real text.
 			// Remove the marker's following bait paragraph before deleting generic
 			// templates. This keeps the relationship intact even if the warning text
@@ -467,6 +461,15 @@ internal class Cenele(context: MangaLoaderContext) :
 					.removeAttr("data-url")
 				return
 			}
+		}
+	}
+
+	private fun parseState(value: String): MangaState? {
+		val status = value.trim().lowercase(Locale.ROOT)
+		return when {
+			status.contains("مستمر") || status.contains("ongoing") || status.contains("on-going") -> MangaState.ONGOING
+			status.contains("مكتمل") || status.contains("completed") || status == "end" -> MangaState.FINISHED
+			else -> null
 		}
 	}
 }

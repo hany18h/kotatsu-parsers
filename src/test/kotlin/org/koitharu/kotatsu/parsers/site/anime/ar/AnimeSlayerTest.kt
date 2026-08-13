@@ -4,8 +4,22 @@ import org.json.JSONArray
 import org.jsoup.Jsoup
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
+import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
+import org.koitharu.kotatsu.parsers.config.ConfigKey
+import org.koitharu.kotatsu.parsers.network.UserAgents
 
 internal class AnimeSlayerTest {
+
+	@Test
+	fun usesTheSameMobileUserAgentInDebugAndRelease() {
+		val keys = mutableListOf<ConfigKey<*>>()
+		AnimeSlayer(MangaLoaderContextMock).onCreateConfig(keys)
+
+		assertEquals(
+			UserAgents.FIREFOX_MOBILE,
+			keys.filterIsInstance<ConfigKey.UserAgent>().single().defaultValue,
+		)
+	}
 
 	@Test
 	fun findsCurrentEpisodeByNumberWhenStoredIdIsStale() {

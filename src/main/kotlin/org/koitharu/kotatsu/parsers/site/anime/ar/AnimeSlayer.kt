@@ -26,6 +26,7 @@ import org.koitharu.kotatsu.parsers.model.MangaTag
 import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
 import org.koitharu.kotatsu.parsers.model.SortOrder
 import org.koitharu.kotatsu.parsers.network.OkHttpWebClient
+import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.network.WebClient
 import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.parseHtml
@@ -65,6 +66,8 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			source,
 		)
 	}
+
+	override val userAgentKey = ConfigKey.UserAgent(UserAgents.FIREFOX_MOBILE)
 
 	override val configKeyDomain = ConfigKey.Domain("anslayer.com")
 
@@ -379,9 +382,17 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		.add("User-Agent", requestUserAgent())
 		.build()
 
-	private fun requestUserAgent(): String = context.getDefaultUserAgent()
-		.takeIf(String::isNotBlank)
-		?: config[userAgentKey]
+	/**
+	 * Do not derive this from Android WebView. Debug and Play-installed applications
+	 * have separate WebView/config state, and some Anime Slayer providers reject the
+	 * WebView-flavoured identity while accepting a regular mobile browser. A stable
+	 * source-specific default keeps API resolution and playback headers identical in
+	 * both variants while still allowing an explicit per-source override.
+	 */
+	private fun requestUserAgent(): String = config[userAgentKey]
+		.trim()
+		.takeIf(String::isNotEmpty)
+		?: UserAgents.FIREFOX_MOBILE
 
 	private fun parseState(value: String): MangaState? = when {
 		value.contains("finished", true) || value.contains("مكتمل") -> MangaState.FINISHED
