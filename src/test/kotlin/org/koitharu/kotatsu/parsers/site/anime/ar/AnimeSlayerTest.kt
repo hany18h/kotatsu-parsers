@@ -11,14 +11,13 @@ import org.koitharu.kotatsu.parsers.network.UserAgents
 internal class AnimeSlayerTest {
 
 	@Test
-	fun usesTheSameMobileUserAgentInDebugAndRelease() {
+	fun ignoresPersistedUserAgentAndUsesTheSameIdentityInDebugAndRelease() {
 		val keys = mutableListOf<ConfigKey<*>>()
-		AnimeSlayer(MangaLoaderContextMock).onCreateConfig(keys)
+		val parser = AnimeSlayer(MangaLoaderContextMock)
+		parser.onCreateConfig(keys)
 
-		assertEquals(
-			UserAgents.FIREFOX_MOBILE,
-			keys.filterIsInstance<ConfigKey.UserAgent>().single().defaultValue,
-		)
+		assertEquals(UserAgents.FIREFOX_MOBILE, parser.getRequestHeaders()["User-Agent"])
+		assertEquals(emptyList<ConfigKey.UserAgent>(), keys.filterIsInstance<ConfigKey.UserAgent>())
 	}
 
 	@Test

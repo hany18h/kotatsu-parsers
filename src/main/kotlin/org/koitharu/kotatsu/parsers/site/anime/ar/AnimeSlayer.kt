@@ -85,9 +85,12 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
-		keys.add(userAgentKey)
 		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
+
+	override fun getRequestHeaders(): Headers = Headers.Builder()
+		.add("User-Agent", UserAgents.FIREFOX_MOBILE)
+		.build()
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions()
 
@@ -387,12 +390,9 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 	 * have separate WebView/config state, and some Anime Slayer providers reject the
 	 * WebView-flavoured identity while accepting a regular mobile browser. A stable
 	 * source-specific default keeps API resolution and playback headers identical in
-	 * both variants while still allowing an explicit per-source override.
+	 * both variants. Ignore any stale per-source value saved by an older build.
 	 */
-	private fun requestUserAgent(): String = config[userAgentKey]
-		.trim()
-		.takeIf(String::isNotEmpty)
-		?: UserAgents.FIREFOX_MOBILE
+	private fun requestUserAgent(): String = UserAgents.FIREFOX_MOBILE
 
 	private fun parseState(value: String): MangaState? = when {
 		value.contains("finished", true) || value.contains("مكتمل") -> MangaState.FINISHED
