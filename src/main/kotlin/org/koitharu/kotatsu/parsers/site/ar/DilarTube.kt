@@ -2,8 +2,8 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
-import okhttp3.Response
+import okio.ByteString.Companion.decodeBase64
+import okio.ByteString.Companion.toByteString
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -12,14 +12,28 @@ import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
+import java.math.BigInteger
+import java.nio.charset.StandardCharsets
+import java.security.KeyFactory
+import java.security.KeyPair
+import java.security.KeyPairGenerator
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECPoint
+import java.security.spec.ECPublicKeySpec
 import java.text.SimpleDateFormat
 import java.util.*
+import javax.crypto.Cipher
+import javax.crypto.KeyAgreement
+import javax.crypto.Mac
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 @MangaSourceParser("DILARTUBE", "Dilar Tube", "ar", ContentType.MANGA)
 internal class DilarTube(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.DILARTUBE, 24) {
 
-    override val configKeyDomain = ConfigKey.Domain("v2.dilar.tube")
+    override val configKeyDomain = ConfigKey.Domain("dilar.tube")
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
@@ -39,7 +53,7 @@ internal class DilarTube(context: MangaLoaderContext) :
         val hasSearch = !filter.query.isNullOrBlank()
 
         if (!hasSearch) {
-            val url = "https://v2.dilar.tube/api/series/?page=$page"
+            val url = "https://$domain/api/series/?page=$page"
             val response = webClient.httpGet(url).parseJson()
             val series = response.getJSONArray("series")
             return (0 until series.length()).map { i ->
@@ -48,7 +62,7 @@ internal class DilarTube(context: MangaLoaderContext) :
         }
 
         // Search: use quick_search — response is a JSONArray of categories
-        val url = "https://dilar.tube/api/search/quick_search"
+        val url = "https://$domain/api/search/quick_search"
         val jsonBody = JSONObject().apply {
             put("query", filter.query)
             put("includes", JSONArray().apply {
@@ -72,7 +86,7 @@ internal class DilarTube(context: MangaLoaderContext) :
     }
 
     private fun parseMangaFromJson(json: JSONObject): Manga {
-        val id = json.getInt("id")
+        val id = json.getString("id")
         val title = json.getString("title")
         val cover = json.optString("cover", "")
         val summary = json.optString("summary", "")
@@ -83,7 +97,7 @@ internal class DilarTube(context: MangaLoaderContext) :
                 cover
             } else {
                 val coverName = cover.substringBeforeLast('.') + ".webp"
-                "https://dilar.tube/uploads/manga/cover/$id/large_$coverName"
+                "https://$domain/uploads/manga/cover/$id/large_$coverName"
             }
         } else ""
 
@@ -93,10 +107,16 @@ internal class DilarTube(context: MangaLoaderContext) :
         val synonyms = json.optJSONObject("synonyms")
         val altTitles = mutableSetOf<String>()
         synonyms?.let { syn ->
-            syn.optString("arabic")?.takeIf { it.isNotEmpty() && it != "null" }?.let { altTitles.add(it) }
-            syn.optString("english")?.takeIf { it.isNotEmpty() && it != "null" }?.let { altTitles.add(it) }
-            syn.optString("japanese")?.takeIf { it.isNotEmpty() && it != "null" }?.let { altTitles.add(it) }
-            syn.optString("alternative")?.takeIf { it.isNotEmpty() && it != "null" }?.let { altTitles.add(it) }
+            arrayOf("arabic", "english", "japanese", "alternative").forEach { key ->
+                val values = syn.optJSONArray(key)
+                if (values != null) {
+                    for (i in 0 until values.length()) {
+                        values.optString(i).trim().takeIf(String::isNotEmpty)?.let(altTitles::add)
+                    }
+                } else {
+                    syn.optString(key).trim().takeIf { it.isNotEmpty() && it != "null" }?.let(altTitles::add)
+                }
+            }
         }
 
         val status = json.optString("story_status", "")
@@ -108,10 +128,10 @@ internal class DilarTube(context: MangaLoaderContext) :
         }
 
         return Manga(
-            id = generateUid(id.toLong()),
+            id = generateUid(id),
             title = title,
             url = "/series/$id",
-            publicUrl = "https://v2.dilar.tube/series/$id",
+            publicUrl = "https://$domain/series/$id",
             coverUrl = coverUrl,
             source = source,
             rating = rating,
@@ -128,7 +148,7 @@ internal class DilarTube(context: MangaLoaderContext) :
 
     override suspend fun getDetails(manga: Manga): Manga {
         val id = manga.url.substringAfterLast("/")
-        val url = "https://v2.dilar.tube/api/series/$id"
+        val url = "https://$domain/api/series/$id"
         val json = webClient.httpGet(url).parseJson()
 
         val title = json.getString("title")
@@ -137,7 +157,7 @@ internal class DilarTube(context: MangaLoaderContext) :
         val cover = json.optString("cover").nullIfEmpty()
         val coverUrl = if (cover != null) {
             val coverName = cover.substringBeforeLast('.') + ".webp"
-            "https://dilar.tube/uploads/manga/cover/$id/large_$coverName"
+            "https://$domain/uploads/manga/cover/$id/large_$coverName"
         } else manga.coverUrl
 
         val statusStr = json.optString("story_status")
@@ -178,7 +198,7 @@ internal class DilarTube(context: MangaLoaderContext) :
     }
 
     private suspend fun getChapters(seriesId: String): List<MangaChapter> {
-        val url = "https://v2.dilar.tube/api/series/$seriesId/chapters"
+        val url = "https://$domain/api/series/$seriesId/chapters"
         val response = webClient.httpGet(url).parseJson()
         val chaptersJson = response.getJSONArray("chapters")
         val chapters = mutableListOf<MangaChapter>()
@@ -187,11 +207,11 @@ internal class DilarTube(context: MangaLoaderContext) :
 
         for (i in 0 until chaptersJson.length()) {
             val item = chaptersJson.getJSONObject(i)
-            val releases = item.getJSONArray("releases")
+            val releases = item.optJSONArray("releases") ?: continue
             if (releases.length() == 0) continue
 
             val release = releases.getJSONObject(0)
-            val releaseId = release.getInt("id")
+            val releaseId = release.getString("id")
             
             val chapterNum = item.optString("chapter").toFloatOrNull() ?: 0f
             val volNum = item.optString("volume").toIntOrNull() ?: 0
@@ -206,7 +226,7 @@ internal class DilarTube(context: MangaLoaderContext) :
 
             chapters.add(
                 MangaChapter(
-                    id = generateUid(releaseId.toString()),
+                    id = generateUid(releaseId),
                     title = title,
                     number = chapterNum,
                     volume = volNum,
@@ -223,10 +243,13 @@ internal class DilarTube(context: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val id = chapter.url.substringAfterLast("/")
-        val url = "https://v2.dilar.tube/api/chapters/$id"
-        val json = webClient.httpGet(url).parseJson()
+        val url = "https://$domain/api/chapters/$id"
+        val json = loadEncryptedJson(url)
         val pagesJson = json.getJSONArray("pages")
         val storageKey = json.optString("storage_key").nullIfEmpty()
+        val mediaToken = json.optString("media_token").nullIfEmpty()
+        val teamId = json.optString("init_team_id").nullIfEmpty()
+            ?: json.optJSONArray("teams")?.optJSONObject(0)?.optString("id")?.nullIfEmpty()
 
         return (0 until pagesJson.length()).map { i ->
             val page = pagesJson.getJSONObject(i)
@@ -236,18 +259,135 @@ internal class DilarTube(context: MangaLoaderContext) :
                 imageUrl
             } else {
                 if (storageKey != null) {
-                    "https://dilar.tube/uploads/releases/$storageKey/hq/$imageUrl"
+                    val resolvedStorageKey = if ('/' in storageKey || teamId == null) {
+                        storageKey
+                    } else {
+                        "$teamId/$storageKey"
+                    }
+                    val qualityDirectory = page.optString("dir", "hq").ifBlank { "hq" }
+                    "https://$domain/uploads/releases/$resolvedStorageKey/$qualityDirectory/$imageUrl"
                 } else {
-                    "https://dilar.tube/uploads/$imageUrl"
+                    "https://$domain/uploads/$imageUrl"
                 }
+            }
+
+            val authorizedUrl = if (mediaToken != null && fullUrl.startsWith("https://$domain/uploads/releases/")) {
+                fullUrl.toHttpUrl().newBuilder().addQueryParameter("t", mediaToken).build().toString()
+            } else {
+                fullUrl
             }
 
             MangaPage(
                 id = generateUid("$id-$i"),
-                url = fullUrl,
+                url = authorizedUrl,
                 preview = null,
                 source = source
             )
         }
+    }
+
+    /**
+     * Dilar encrypts chapter responses with an ephemeral P-256 ECDH key. The
+     * browser sends its raw public key in X-DH-Pub, then opens the returned
+     * AES-GCM envelope using HKDF-SHA256. Keep this local to the parser so no
+     * account, shared secret, or device identifier is involved.
+     */
+    private suspend fun loadEncryptedJson(url: String): JSONObject {
+        val keyPair = KeyPairGenerator.getInstance("EC").apply {
+            initialize(ECGenParameterSpec("secp256r1"))
+        }.generateKeyPair()
+        val publicKey = encodeRawPublicKey(keyPair.public as ECPublicKey)
+        val publicKeyHeader = publicKey.toByteString().base64Url().trimEnd('=')
+        val envelope = webClient.httpGet(
+            url,
+            Headers.Builder()
+                .add("Accept", "application/json")
+                .add("Referer", "https://$domain/")
+                .add("X-DH-Pub", publicKeyHeader)
+                .build(),
+        ).parseJson()
+        if (!envelope.has("epk") || !envelope.has("ct")) return envelope
+        return decryptResponseEnvelope(envelope, keyPair, publicKey)
+    }
+
+    private fun decryptResponseEnvelope(
+        envelope: JSONObject,
+        keyPair: KeyPair,
+        clientPublicKey: ByteArray,
+    ): JSONObject {
+        require(envelope.getInt("v") == 1) { "Unsupported Dilar encryption version" }
+        val serverPublicKeyRaw = decodeBase64Url(envelope.getString("epk"))
+        val clientPublic = keyPair.public as ECPublicKey
+        val coordinateSize = (clientPublic.params.curve.field.fieldSize + 7) / 8
+        require(serverPublicKeyRaw.size == 1 + coordinateSize * 2 && serverPublicKeyRaw[0] == 4.toByte()) {
+            "Invalid Dilar ECDH public key"
+        }
+        val serverPoint = ECPoint(
+            BigInteger(1, serverPublicKeyRaw.copyOfRange(1, 1 + coordinateSize)),
+            BigInteger(1, serverPublicKeyRaw.copyOfRange(1 + coordinateSize, serverPublicKeyRaw.size)),
+        )
+        val serverPublicKey = KeyFactory.getInstance("EC").generatePublic(
+            ECPublicKeySpec(serverPoint, clientPublic.params),
+        )
+        val sharedSecret = KeyAgreement.getInstance("ECDH").run {
+            init(keyPair.private)
+            doPhase(serverPublicKey, true)
+            generateSecret()
+        }
+        val salt = clientPublicKey + serverPublicKeyRaw
+        val info = "dilar.response.ecies.v1|${envelope.getLong("e")}".toByteArray(StandardCharsets.UTF_8)
+        val aesKey = hkdfSha256(sharedSecret, salt, info, 32)
+        val cipherText = decodeBase64Url(envelope.getString("ct")) + decodeBase64Url(envelope.getString("tag"))
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            Cipher.DECRYPT_MODE,
+            SecretKeySpec(aesKey, "AES"),
+            GCMParameterSpec(128, decodeBase64Url(envelope.getString("iv"))),
+        )
+        return JSONObject(String(cipher.doFinal(cipherText), StandardCharsets.UTF_8))
+    }
+
+    private fun encodeRawPublicKey(publicKey: ECPublicKey): ByteArray {
+        val coordinateSize = (publicKey.params.curve.field.fieldSize + 7) / 8
+        return byteArrayOf(4) +
+            publicKey.w.affineX.toUnsignedFixedLength(coordinateSize) +
+            publicKey.w.affineY.toUnsignedFixedLength(coordinateSize)
+    }
+
+    private fun BigInteger.toUnsignedFixedLength(size: Int): ByteArray {
+        val encoded = toByteArray()
+        val unsigned = if (encoded.size > 1 && encoded[0] == 0.toByte()) encoded.copyOfRange(1, encoded.size) else encoded
+        require(unsigned.size <= size) { "EC coordinate is too large" }
+        return ByteArray(size - unsigned.size) + unsigned
+    }
+
+    private fun decodeBase64Url(value: String): ByteArray =
+        value.decodeBase64()?.toByteArray() ?: error("Invalid base64url value")
+
+    private fun hkdfSha256(
+        inputKey: ByteArray,
+        salt: ByteArray,
+        info: ByteArray,
+        outputLength: Int,
+    ): ByteArray {
+        val hmac = Mac.getInstance("HmacSHA256")
+        hmac.init(SecretKeySpec(salt, "HmacSHA256"))
+        val pseudoRandomKey = hmac.doFinal(inputKey)
+        val result = ByteArray(outputLength)
+        var previous = ByteArray(0)
+        var offset = 0
+        var counter = 1
+        while (offset < outputLength) {
+            hmac.init(SecretKeySpec(pseudoRandomKey, "HmacSHA256"))
+            hmac.update(previous)
+            hmac.update(info)
+            hmac.update(counter.toByte())
+            previous = hmac.doFinal()
+            val count = minOf(previous.size, outputLength - offset)
+            previous.copyInto(result, offset, 0, count)
+            offset += count
+            counter++
+        }
+        return result
     }
 }
