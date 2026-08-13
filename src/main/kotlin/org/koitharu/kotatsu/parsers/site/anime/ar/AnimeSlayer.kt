@@ -1,5 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.anime.ar
 
+import okhttp3.CookieJar
 import okhttp3.Headers
 import org.json.JSONArray
 import org.json.JSONObject
@@ -24,6 +25,8 @@ import org.koitharu.kotatsu.parsers.model.MangaState
 import org.koitharu.kotatsu.parsers.model.MangaTag
 import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
 import org.koitharu.kotatsu.parsers.model.SortOrder
+import org.koitharu.kotatsu.parsers.network.OkHttpWebClient
+import org.koitharu.kotatsu.parsers.network.WebClient
 import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.parseJson
@@ -34,6 +37,7 @@ import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.EnumSet
 import java.util.Locale
+import kotlin.math.abs
 
 /**
  * Parser for the catalogue and episode servers used by the official Anime
@@ -46,6 +50,21 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 	pageSize = PAGE_SIZE,
 	searchPageSize = PAGE_SIZE,
 ) {
+	/**
+	 * Debug and release applications use different persistent cookie/cache stores. Anime
+	 * Slayer's API and public video providers do not require a signed-in session, therefore
+	 * reusing persisted state can only make identical parser code behave differently. Keep
+	 * this source stateless while retaining the application's interceptors and proxy setup.
+	 */
+	private val statelessWebClient: WebClient by lazy {
+		OkHttpWebClient(
+			context.httpClient.newBuilder()
+				.cookieJar(CookieJar.NO_COOKIES)
+				.cache(null)
+				.build(),
+			source,
+		)
+	}
 
 	override val configKeyDomain = ConfigKey.Domain("anslayer.com")
 
@@ -93,7 +112,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		}
 		payload.put("just_info", "Yes")
 
-		val response = webClient.httpGet(
+		val response = statelessWebClient.httpGet(
 			"$API_BASE/animes/get-published-animes?json=${payload.toString().urlEncoded()}",
 			apiHeaders(),
 		).parseJson()
@@ -138,28 +157,31 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 
 	override suspend fun getVideoStreams(chapter: MangaChapter): List<AnimeStream> {
 		val parts = chapter.url.substringAfter(EPISODE_PATH).split('/', limit = 2)
-		if (parts.size != 2) return emptyList()
+		require(EPISODE_PATH in chapter.url && parts.size == 2 && parts.all(String::isNotBlank)) {
+			"Unsupported Anime Slayer episode URL: ${chapter.url}"
+		}
 		val animeId = parts[0]
 		val episodeId = parts[1]
 		val details = loadDetails(animeId) ?: return emptyList()
 		val episodes = details.optJSONObject("episodes")?.optJSONArray("data") ?: return emptyList()
-		val episode = (0 until episodes.length())
-			.asSequence()
-			.mapNotNull(episodes::optJSONObject)
-			.firstOrNull { it.optString("episode_id") == episodeId }
+		val episode = findEpisode(episodes, episodeId, chapter.number)
 			?: return emptyList()
 		val servers = episode.optJSONArray("episode_urls") ?: return emptyList()
 
 		val result = ArrayList<AnimeStream>()
+		var firstFailure: Throwable? = null
 		for (index in 0 until servers.length()) {
 			val server = servers.optJSONObject(index) ?: continue
-			result += runCatching { resolveServer(server) }.getOrDefault(emptyList())
+			runCatching { resolveServer(server) }
+				.onSuccess(result::addAll)
+				.onFailure { error -> if (firstFailure == null) firstFailure = error }
 		}
+		if (result.isEmpty()) firstFailure?.let { throw it }
 		return result.distinctBy(AnimeStream::url)
 	}
 
 	private suspend fun loadDetails(animeId: String): JSONObject? {
-		val response = webClient.httpGet(
+		val response = statelessWebClient.httpGet(
 			"$API_BASE/anime/get-anime-details?anime_id=${animeId.urlEncoded()}" +
 				"&fetch_episodes=Yes&more_info=No",
 			apiHeaders(),
@@ -173,7 +195,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		.add("Pragma", "no-cache")
 		.add("Client-Id", CLIENT_ID)
 		.add("Client-Secret", CLIENT_SECRET)
-		.add("User-Agent", config[userAgentKey])
+		.add("User-Agent", requestUserAgent())
 		.build()
 
 	private fun parseAnime(item: JSONObject): Manga? {
@@ -255,13 +277,13 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			}.distinct()
 		}
 
-		return buildList {
+		var firstFailure: Throwable? = null
+		val streams = buildList {
 			for (candidate in candidates) {
 				// One blocked provider must not discard all remaining servers.
 				// MediaFire, in particular, can be unavailable on one network while
 				// StreamTape from the same response is still playable.
-				addAll(
-					runCatching {
+				runCatching {
 						when {
 							candidate.contains("mediafire.com", ignoreCase = true) -> {
 								listOfNotNull(resolveMediaFire(candidate, serverName))
@@ -279,34 +301,42 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 								}
 							}
 						}
-					}.getOrDefault(emptyList()),
-				)
+					}
+					.onSuccess(::addAll)
+					.onFailure { error -> if (firstFailure == null) firstFailure = error }
 			}
 		}
+		if (streams.isEmpty()) firstFailure?.let { throw it }
+		return streams
 	}
 
 	private suspend fun loadAlternativeLinks(serverUrl: String): List<String> {
+		var firstFailure: Throwable? = null
+		var receivedResponse = false
 		for (requestUrl in alternativeEndpointCandidates(serverUrl)) {
 			val raw = runCatching {
-				webClient.httpGet(
+				statelessWebClient.httpGet(
 					requestUrl,
 					pageHeaders("https://anslayer.com/"),
 				).parseRaw()
-			}.getOrNull() ?: continue
+			}.onFailure { error -> if (firstFailure == null) firstFailure = error }
+				.getOrNull() ?: continue
+			receivedResponse = true
 			val links = parseAlternativeLinks(raw)
 			if (links.isNotEmpty()) return links
 		}
+		if (!receivedResponse) firstFailure?.let { throw it }
 		return emptyList()
 	}
 
 	private suspend fun resolveMediaFire(url: String, serverName: String): AnimeStream? {
-		val document = webClient.httpGet(url, pageHeaders("https://anslayer.com/")).parseHtml()
+		val document = statelessWebClient.httpGet(url, pageHeaders("https://anslayer.com/")).parseHtml()
 		val direct = extractMediaFireDirectUrl(document) ?: return null
 		return createStream("$serverName • MediaFire", direct, url)
 	}
 
 	private suspend fun resolveStreamTape(url: String, serverName: String): AnimeStream? {
-		val raw = webClient.httpGet(url, pageHeaders("https://anslayer.com/")).parseRaw()
+		val raw = statelessWebClient.httpGet(url, pageHeaders("https://anslayer.com/")).parseRaw()
 		val direct = extractStreamTapeScriptUrl(raw, url)
 			?: extractStreamTapeDirectUrl(Jsoup.parse(raw, url), url)
 			?: findStreamTapeUrl(raw)
@@ -317,7 +347,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 
 	private suspend fun extractPageLinks(url: String, referer: String): List<String> {
 		val raw = runCatching {
-			webClient.httpGet(url, pageHeaders(referer)).parseRaw()
+			statelessWebClient.httpGet(url, pageHeaders(referer)).parseRaw()
 		}.getOrNull() ?: return emptyList()
 		return buildList {
 			addAll(findDirectMediaUrls(raw))
@@ -332,7 +362,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			url = absoluteUrl(url, referer),
 			headers = mapOf(
 				"Referer" to referer,
-				"User-Agent" to config[userAgentKey],
+				"User-Agent" to requestUserAgent(),
 				"Cache-Control" to "no-cache",
 				"Pragma" to "no-cache",
 			),
@@ -346,8 +376,12 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		.add("Cache-Control", "no-cache, no-store")
 		.add("Pragma", "no-cache")
 		.add("Referer", referer)
-		.add("User-Agent", config[userAgentKey])
+		.add("User-Agent", requestUserAgent())
 		.build()
+
+	private fun requestUserAgent(): String = context.getDefaultUserAgent()
+		.takeIf(String::isNotBlank)
+		?: config[userAgentKey]
 
 	private fun parseState(value: String): MangaState? = when {
 		value.contains("finished", true) || value.contains("مكتمل") -> MangaState.FINISHED
@@ -386,6 +420,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		const val CLIENT_SECRET = "7befba6263cc14c90d2f1d6da2c5cf9b251bfbbd"
 		const val ANIME_PATH = "/anime/"
 		const val EPISODE_PATH = "/episode/"
+		const val EPISODE_NUMBER_EPSILON = 0.001f
 
 		val QUALITY_NUMBER = Regex("""(?:^|[_\-.])(\d{3,4})p?(?:[_\-.]|$)""", RegexOption.IGNORE_CASE)
 		val DIRECT_MEDIA_URL = Regex(
@@ -417,6 +452,18 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			"""(?:(?:https?:)?//)[^\s"'<>\\]+""",
 			RegexOption.IGNORE_CASE,
 		)
+
+		fun findEpisode(episodes: JSONArray, episodeId: String, episodeNumber: Float): JSONObject? {
+			val availableEpisodes = (0 until episodes.length())
+				.asSequence()
+				.mapNotNull(episodes::optJSONObject)
+				.toList()
+			return availableEpisodes.firstOrNull { it.optString("episode_id") == episodeId }
+				?: availableEpisodes.firstOrNull {
+					val freshNumber = it.optString("episode_number").toFloatOrNull()
+					freshNumber != null && abs(freshNumber - episodeNumber) <= EPISODE_NUMBER_EPSILON
+				}
+		}
 
 		fun alternativeEndpointCandidates(serverUrl: String): List<String> = buildList {
 			add(serverUrl.replace("\\", "%5C"))
