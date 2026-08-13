@@ -61,4 +61,23 @@ internal class CeneleChapterLocatorTest {
 		)
 		assertEquals("النص الصحيح للفصل", content?.text())
 	}
+
+	@Test
+	fun selectsLiveRandomClassArticleByStableChapterContainer() {
+		val document = Jsoup.parse(
+			"""
+			<div id="chapter-83566" class="reading-content current" data-block-chapter-id="83566">
+			  <article class="tbc5e0b2d"><p>نص الفصل الجديد</p></article>
+			</div>
+			""".trimIndent(),
+		)
+
+		val content = Cenele.findDirectChapterContent(
+			document,
+			CeneleChapterLocator(mangaId = "90268", chapterId = "83566"),
+		)
+
+		assertEquals("article", content?.tagName())
+		assertEquals("نص الفصل الجديد", content?.text())
+	}
 }

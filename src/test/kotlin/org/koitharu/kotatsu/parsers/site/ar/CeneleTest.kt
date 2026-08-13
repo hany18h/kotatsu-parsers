@@ -106,4 +106,25 @@ internal class CeneleTest {
 		assertFalse(content.text().contains("هذا تنبيه"))
 		assertFalse(content.text().contains("نص تمويهي"))
 	}
+
+	@Test
+	fun removesRandomAntiCopyClassDeclaredHiddenByInlineCss() {
+		val document = Jsoup.parse(
+			"""
+			<article class="random-body">
+			  <style>.reading-content .r04dfb668cee13df{display:none!important;}</style>
+			  <p>الفقرة الحقيقية الأولى</p>
+			  <div class="r04dfb668cee13df"><p>نص طُعم متغير</p></div>
+			  <p>الفقرة الحقيقية الثانية</p>
+			</article>
+			""".trimIndent(),
+		)
+		val content = document.selectFirst("article")!!
+
+		Cenele.sanitizeChapterContent(content)
+
+		assertTrue(content.text().contains("الفقرة الحقيقية الأولى"))
+		assertTrue(content.text().contains("الفقرة الحقيقية الثانية"))
+		assertFalse(content.text().contains("نص طُعم متغير"))
+	}
 }
