@@ -1,10 +1,24 @@
 package org.koitharu.kotatsu.parsers.site.anime.ar
 
+import org.json.JSONArray
 import org.jsoup.Jsoup
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 
 internal class AnimeSlayerTest {
+
+	@Test
+	fun findsCurrentEpisodeByNumberWhenStoredIdIsStale() {
+		val episodes = JSONArray(
+			"""[{"episode_id":"new-id","episode_number":"12"}]""",
+		)
+
+		assertEquals(
+			"new-id",
+			AnimeSlayer.findEpisode(episodes, episodeId = "old-id", episodeNumber = 12f)
+				?.optString("episode_id"),
+		)
+	}
 
 	@Test
 	fun parsesAlternativeServerLinks() {
