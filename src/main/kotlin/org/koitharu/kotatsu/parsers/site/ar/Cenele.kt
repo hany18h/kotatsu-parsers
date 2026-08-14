@@ -293,7 +293,19 @@ internal class Cenele(context: MangaLoaderContext) :
 			.replace("&style=list", "")
 			.toAbsoluteUrl(domain)
 
-		val doc = webClient.httpGet(cleanUrl).parseHtml()
+		// Chapter markup is randomized on every response. Reusing an older cached
+		// document (or an empty 304 body) can therefore make an otherwise valid
+		// chapter look unsupported, especially during continuous prefetching.
+		val doc = webClient.httpGet(
+			cleanUrl,
+			Headers.Builder()
+				.add("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+				.add("Cache-Control", "no-cache, no-store")
+				.add("Pragma", "no-cache")
+				.add("Referer", "https://$domain/")
+				.add("User-Agent", config[userAgentKey])
+				.build(),
+		).parseHtml()
 		val locator = parseCeneleChapterLocator(chapter.url)
 		val content = findDirectChapterContent(doc, locator)
 			?: locator?.let { loadChapterViaAjax(doc, cleanUrl, it) }
@@ -370,15 +382,14 @@ internal class Cenele(context: MangaLoaderContext) :
 			doc: Document,
 			locator: CeneleChapterLocator?,
 		): Element? {
-			if (locator != null) {
-				return doc.selectFirst(
-					"#chapter-${locator.chapterId} > article, #chapter-${locator.chapterId} .text-left",
-				)
-			}
-			return doc.selectFirst(
-				".reading-content.current > article, " +
-					".reading-content.current .text-left, " +
-					".reading-content[data-block-chapter-id] > article",
+			val chapterRoot = locator?.let { value ->
+				doc.selectFirst("#chapter-${value.chapterId}")
+			} ?: doc.selectFirst(
+				".reading-content.current, .reading-content[data-block-chapter-id]",
+			)
+			return chapterRoot?.selectFirst(
+				"article, .text-left, .text-content, .text-chapter-content, " +
+					"aside:has(input[id^=chapter-url-])",
 			)
 		}
 

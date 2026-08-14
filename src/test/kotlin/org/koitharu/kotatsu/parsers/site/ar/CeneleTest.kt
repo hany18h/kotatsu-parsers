@@ -20,6 +20,33 @@ internal class CeneleTest {
 	}
 
 	@Test
+	fun detectsRandomizedAsideBeforeSiteAddsTextLeftClass() {
+		val document = Jsoup.parse(
+			"""
+			<div id="chapter-53320" class="reading-content current" data-block-chapter-id="53320">
+			  <div class="chapter-warning"><p>support form</p></div>
+			  <aside class="t4644676f">
+			    <input type="hidden" id="chapter-url-53320" value="https://cenele.com/cont/example/3/">
+			    <style>.reading-content .bait{display:none!important;}</style>
+			    <p>real chapter body</p>
+			  </aside>
+			  <script>document.currentScript.previousElementSibling.classList.add('text-left')</script>
+			</div>
+			""".trimIndent(),
+		)
+
+		val withLocator = Cenele.findDirectChapterContent(
+			document,
+			CeneleChapterLocator("67184", "53320"),
+		)
+		val legacyUrl = Cenele.findDirectChapterContent(document, null)
+
+		assertTrue(withLocator?.tagName() == "aside")
+		assertTrue(withLocator?.text()?.contains("real chapter body") == true)
+		assertTrue(legacyUrl === withLocator)
+	}
+
+	@Test
 	fun keepsRealTextWhenHiddenBaitIsInsideTheSameParagraph() {
 		val document = Jsoup.parse(
 			"""
