@@ -360,7 +360,7 @@ internal class Cenele(context: MangaLoaderContext) :
 		private val CHAPTERS_POST_ID = Regex("""["']postId["']\s*:\s*["']?(\d+)""")
 		private val CHAPTERS_NONCE = Regex("""["']chaptersNonce["']\s*:\s*["']([^"']+)""")
 		private val HIDDEN_CSS_CLASS = Regex(
-			"""\.([A-Za-z][\w-]*)\s*\{[^{}]*display\s*:\s*none(?:\s*!important)?[^{}]*}""",
+			"""\.([A-Za-z][\w-]*)\s*\{[^{}]*display\s*:\s*none(?:\s*!important)?[^{}]*\}""",
 			RegexOption.IGNORE_CASE,
 		)
 		private const val CHAPTERS_PER_PAGE = 100

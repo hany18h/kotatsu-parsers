@@ -11,14 +11,13 @@ import org.koitharu.kotatsu.parsers.network.UserAgents
 internal class AnimeSlayerTest {
 
 	@Test
-	fun usesTheSameMobileUserAgentInDebugAndRelease() {
+	fun ignoresPersistedUserAgentAndUsesTheSameIdentityInDebugAndRelease() {
 		val keys = mutableListOf<ConfigKey<*>>()
-		AnimeSlayer(MangaLoaderContextMock).onCreateConfig(keys)
+		val parser = AnimeSlayer(MangaLoaderContextMock)
+		parser.onCreateConfig(keys)
 
-		assertEquals(
-			UserAgents.FIREFOX_MOBILE,
-			keys.filterIsInstance<ConfigKey.UserAgent>().single().defaultValue,
-		)
+		assertEquals(UserAgents.FIREFOX_MOBILE, parser.getRequestHeaders()["User-Agent"])
+		assertEquals(emptyList<ConfigKey.UserAgent>(), keys.filterIsInstance<ConfigKey.UserAgent>())
 	}
 
 	@Test
@@ -147,6 +146,51 @@ internal class AnimeSlayerTest {
 		assertEquals(
 			"https://download.example.com/episode_h.mp4",
 			AnimeSlayer.extractMediaFireDirectUrl(document),
+		)
+	}
+
+	@Test
+	fun convertsOkRuWatchUrlsToTheLightweightEmbedPlayer() {
+		assertEquals(
+			"https://ok.ru/videoembed/123456789",
+			AnimeSlayer.okRuEmbedUrl("https://m.ok.ru/video/123456789"),
+		)
+	}
+
+	@Test
+	fun extractsOkRuHlsAndQualityStreamsFromPlayerMetadata() {
+		val metadata = org.json.JSONObject()
+			.put(
+				"movie",
+				org.json.JSONObject()
+					.put("hlsManifestUrl", "https://vd.okcdn.ru/master.m3u8?token=abc")
+					.put(
+						"videos",
+						JSONArray()
+							.put(
+								org.json.JSONObject()
+									.put("name", "hd")
+									.put("url", "https://vd.okcdn.ru/video-720.mp4"),
+							)
+							.put(
+								org.json.JSONObject()
+									.put("name", "sd")
+									.put("url", "https://www.youtube.com/v/external"),
+							),
+					),
+			)
+			.toString()
+		val options = org.json.JSONObject()
+			.put("flashvars", org.json.JSONObject().put("metadata", metadata))
+			.toString()
+		val document = Jsoup.parse("""<div data-options='$options'></div>""")
+
+		assertEquals(
+			listOf(
+				"https://vd.okcdn.ru/master.m3u8?token=abc" to null,
+				"https://vd.okcdn.ru/video-720.mp4" to "720p",
+			),
+			AnimeSlayer.extractOkRuVideos(document),
 		)
 	}
 

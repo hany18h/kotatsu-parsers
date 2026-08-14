@@ -85,9 +85,12 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
-		keys.add(userAgentKey)
 		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
+
+	override fun getRequestHeaders(): Headers = Headers.Builder()
+		.add("User-Agent", UserAgents.FIREFOX_MOBILE)
+		.build()
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions()
 
@@ -269,6 +272,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			?: return emptyList()
 		val candidates = when {
 			isDirectMediaUrl(serverUrl) || serverUrl.contains("/get_video?", ignoreCase = true) -> listOf(serverUrl)
+			isOkRuUrl(serverUrl) -> listOf(serverUrl)
 			serverUrl.contains("a-reslayer.com", ignoreCase = true) -> {
 				loadAlternativeLinks(serverUrl)
 			}
@@ -294,6 +298,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 							candidate.contains("streamtape.", ignoreCase = true) -> {
 								listOfNotNull(resolveStreamTape(candidate, serverName))
 							}
+							isOkRuUrl(candidate) -> resolveOkRu(candidate, serverName)
 							isDirectMediaUrl(candidate) ||
 								candidate.contains("/get_video?", ignoreCase = true) -> {
 								listOf(createStream(serverName, candidate, serverUrl))
@@ -358,8 +363,24 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		}.distinct()
 	}
 
-	private fun createStream(name: String, url: String, referer: String): AnimeStream {
-		val quality = detectQuality(url)
+	private suspend fun resolveOkRu(url: String, serverName: String): List<AnimeStream> {
+		val embedUrl = okRuEmbedUrl(url) ?: url
+		val document = statelessWebClient.httpGet(
+			embedUrl,
+			pageHeaders("https://anslayer.com/"),
+		).parseHtml()
+		return extractOkRuVideos(document).map { (direct, quality) ->
+			createStream("$serverName • OK.ru", direct, embedUrl, quality)
+		}
+	}
+
+	private fun createStream(
+		name: String,
+		url: String,
+		referer: String,
+		qualityHint: String? = null,
+	): AnimeStream {
+		val quality = qualityHint ?: detectQuality(url)
 		return AnimeStream(
 			name = listOfNotNull("Anime Slayer", name, quality).joinToString(" • "),
 			url = absoluteUrl(url, referer),
@@ -387,12 +408,9 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 	 * have separate WebView/config state, and some Anime Slayer providers reject the
 	 * WebView-flavoured identity while accepting a regular mobile browser. A stable
 	 * source-specific default keeps API resolution and playback headers identical in
-	 * both variants while still allowing an explicit per-source override.
+	 * both variants. Ignore any stale per-source value saved by an older build.
 	 */
-	private fun requestUserAgent(): String = config[userAgentKey]
-		.trim()
-		.takeIf(String::isNotEmpty)
-		?: UserAgents.FIREFOX_MOBILE
+	private fun requestUserAgent(): String = UserAgents.FIREFOX_MOBILE
 
 	private fun parseState(value: String): MangaState? = when {
 		value.contains("finished", true) || value.contains("مكتمل") -> MangaState.FINISHED
@@ -461,6 +479,10 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		)
 		val ABSOLUTE_URL = Regex(
 			"""(?:(?:https?:)?//)[^\s"'<>\\]+""",
+			RegexOption.IGNORE_CASE,
+		)
+		val OK_RU_VIDEO_ID = Regex(
+			"""/(?:video|videoembed)/(\d+)""",
 			RegexOption.IGNORE_CASE,
 		)
 
@@ -549,6 +571,59 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			.map { element -> element.attr("abs:href").ifBlank { element.attr("href") } }
 			.firstOrNull(::isDirectMediaUrl)
 			?: findDirectMediaUrls(document.html()).firstOrNull()
+
+		fun isOkRuUrl(value: String): Boolean = (runCatching { URI(value).host }
+			.getOrNull()
+			?.let { host -> host.equals("ok.ru", true) || host.endsWith(".ok.ru", true) }) == true
+
+		fun okRuEmbedUrl(value: String): String? {
+			if (!isOkRuUrl(value)) return null
+			val id = OK_RU_VIDEO_ID.find(value)?.groupValues?.getOrNull(1) ?: return null
+			return "https://ok.ru/videoembed/$id"
+		}
+
+		fun extractOkRuVideos(document: Document): List<Pair<String, String?>> {
+			val output = LinkedHashMap<String, String?>()
+			for (element in document.select("[data-options]")) {
+				val options = runCatching { JSONObject(element.attr("data-options")) }.getOrNull() ?: continue
+				val metadata = sequenceOf(
+					options.optJSONObject("flashvars")?.optString("metadata"),
+					options.optString("metadata"),
+				).firstOrNull { !it.isNullOrBlank() }
+					?.let { raw -> runCatching { JSONObject(raw) }.getOrNull() }
+					?: continue
+				collectOkRuVideos(metadata, output)
+				metadata.optJSONObject("movie")?.let { movie -> collectOkRuVideos(movie, output) }
+			}
+			return output.map { (url, quality) -> url to quality }
+		}
+
+		private fun collectOkRuVideos(value: JSONObject, output: MutableMap<String, String?>) {
+			sequenceOf("hlsManifestUrl", "hlsMasterPlaylistUrl", "manifestUrl")
+				.map(value::optString)
+				.filter(String::isNotBlank)
+				.forEach { url -> output.putIfAbsent(url, null) }
+			val videos = value.optJSONArray("videos") ?: return
+			for (index in 0 until videos.length()) {
+				val video = videos.optJSONObject(index) ?: continue
+				val url = video.optString("url").takeIf(String::isNotBlank) ?: continue
+				if (!url.startsWith("http://") && !url.startsWith("https://") && !url.startsWith("//")) continue
+				if ("youtube.com/" in url || "youtu.be/" in url) continue
+				output.putIfAbsent(url, okRuQuality(video.optString("name")))
+			}
+		}
+
+		private fun okRuQuality(name: String): String? = when (name.lowercase(Locale.ROOT)) {
+			"mobile" -> "144p"
+			"lowest" -> "240p"
+			"low" -> "360p"
+			"sd" -> "480p"
+			"hd" -> "720p"
+			"full" -> "1080p"
+			"quad" -> "1440p"
+			"ultra" -> "2160p"
+			else -> null
+		}
 
 		fun extractStreamTapeDirectUrl(document: Document, baseUrl: String): String? {
 			val value = document.select("#ideoooolink, #norobotlink, #robotlink")
