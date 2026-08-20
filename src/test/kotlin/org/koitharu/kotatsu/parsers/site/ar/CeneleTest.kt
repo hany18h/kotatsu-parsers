@@ -47,6 +47,30 @@ internal class CeneleTest {
 	}
 
 	@Test
+	fun detectsRandomizedSectionFromCurrentSiteMarkup() {
+		val document = Jsoup.parse(
+			"""
+			<div id="chapter-53320" class="reading-content current" data-block-chapter-id="53320">
+			  <div class="chapter-warning"><p>support form</p></div>
+			  <section class="tab635be0">
+			    <input type="hidden" id="chapter-url-53320" value="https://cenele.com/cont/example/3/">
+			    <style>.reading-content .bait{display:none!important;}</style>
+			    <p>real current chapter body</p>
+			  </section>
+			</div>
+			""".trimIndent(),
+		)
+
+		val content = Cenele.findDirectChapterContent(
+			document,
+			CeneleChapterLocator("67184", "53320"),
+		)
+
+		assertTrue(content?.tagName() == "section")
+		assertTrue(content?.text()?.contains("real current chapter body") == true)
+	}
+
+	@Test
 	fun keepsRealTextWhenHiddenBaitIsInsideTheSameParagraph() {
 		val document = Jsoup.parse(
 			"""

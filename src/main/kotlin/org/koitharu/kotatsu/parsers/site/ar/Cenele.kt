@@ -387,10 +387,10 @@ internal class Cenele(context: MangaLoaderContext) :
 			} ?: doc.selectFirst(
 				".reading-content.current, .reading-content[data-block-chapter-id]",
 			)
-			return chapterRoot?.selectFirst(
-				"article, .text-left, .text-content, .text-chapter-content, " +
-					"aside:has(input[id^=chapter-url-])",
-			)
+			if (chapterRoot == null) return null
+			return chapterRoot.selectFirst(
+				"article, .text-left, .text-content, .text-chapter-content",
+			) ?: chapterRoot.selectFirst("input[id^=chapter-url-]")?.parent()
 		}
 
 		internal fun sanitizeChapterContent(content: Element): Element {
