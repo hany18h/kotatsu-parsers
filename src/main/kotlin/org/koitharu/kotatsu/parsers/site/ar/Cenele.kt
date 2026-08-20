@@ -382,15 +382,24 @@ internal class Cenele(context: MangaLoaderContext) :
 			doc: Document,
 			locator: CeneleChapterLocator?,
 		): Element? {
-			val chapterRoot = locator?.let { value ->
-				doc.selectFirst("#chapter-${value.chapterId}")
-			} ?: doc.selectFirst(
-				".reading-content.current, .reading-content[data-block-chapter-id]",
-			)
+			val chapterRoot = if (locator != null) {
+				doc.selectFirst(
+					"#chapter-${locator.chapterId}, " +
+						".reading-content[data-block-chapter-id=${locator.chapterId}]",
+				)
+			} else {
+				doc.selectFirst(".reading-content.current, .reading-content[data-block-chapter-id]")
+			}
 			if (chapterRoot == null) return null
-			return chapterRoot.selectFirst(
-				"article, .text-left, .text-content, .text-chapter-content",
-			) ?: chapterRoot.selectFirst("input[id^=chapter-url-]")?.parent()
+			// Cenele now randomizes the wrapper tag/class and adds `text-left` only
+			// after JavaScript runs. The hidden chapter URL is the stable server-side
+			// marker, so prefer its direct parent over generic article elements (which
+			// can be donation/promo cards inside the same chapter container).
+			val exactMarker = locator?.let { value ->
+				chapterRoot.selectFirst("input#chapter-url-${value.chapterId}")
+			} ?: chapterRoot.selectFirst("input[id^=chapter-url-]")
+			return exactMarker?.parent()
+				?: chapterRoot.selectFirst(".text-left, .text-content, .text-chapter-content, article")
 		}
 
 		internal fun sanitizeChapterContent(content: Element): Element {

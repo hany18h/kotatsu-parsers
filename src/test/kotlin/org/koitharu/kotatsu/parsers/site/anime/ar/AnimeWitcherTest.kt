@@ -56,4 +56,14 @@ internal class AnimeWitcherTest {
 			),
 		)
 	}
+
+	@Test
+	fun extractsEscapedDirectVideoFromServerPage() {
+		assertEquals(
+			"https://cdn.example.org/anime/episode.mp4?token=a&expires=2",
+			AnimeWitcher.findDirectVideoInPage(
+				"""var file = "https:\/\/cdn.example.org\/anime\/episode.mp4?token=a&amp;expires=2";""",
+			),
+		)
+	}
 }
