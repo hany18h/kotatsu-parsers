@@ -158,6 +158,17 @@ internal class Anime3rb(context: MangaLoaderContext) : PagedMangaParser(
 		val episodeUrl = chapter.url.toAbsoluteUrl(domain)
 		val document = webClient.httpGet(episodeUrl).parseHtml()
 		val result = ArrayList<AnimeStream>()
+		findDownloadSources(document).mapTo(result) { video ->
+			AnimeStream(
+				name = "Anime3rb • ${video.quality}",
+				url = video.url,
+				headers = mapOf(
+					"Referer" to episodeUrl,
+					"User-Agent" to config[userAgentKey],
+				),
+				quality = video.quality,
+			)
+		}
 
 		for (playerUrl in findPlayerUrls(document)) {
 			val playerHeaders = Headers.Builder()
@@ -305,15 +316,40 @@ internal class Anime3rb(context: MangaLoaderContext) : PagedMangaParser(
 		const val SEARCH_PAGE_SIZE = 12
 		val NUMBER = Regex("""\d+(?:\.\d+)?""")
 
-		fun findPlayerUrls(document: Document): List<String> =
-			document.getElementsByAttribute("wire:snapshot").mapNotNull { element ->
+		fun findPlayerUrls(document: Document): List<String> = buildList {
+			document.getElementsByAttribute("wire:snapshot").mapNotNullTo(this) { element ->
 				runCatching {
 					JSONObject(element.attr("wire:snapshot"))
 						.optJSONObject("data")
 						?.optString("video_url")
 						?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
 				}.getOrNull()
-			}.distinct()
+			}
+			for (element in document.select("iframe[src], a[href*=/player/], [data-url], [data-src], [onclick]")) {
+				for (attribute in arrayOf("src", "href", "data-url", "data-src")) {
+					val raw = element.attr(attribute).trim()
+					if (raw.isEmpty()) continue
+					val absolute = element.absUrl(attribute).ifEmpty {
+						raw.takeIf { it.startsWith("http://") || it.startsWith("https://") }.orEmpty()
+					}
+					if (absolute.isNotEmpty() && ("/player/" in absolute || "vid3rb" in absolute)) add(absolute)
+				}
+				ATTRIBUTE_URL.findAll(element.attr("onclick")).forEach { match ->
+					decodeAttributeUrl(match.value)?.let(::add)
+				}
+			}
+		}.distinct()
+
+		fun findDownloadSources(document: Document): List<ParsedVideoSource> =
+			document.select("a[href*=/download/]").mapNotNull { anchor ->
+				val url = anchor.absUrl("href").ifEmpty { anchor.attr("href") }
+					.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+					?: return@mapNotNull null
+				val context = listOf(anchor.text(), anchor.parent()?.text()).joinToString(" ")
+				val quality = QUALITY.find(context)?.groupValues?.getOrNull(1)?.let { "${it}p" }
+					?: if (context.contains("HEVC", true)) "HEVC" else "Auto"
+				ParsedVideoSource(url = url, quality = quality)
+			}.distinctBy(ParsedVideoSource::url)
 
 		fun findVideoSources(raw: String): List<ParsedVideoSource> {
 			val array = findAssignedJsonArrays(raw, "video_sources")
@@ -381,6 +417,17 @@ internal class Anime3rb(context: MangaLoaderContext) : PagedMangaParser(
 				}
 			}
 		}
+
+		private fun decodeAttributeUrl(value: String): String? {
+			val normalized = value
+				.replace("\\/", "/")
+				.replace("\\u0026", "&")
+				.replace("&amp;", "&")
+			return normalized.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+		}
+
+		private val ATTRIBUTE_URL = Regex("""https?:\\?/\\?/[^'"\s)]+""", RegexOption.IGNORE_CASE)
+		private val QUALITY = Regex("""(?:^|\D)(360|480|720|1080|1440|2160)\s*p?(?:\D|$)""", RegexOption.IGNORE_CASE)
 	}
 }
 

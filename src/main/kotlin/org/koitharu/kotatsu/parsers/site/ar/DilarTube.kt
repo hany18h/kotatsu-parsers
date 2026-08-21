@@ -6,6 +6,7 @@ import okio.ByteString.Companion.decodeBase64
 import okio.ByteString.Companion.toByteString
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.HttpStatusException
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -40,7 +41,6 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
         keys.add(userAgentKey)
-        keys.add(ConfigKey.InterceptCloudflare(true))
     }
 
     override val filterCapabilities: MangaListFilterCapabilities
@@ -57,7 +57,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
 
         if (!hasSearch) {
             val url = "https://$domain/api/series/?page=$page"
-            val response = webClient.httpGet(url, apiHeaders()).parseJson()
+            val response = getApiJson(url)
             val series = response.getJSONArray("series")
             return (0 until series.length()).map { i ->
                 parseMangaFromJson(series.getJSONObject(i))
@@ -75,7 +75,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
             })
         }
 
-        val response = webClient.httpPost(url.toHttpUrl(), jsonBody, apiHeaders()).parseJsonArray()
+        val response = postApiJsonArray(url, jsonBody)
         for (i in 0 until response.length()) {
             val category = response.getJSONObject(i)
             if (category.optString("class") == "Manga") {
@@ -152,7 +152,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
     override suspend fun getDetails(manga: Manga): Manga {
         val id = manga.url.substringAfterLast("/")
         val url = "https://$domain/api/series/$id"
-        val json = webClient.httpGet(url, apiHeaders()).parseJson()
+        val json = getApiJson(url)
 
         val title = json.getString("title")
         val summary = json.optString("summary").nullIfEmpty()
@@ -202,7 +202,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
 
     private suspend fun getChapters(seriesId: String): List<MangaChapter> {
         val url = "https://$domain/api/series/$seriesId/chapters"
-        val response = webClient.httpGet(url, apiHeaders()).parseJson()
+        val response = getApiJson(url)
         val chaptersJson = response.getJSONArray("chapters")
         val chapters = mutableListOf<MangaChapter>()
 
@@ -317,23 +317,25 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         clientToken: String? = null,
         freePass: String? = null,
     ): JSONObject {
+        val resolvedClientToken = clientToken ?: getClientToken()
         val keyPair = KeyPairGenerator.getInstance("EC").apply {
             initialize(ECGenParameterSpec("secp256r1"))
         }.generateKeyPair()
         val publicKey = encodeRawPublicKey(keyPair.public as ECPublicKey)
         val publicKeyHeader = publicKey.toByteString().base64Url().trimEnd('=')
-        val envelope = webClient.httpGet(
-            url,
-            apiHeaders()
-                .newBuilder()
-                .add("X-DH-Pub", publicKeyHeader)
-                .add("X-Crypto-Caps", "1,10")
-                .apply {
-                    clientToken?.let { add("X-Client-Token", it) }
-                    freePass?.let { add("X-Unlock-Free-Chapter", it) }
-                }
-                .build(),
-        ).parseJson()
+        val envelope = withDilarAccess {
+            webClient.httpGet(
+                url,
+                apiHeaders(resolvedClientToken)
+                    .newBuilder()
+                    .add("X-DH-Pub", publicKeyHeader)
+                    .add("X-Crypto-Caps", "1,10")
+                    .apply {
+                        freePass?.let { add("X-Unlock-Free-Chapter", it) }
+                    }
+                    .build(),
+            ).parseJson()
+        }
         if (!envelope.has("epk") || !envelope.has("ct")) return envelope
         return decryptResponseEnvelope(envelope, keyPair, publicKey)
     }
@@ -402,27 +404,33 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
             (function() {
               try {
                 var raw = localStorage.getItem('dilar.client.credential');
-                if (!raw) return null;
+                if (!raw) return '__missing__';
                 var value = JSON.parse(raw);
-                return value && typeof value.token === 'string' ? value.token : null;
+                if (!value || typeof value.token !== 'string') return '__missing__';
+                if (typeof value.expiresAt === 'number' && value.expiresAt <= Math.floor(Date.now() / 1000) + 60) {
+                  return '__missing__';
+                }
+                return value.token;
               } catch (e) {
-                return null;
+                return '__missing__';
               }
             })()
             """.trimIndent(),
         )?.trim()?.takeIf { it != "null" } ?: return null
-        return runCatching { JSONObject("{\"value\":$result}").optString("value").nullIfEmpty() }.getOrNull()
+        return runCatching { JSONObject("{\"value\":$result}").optString("value").nullIfEmpty() }
+            .getOrNull()
+            ?.takeUnless { it == "__missing__" }
     }
 
     private suspend fun requestFreePass(releaseId: String, clientToken: String): String {
-        val headers = apiHeaders().newBuilder()
-            .add("X-Client-Token", clientToken)
-            .build()
-        val response = webClient.httpPost(
-            "https://$domain/api/chapters/$releaseId/unlock/free".toHttpUrl(),
-            JSONObject(),
-            headers,
-        ).parseJson()
+        val headers = apiHeaders(clientToken)
+        val response = withDilarAccess {
+            webClient.httpPost(
+                "https://$domain/api/chapters/$releaseId/unlock/free".toHttpUrl(),
+                JSONObject(),
+                headers,
+            ).parseJson()
+        }
         return response.optString("token").nullIfEmpty()
             ?: throw ContentUnavailableException("Dilar free-pass verification did not return a token")
     }
@@ -461,12 +469,46 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         }
     }
 
-    private fun apiHeaders(): Headers = Headers.Builder()
+    private suspend fun getApiJson(url: String): JSONObject = withDilarAccess {
+        webClient.httpGet(url, apiHeaders(getClientToken())).parseJson()
+    }
+
+    private suspend fun postApiJsonArray(url: String, body: JSONObject): JSONArray = withDilarAccess {
+        webClient.httpPost(url.toHttpUrl(), body, apiHeaders(getClientToken())).parseJsonArray()
+    }
+
+    private suspend fun getClientToken(): String? {
+        cachedClientToken?.let { return it }
+        if (clientTokenChecked) return null
+        clientTokenChecked = true
+        return readClientToken()?.also { cachedClientToken = it }
+    }
+
+    private suspend fun <T> withDilarAccess(block: suspend () -> T): T = try {
+        block()
+    } catch (error: HttpStatusException) {
+        if (requiresBrowserEnrollment(error.statusCode)) {
+            cachedClientToken = null
+            clientTokenChecked = false
+            // Dilar enrolls the browser and stores dilar.client.credential on
+            // its normal site page. Opening the raw API URL can solve Turnstile
+            // without enrolling the client, which only leads to another 403/428.
+            loaderContext.requestBrowserAction(this, "https://$domain/")
+        }
+        throw error
+    }
+
+    private fun apiHeaders(clientToken: String? = null): Headers = Headers.Builder()
         .add("Accept", "application/json")
         .add("Origin", "https://$domain")
         .add("Referer", "https://$domain/")
+        .add("X-Client-Form", "mobile")
         .add("User-Agent", config[userAgentKey])
+        .apply { clientToken?.let { add("X-Client-Token", it) } }
         .build()
+
+    private var cachedClientToken: String? = null
+    private var clientTokenChecked = false
 
     private fun encodeRawPublicKey(publicKey: ECPublicKey): ByteArray {
         val coordinateSize = (publicKey.params.curve.field.fieldSize + 7) / 8
@@ -532,5 +574,9 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
             counter++
         }
         return result
+    }
+
+    internal companion object {
+        fun requiresBrowserEnrollment(statusCode: Int): Boolean = statusCode == 403 || statusCode == 428
     }
 }

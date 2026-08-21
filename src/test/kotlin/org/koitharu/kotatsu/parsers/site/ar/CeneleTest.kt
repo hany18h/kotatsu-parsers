@@ -1,6 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
 import org.jsoup.Jsoup
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -68,6 +69,29 @@ internal class CeneleTest {
 
 		assertTrue(content?.tagName() == "section")
 		assertTrue(content?.text()?.contains("real current chapter body") == true)
+	}
+
+	@Test
+	fun prefersExactRandomizedChapterWrapperOverPromoArticle() {
+		val document = Jsoup.parse(
+			"""
+			<div id="chapter-87692" class="reading-content current" data-block-chapter-id="87692">
+			  <article class="reader-promo"><p>دعم الموقع</p></article>
+			  <section class="tab635be0">
+			    <input type="hidden" id="chapter-url-87692" value="https://cenele.com/cont/example/1822/">
+			    <p>النص الحقيقي للفصل 1822</p>
+			  </section>
+			</div>
+			""".trimIndent(),
+		)
+
+		val content = Cenele.findDirectChapterContent(
+			document,
+			CeneleChapterLocator("20368", "87692"),
+		)
+
+		assertEquals("section", content?.tagName())
+		assertTrue(content?.text()?.contains("النص الحقيقي") == true)
 	}
 
 	@Test

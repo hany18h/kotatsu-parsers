@@ -13,6 +13,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.koitharu.kotatsu.parsers.MangaAuthAccount
 import org.koitharu.kotatsu.parsers.MangaAuthException
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -38,6 +39,7 @@ import org.koitharu.kotatsu.parsers.model.SortOrder
 import org.koitharu.kotatsu.parsers.util.await
 import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.parseJson
+import org.koitharu.kotatsu.parsers.util.parseRaw
 import org.koitharu.kotatsu.parsers.util.urlEncoded
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
@@ -261,7 +263,7 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 			for (server in servers) {
 				if (server.firestoreBoolean("visible") == false) continue
 				val link = server.firestoreString("link") ?: continue
-				val direct = toDirectVideoUrl(
+				val direct = resolveVideoUrl(
 					link = link,
 					directLink = server.firestoreBoolean("direct_link") == true,
 				) ?: continue
@@ -282,6 +284,75 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 			}
 		}.distinctBy(AnimeStream::url)
 	}
+
+	private suspend fun resolveVideoUrl(link: String, directLink: Boolean): String? {
+		toDirectVideoUrl(link, directLink)?.let { return it }
+		val url = runCatching { link.toHttpUrl() }.getOrNull() ?: return null
+		return when {
+			url.host == "streamtape.com" || url.host.endsWith(".streamtape.com") ->
+				resolveStreamTape(link)
+			url.host == "mediafire.com" || url.host.endsWith(".mediafire.com") ->
+				resolveMediaFire(link)
+			url.host == "krakenfiles.com" || url.host.endsWith(".krakenfiles.com") ->
+				resolveKrakenFiles(link)
+			else -> null
+		}
+	}
+
+	private suspend fun resolveStreamTape(link: String): String? {
+		val raw = loadEmbedPage(link) ?: return null
+		findDirectVideoInPage(raw)?.let { return it }
+		val fragment = STREAM_TAPE_FRAGMENT.find(raw)?.groupValues?.getOrNull(1)
+			?.decodeHtmlUrl()
+			?.trim()
+			?.takeIf { it.isNotEmpty() && '+' !in it }
+			?: return null
+		return "https://streamtape.com/get_video?id=$fragment"
+	}
+
+	private suspend fun resolveMediaFire(link: String): String? {
+		val raw = loadEmbedPage(link) ?: return null
+		findDirectVideoInPage(raw)?.let { return it }
+		val document = Jsoup.parse(raw, link)
+		return document.selectFirst("a#downloadButton[href], a.input.popsok[href], a[aria-label*=Download][href]")
+			?.absUrl("href")
+			?.takeIf { it.isNotBlank() && it != link }
+	}
+
+	private suspend fun resolveKrakenFiles(link: String): String? {
+		val raw = loadEmbedPage(link) ?: return null
+		findDirectVideoInPage(raw)?.let { return it }
+		val document = Jsoup.parse(raw, link)
+		val form = document.selectFirst("form#dl-form, form[action*=download]") ?: return null
+		val action = form.absUrl("action").ifEmpty { link }
+		val values = form.select("input[name]").associate { input ->
+			input.attr("name") to input.attr("value")
+		}
+		val response = runCatching {
+			webClient.httpPost(
+				action.toHttpUrl(),
+				values,
+				serverPageHeaders(link).newBuilder()
+					.add("X-Requested-With", "XMLHttpRequest")
+					.build(),
+			).parseRaw()
+		}.getOrNull() ?: return null
+		return runCatching { JSONObject(response).optString("url") }
+			.getOrNull()
+			?.decodeHtmlUrl()
+			?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+			?: findDirectVideoInPage(response)
+	}
+
+	private suspend fun loadEmbedPage(link: String): String? = runCatching {
+		webClient.httpGet(link, serverPageHeaders(link)).parseRaw()
+	}.getOrNull()
+
+	private fun serverPageHeaders(referer: String) = Headers.Builder()
+		.add("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+		.add("Referer", referer)
+		.add("User-Agent", config[userAgentKey])
+		.build()
 
 	private suspend fun loadEpisodes(animeId: String): List<MangaChapter> {
 		val summary = runCatching {
@@ -305,6 +376,24 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 
 	private suspend fun loadServers(animeId: String, episodeId: String): List<JSONObject> {
 		val authHeaders = firestoreAuthHeaders()
+		val result = ArrayList<JSONObject>()
+		try {
+			fetchCollectionAuthenticated(
+				SERVERS_PAGE_SIZE,
+				authHeaders,
+				"anime_list",
+				animeId,
+				"episodes",
+				episodeId,
+				"servers",
+			).mapNotNullTo(result) { it.optJSONObject("fields") }
+		} catch (error: CancellationException) {
+			throw error
+		} catch (error: AuthRequiredException) {
+			throw error
+		} catch (_: Exception) {
+			// Older episodes can have only the compact servers2 document.
+		}
 		val summary = try {
 			fetchDocumentAuthenticated(
 				authHeaders,
@@ -323,38 +412,15 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 			null
 		}
 		val values = summary?.optJSONObject("fields")?.firestoreArray("servers")
-		val summarizedServers = buildList {
-			if (values != null) {
-				for (i in 0 until values.length()) {
-					values.optJSONObject(i)
-						?.optJSONObject("mapValue")
-						?.optJSONObject("fields")
-						?.let(::add)
-				}
+		if (values != null) {
+			for (i in 0 until values.length()) {
+				values.optJSONObject(i)
+					?.optJSONObject("mapValue")
+					?.optJSONObject("fields")
+					?.let(result::add)
 			}
 		}
-		if (summarizedServers.isNotEmpty()) {
-			return summarizedServers
-		}
-
-		return try {
-			fetchCollectionAuthenticated(
-				SERVERS_PAGE_SIZE,
-				authHeaders,
-				"anime_list",
-				animeId,
-				"episodes",
-				episodeId,
-				"servers",
-			)
-				.mapNotNull { it.optJSONObject("fields") }
-		} catch (error: CancellationException) {
-			throw error
-		} catch (error: AuthRequiredException) {
-			throw error
-		} catch (_: Exception) {
-			emptyList()
-		}
+		return result.distinctBy { server -> server.firestoreString("link") }
 	}
 
 	private fun parseCatalogItem(item: JSONObject): Manga? {
@@ -866,6 +932,14 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 			"""\.(?:m3u8|mp4)(?:[?#].*)?$""",
 			RegexOption.IGNORE_CASE,
 		)
+		private val DIRECT_VIDEO_IN_PAGE = Regex(
+			"""https?:\\?/\\?/[^'"<>\s]+\.(?:m3u8|mp4)(?:\?[^'"<>\s]*)?""",
+			RegexOption.IGNORE_CASE,
+		)
+		private val STREAM_TAPE_FRAGMENT = Regex(
+			"""get_video\?id=([^'"<\s\\]+)""",
+			RegexOption.IGNORE_CASE,
+		)
 		private val ALGOLIA_ATTRIBUTES = JSONArray(
 			listOf(
 				"objectID",
@@ -906,6 +980,16 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 				else -> false
 			}
 		}.getOrDefault(true)
+
+		internal fun findDirectVideoInPage(raw: String): String? =
+			DIRECT_VIDEO_IN_PAGE.find(raw)?.value?.decodeHtmlUrl()
+
+		private fun String.decodeHtmlUrl(): String = this
+			.replace("\\/", "/")
+			.replace("\\u0026", "&")
+			.replace("&amp;", "&")
+			.replace("&#038;", "&")
+			.let { if (it.startsWith("//")) "https:$it" else it }
 
 		private fun normalizeRating(value: Double): Float =
 			(value / 10.0).coerceIn(0.0, 1.0).toFloat()

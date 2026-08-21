@@ -53,4 +53,31 @@ internal class Anime3rbTest {
 			Anime3rb.findVideoSources(html),
 		)
 	}
+
+	@Test
+	fun extractsDynamicPlayerAndSignedDownloadQualities() {
+		val document = Jsoup.parse(
+			"""
+			<li onclick="window.location='https://video.vid3rb.com/player/episode-token'">سيرفر 1</li>
+			<div class="download-row">تحميل 1080p HEVC
+			  <a href="/download/file-id?expires=1&amp;signature=abc">تحميل</a>
+			</div>
+			""".trimIndent(),
+			"https://anime3rb.com/episode/example/1",
+		)
+
+		assertEquals(
+			listOf("https://video.vid3rb.com/player/episode-token"),
+			Anime3rb.findPlayerUrls(document),
+		)
+		assertEquals(
+			listOf(
+				ParsedVideoSource(
+					"https://anime3rb.com/download/file-id?expires=1&signature=abc",
+					"1080p",
+				),
+			),
+			Anime3rb.findDownloadSources(document),
+		)
+	}
 }
