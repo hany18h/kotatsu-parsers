@@ -10,7 +10,6 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import okhttp3.Headers
 import org.json.JSONObject
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -66,6 +65,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(
@@ -234,15 +234,12 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
-		val browserHtml = readChapterHtmlInBrowser(chapterUrl)
-		val content = if (browserHtml != null) {
-			Jsoup.parseBodyFragment(browserHtml, chapterUrl).body()
-		} else {
-			val document = webClient.httpGet(chapterUrl, siteHeaders("https://$domain/")).parseHtml()
-			document.selectFirst(
-				".wor-chapter-content, .entry-content, .chapter-content, .post-content, article .content",
-			) ?: document.selectFirst("article") ?: return null
-		}
+		// The normal chapter page is publicly readable and is more reliable than
+		// the protected REST content endpoint. Do not try a hidden WebView first:
+		// on Cloudflare responses it only waits for the full JS timeout before
+		// repeating the same request with OkHttp.
+		val document = webClient.httpGet(chapterUrl, siteHeaders("https://$domain/")).parseHtml()
+		val content = extractChapterContent(document) ?: return null
 		content.select(
 			"script, style, iframe, noscript, form, button, nav, .ads, .ad-unit, " +
 				"[data-ad-position], [hidden], [aria-hidden=true]",
@@ -268,14 +265,10 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		return NovelChapterContent(html = content.html(), images = images)
 	}
 
-	private suspend fun readChapterHtmlInBrowser(chapterUrl: String): String? {
-		val result = loaderContext.evaluateJs(chapterUrl, BROWSER_CHAPTER_SCRIPT)?.trim()
-			?.takeUnless { it == "null" }
-			?: return null
-		return runCatching {
-			JSONObject("{\"value\":$result}").optString("value").trim().takeIf(String::isNotEmpty)
-		}.getOrNull()
-	}
+	internal fun extractChapterContent(document: Document): Element? = document.selectFirst(
+		".wor-reading-page__content, .wor-chapter-content, .entry-content, " +
+			".chapter-content, .post-content, article .content",
+	) ?: document.selectFirst("article")
 
 	private fun siteHeaders(referer: String): Headers {
 		// Store this as a real cookie so OkHttp's CookieJar merges it with
@@ -336,14 +329,6 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	internal companion object {
 		private const val PAGE_SIZE = 20
-		private val BROWSER_CHAPTER_SCRIPT = """
-			(function() {
-			  var content = document.querySelector(
-			    '.wor-chapter-content, .entry-content, .chapter-content, .post-content, article .content, article'
-			  );
-			  return content ? content.innerHTML : null;
-			})()
-		""".trimIndent()
 		private val NUMBER = Regex("""\d+(?:\.\d+)?""")
 		private val DATE_PATTERNS = listOf(
 			SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.ENGLISH),
