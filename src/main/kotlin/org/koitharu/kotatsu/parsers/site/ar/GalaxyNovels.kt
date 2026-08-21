@@ -64,7 +64,6 @@ internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
-		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(
@@ -265,8 +264,12 @@ internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
 	private fun siteHeaders(referer: String): Headers = Headers.Builder()
 		.add("Cookie", "wor_reader_js=1")
 		.add("Referer", referer)
-		.add("Accept", "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8")
+		.add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 		.add("Accept-Language", "ar,en-US;q=0.7,en;q=0.3")
+		.add("Sec-Fetch-Dest", "document")
+		.add("Sec-Fetch-Mode", "navigate")
+		.add("Sec-Fetch-Site", "same-origin")
+		.add("Upgrade-Insecure-Requests", "1")
 		.add("User-Agent", config[userAgentKey])
 		.build()
 
