@@ -10,6 +10,7 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import okhttp3.Headers
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -33,6 +34,7 @@ import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
 import org.koitharu.kotatsu.parsers.model.SortOrder
 import org.koitharu.kotatsu.parsers.util.attrAsRelativeUrlOrNull
 import org.koitharu.kotatsu.parsers.util.generateUid
+import org.koitharu.kotatsu.parsers.util.insertCookies
 import org.koitharu.kotatsu.parsers.util.mapNotNullToSet
 import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.parseRaw
@@ -44,8 +46,8 @@ import java.util.EnumSet
 import java.util.Locale
 
 @MangaSourceParser("GALAXYNOVELS", "مجرة الروايات", "ar", ContentType.NOVEL)
-internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
-	context = context,
+internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : PagedMangaParser(
+	context = loaderContext,
 	source = MangaParserSource.GALAXYNOVELS,
 	pageSize = PAGE_SIZE,
 ) {
@@ -232,10 +234,15 @@ internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
 
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
-		val document = webClient.httpGet(chapterUrl, siteHeaders("https://$domain/")).parseHtml()
-		val content = document.selectFirst(
-			".wor-chapter-content, .entry-content, .chapter-content, .post-content, article .content",
-		) ?: return null
+		val browserHtml = readChapterHtmlInBrowser(chapterUrl)
+		val content = if (browserHtml != null) {
+			Jsoup.parseBodyFragment(browserHtml, chapterUrl).body()
+		} else {
+			val document = webClient.httpGet(chapterUrl, siteHeaders("https://$domain/")).parseHtml()
+			document.selectFirst(
+				".wor-chapter-content, .entry-content, .chapter-content, .post-content, article .content",
+			) ?: document.selectFirst("article") ?: return null
+		}
 		content.select(
 			"script, style, iframe, noscript, form, button, nav, .ads, .ad-unit, " +
 				"[data-ad-position], [hidden], [aria-hidden=true]",
@@ -261,8 +268,23 @@ internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
 		return NovelChapterContent(html = content.html(), images = images)
 	}
 
-	private fun siteHeaders(referer: String): Headers = Headers.Builder()
-		.add("Cookie", "wor_reader_js=1")
+	private suspend fun readChapterHtmlInBrowser(chapterUrl: String): String? {
+		val result = loaderContext.evaluateJs(chapterUrl, BROWSER_CHAPTER_SCRIPT)?.trim()
+			?.takeUnless { it == "null" }
+			?: return null
+		return runCatching {
+			JSONObject("{\"value\":$result}").optString("value").trim().takeIf(String::isNotEmpty)
+		}.getOrNull()
+	}
+
+	private fun siteHeaders(referer: String): Headers {
+		// Store this as a real cookie so OkHttp's CookieJar merges it with
+		// cf_clearance instead of replacing the explicit Cookie header.
+		loaderContext.cookieJar.insertCookies(
+			domain,
+			"wor_reader_js=1; Path=/; Secure; SameSite=Lax",
+		)
+		return Headers.Builder()
 		.add("Referer", referer)
 		.add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 		.add("Accept-Language", "ar,en-US;q=0.7,en;q=0.3")
@@ -272,6 +294,7 @@ internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
 		.add("Upgrade-Insecure-Requests", "1")
 		.add("User-Agent", config[userAgentKey])
 		.build()
+	}
 
 	private fun promoteLazyImage(image: Element) {
 		val current = image.attr("src").trim()
@@ -313,6 +336,14 @@ internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
 
 	internal companion object {
 		private const val PAGE_SIZE = 20
+		private val BROWSER_CHAPTER_SCRIPT = """
+			(function() {
+			  var content = document.querySelector(
+			    '.wor-chapter-content, .entry-content, .chapter-content, .post-content, article .content, article'
+			  );
+			  return content ? content.innerHTML : null;
+			})()
+		""".trimIndent()
 		private val NUMBER = Regex("""\d+(?:\.\d+)?""")
 		private val DATE_PATTERNS = listOf(
 			SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.ENGLISH),
