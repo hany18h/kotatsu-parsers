@@ -407,7 +407,9 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
                 if (!raw) return '__missing__';
                 var value = JSON.parse(raw);
                 if (!value || typeof value.token !== 'string') return '__missing__';
-                if (typeof value.expiresAt === 'number' && value.expiresAt <= Math.floor(Date.now() / 1000) + 60) {
+                // Match Dilar's own renewal window: credentials with less than
+                // 12 hours remaining are deliberately renewed by the website.
+                if (typeof value.expiresAt === 'number' && value.expiresAt <= Math.floor(Date.now() / 1000) + 43200) {
                   return '__missing__';
                 }
                 return value.token;
