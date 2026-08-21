@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
+import org.jsoup.Jsoup
 import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
 
 internal class GalaxyNovelsTest {
@@ -22,5 +23,23 @@ internal class GalaxyNovelsTest {
 
 		assertEquals(listOf(12.5f, 2f), chapters.map { it.number })
 		assertEquals("الفصل 12.5 — العودة", chapters.first().title)
+	}
+
+	@Test
+	fun extractsCurrentReaderPageContentBeforeArticleFallback() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+		val document = Jsoup.parse(
+			"""
+			<article class="wor-reading-page">
+			  <h1>عنوان الفصل</h1>
+			  <div class="wor-reading-page__content"><p>نص الفصل الصحيح</p></div>
+			</article>
+			""".trimIndent(),
+		)
+
+		val content = parser.extractChapterContent(document)
+
+		assertEquals("نص الفصل الصحيح", content?.text())
+		assertEquals("wor-reading-page__content", content?.className())
 	}
 }
