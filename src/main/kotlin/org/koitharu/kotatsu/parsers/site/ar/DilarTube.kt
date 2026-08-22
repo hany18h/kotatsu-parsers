@@ -256,7 +256,10 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         var json = loadEncryptedJson(url)
         if (json.optBoolean("free_pass_required") && json.optJSONArray("pages")?.length() == 0) {
             val clientToken = readClientToken()
-                ?: loaderContext.requestBrowserAction(this, "https://$domain/r/$id")
+                // Open only Dilar's enrollment page. Opening /r/$id leaves the
+                // user reading the website chapter instead of returning to the
+                // native reader after the credential has been issued.
+                ?: loaderContext.requestBrowserAction(this, "https://$domain/")
             val freePass = requestFreePass(id, clientToken)
             json = loadEncryptedJson(url, clientToken, freePass)
             json.optJSONObject("assets_enc")?.let { encryptedAssets ->
