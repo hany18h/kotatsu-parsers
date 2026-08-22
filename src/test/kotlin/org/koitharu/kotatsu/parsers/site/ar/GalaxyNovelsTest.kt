@@ -4,8 +4,16 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 import org.jsoup.Jsoup
 import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
+import org.koitharu.kotatsu.parsers.network.UserAgents
 
 internal class GalaxyNovelsTest {
+
+	@Test
+	fun usesBrowserUserAgentAcceptedByReaderPages() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+
+		assertEquals(UserAgents.CHROME_MOBILE, parser.getRequestHeaders()["User-Agent"])
+	}
 
 	@Test
 	fun parsesAndOrdersCachedChapterMetadata() {

@@ -31,6 +31,7 @@ import org.koitharu.kotatsu.parsers.model.NovelChapterContent
 import org.koitharu.kotatsu.parsers.model.NovelImage
 import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
 import org.koitharu.kotatsu.parsers.model.SortOrder
+import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.util.attrAsRelativeUrlOrNull
 import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.insertCookies
@@ -52,6 +53,10 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 ) {
 
 	override val configKeyDomain = ConfigKey.Domain("galaxynovels.com")
+
+	// Galaxy protects chapter pages more strictly than its catalogue. Those
+	// pages reject Android WebView identities while accepting normal Chrome.
+	override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_MOBILE)
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,

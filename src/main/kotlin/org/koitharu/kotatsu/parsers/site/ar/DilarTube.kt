@@ -13,6 +13,7 @@ import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.exception.ContentUnavailableException
 import org.koitharu.kotatsu.parsers.model.*
+import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.util.*
 import java.math.BigInteger
 import java.nio.charset.StandardCharsets
@@ -37,6 +38,11 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
     PagedMangaParser(loaderContext, MangaParserSource.DILARTUBE, 24) {
 
     override val configKeyDomain = ConfigKey.Domain("dilar.tube")
+
+    // Dilar rejects Android WebView user agents at nginx before its browser
+    // enrollment page can run. Use a regular mobile Chrome identity for both
+    // API requests and the verification WebView.
+    override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_MOBILE)
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
@@ -249,14 +255,12 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         val url = "https://$domain/api/chapters/$id"
         var json = loadEncryptedJson(url)
         if (json.optBoolean("free_pass_required") && json.optJSONArray("pages")?.length() == 0) {
-            val clientToken = readClientToken()
-                ?: loaderContext.requestBrowserAction(this, "https://$domain/r/$id")
-            val freePass = requestFreePass(id, clientToken)
-            json = loadEncryptedJson(url, clientToken, freePass)
+            val unlocked = loadUnlockedJson(url, id)
+            json = unlocked.json
             json.optJSONObject("assets_enc")?.let { encryptedAssets ->
                 val mediaToken = json.optString("media_token").nullIfEmpty()
                     ?: throw ContentUnavailableException("Dilar did not provide a media token")
-                mergeJson(json, decryptMediaPayload(encryptedAssets, freePass, mediaToken))
+                mergeJson(json, decryptMediaPayload(encryptedAssets, unlocked.freePass, mediaToken))
                 json.remove("assets_enc")
             }
         }
@@ -314,28 +318,39 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
      */
     private suspend fun loadEncryptedJson(
         url: String,
-        clientToken: String? = null,
-        freePass: String? = null,
+    ): JSONObject = withDilarTokenRetry { clientToken ->
+        loadEncryptedJsonRaw(url, clientToken, null)
+    }
+
+    private suspend fun loadUnlockedJson(url: String, releaseId: String): UnlockedChapter =
+        withDilarTokenRetry { clientToken ->
+            val freePass = requestFreePassRaw(releaseId, clientToken)
+            UnlockedChapter(loadEncryptedJsonRaw(url, clientToken, freePass), freePass)
+        }
+
+    private data class UnlockedChapter(val json: JSONObject, val freePass: String)
+
+    private suspend fun loadEncryptedJsonRaw(
+        url: String,
+        clientToken: String,
+        freePass: String?,
     ): JSONObject {
-        val resolvedClientToken = clientToken ?: getClientToken()
         val keyPair = KeyPairGenerator.getInstance("EC").apply {
             initialize(ECGenParameterSpec("secp256r1"))
         }.generateKeyPair()
         val publicKey = encodeRawPublicKey(keyPair.public as ECPublicKey)
         val publicKeyHeader = publicKey.toByteString().base64Url().trimEnd('=')
-        val envelope = withDilarAccess {
-            webClient.httpGet(
-                url,
-                apiHeaders(resolvedClientToken)
-                    .newBuilder()
-                    .add("X-DH-Pub", publicKeyHeader)
-                    .add("X-Crypto-Caps", "1,10")
-                    .apply {
-                        freePass?.let { add("X-Unlock-Free-Chapter", it) }
-                    }
-                    .build(),
-            ).parseJson()
-        }
+        val envelope = webClient.httpGet(
+            url,
+            apiHeaders(clientToken)
+                .newBuilder()
+                .add("X-DH-Pub", publicKeyHeader)
+                .add("X-Crypto-Caps", "1,10,11")
+                .apply {
+                    freePass?.let { add("X-Unlock-Free-Chapter", it) }
+                }
+                .build(),
+        ).parseJson()
         if (!envelope.has("epk") || !envelope.has("ct")) return envelope
         return decryptResponseEnvelope(envelope, keyPair, publicKey)
     }
@@ -346,7 +361,9 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         clientPublicKey: ByteArray,
     ): JSONObject {
         val version = envelope.getInt("v")
-        require(version == 1 || version == 10) { "Unsupported Dilar encryption version: $version" }
+        require(version == 1 || version == 10 || version == 11) {
+            "Unsupported Dilar encryption version: $version"
+        }
         val serverPublicKeyRaw = decodeBase64Url(envelope.getString("epk"))
         val clientPublic = keyPair.public as ECPublicKey
         val coordinateSize = (clientPublic.params.curve.field.fieldSize + 7) / 8
@@ -365,36 +382,80 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
             doPhase(serverPublicKey, true)
             generateSecret()
         }
-        val iv = decodeBase64Url(envelope.getString("iv"))
+        val envelopeIv = decodeBase64Url(envelope.getString("iv"))
         val epoch = envelope.getLong("e")
-        val (hash, salt, info) = when (version) {
-            1 -> Triple(
-                "SHA-256",
-                clientPublicKey + serverPublicKeyRaw,
-                "dilar.response.ecies.v1|$epoch".toByteArray(StandardCharsets.UTF_8),
-            )
+        val (aesKey, nonce) = when (version) {
+            1 -> {
+                val material = hkdf(
+                    sharedSecret,
+                    clientPublicKey + serverPublicKeyRaw,
+                    "dilar.response.ecies.v1|$epoch".toByteArray(StandardCharsets.UTF_8),
+                    32,
+                    "SHA-256",
+                )
+                material to envelopeIv
+            }
 
-            10 -> Triple(
-                "SHA-512",
-                digest(
+            10 -> {
+                val material = hkdf(
+                    sharedSecret,
+                    digest(
+                        "SHA-512",
+                        lengthPrefixed(clientPublicKey, serverPublicKeyRaw, envelopeIv),
+                    ),
+                    "dilar.response.ecies.v10|$epoch|${digest("SHA-512", envelopeIv).toHex().take(24)}"
+                        .toByteArray(StandardCharsets.UTF_8),
+                    32,
                     "SHA-512",
-                    lengthPrefixed(clientPublicKey, serverPublicKeyRaw, iv),
-                ),
-                "dilar.response.ecies.v10|$epoch|${digest("SHA-512", iv).toHex().take(24)}"
-                    .toByteArray(StandardCharsets.UTF_8),
-            )
+                )
+                material to envelopeIv
+            }
+
+            11 -> {
+                // Version 11 derives both the AES key and its nonce. The
+                // response IV is mixed into HKDF but is not the AES-GCM nonce.
+                val material = deriveV11KeyMaterial(
+                    sharedSecret,
+                    clientPublicKey,
+                    serverPublicKeyRaw,
+                    envelopeIv,
+                    epoch,
+                )
+                material.copyOfRange(0, 32) to material.copyOfRange(32, 44)
+            }
 
             else -> error("Unsupported Dilar encryption version: $version")
         }
-        val aesKey = hkdf(sharedSecret, salt, info, 32, hash)
         val cipherText = decodeBase64Url(envelope.getString("ct")) + decodeBase64Url(envelope.getString("tag"))
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(
             Cipher.DECRYPT_MODE,
             SecretKeySpec(aesKey, "AES"),
-            GCMParameterSpec(128, iv),
+            GCMParameterSpec(128, nonce),
         )
         return JSONObject(String(cipher.doFinal(cipherText), StandardCharsets.UTF_8))
+    }
+
+    internal fun deriveV11KeyMaterial(
+        sharedSecret: ByteArray,
+        clientPublicKey: ByteArray,
+        serverPublicKey: ByteArray,
+        envelopeIv: ByteArray,
+        epoch: Long,
+    ): ByteArray {
+        val salt = hmac(
+            "HmacSHA512",
+            serverPublicKey,
+            lengthPrefixed(envelopeIv, clientPublicKey),
+        )
+        val ivFingerprint = digest("SHA-384", envelopeIv)
+            .toByteString()
+            .base64Url()
+            .trimEnd('=')
+            .take(22)
+        val info = "dilar.response.ecies.v11|$epoch|$ivFingerprint"
+            .toByteArray(StandardCharsets.UTF_8)
+        return hkdf(sharedSecret, salt, info, 44, "SHA-512")
     }
 
     private suspend fun readClientToken(): String? {
@@ -424,15 +485,12 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
             ?.takeUnless { it == "__missing__" }
     }
 
-    private suspend fun requestFreePass(releaseId: String, clientToken: String): String {
-        val headers = apiHeaders(clientToken)
-        val response = withDilarAccess {
-            webClient.httpPost(
-                "https://$domain/api/chapters/$releaseId/unlock/free".toHttpUrl(),
-                JSONObject(),
-                headers,
-            ).parseJson()
-        }
+    private suspend fun requestFreePassRaw(releaseId: String, clientToken: String): String {
+        val response = webClient.httpPost(
+            "https://$domain/api/chapters/$releaseId/unlock/free".toHttpUrl(),
+            JSONObject(),
+            apiHeaders(clientToken),
+        ).parseJson()
         return response.optString("token").nullIfEmpty()
             ?: throw ContentUnavailableException("Dilar free-pass verification did not return a token")
     }
@@ -471,33 +529,45 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         }
     }
 
-    private suspend fun getApiJson(url: String): JSONObject = withDilarAccess {
-        webClient.httpGet(url, apiHeaders(getClientToken())).parseJson()
+    private suspend fun getApiJson(url: String): JSONObject = withDilarTokenRetry { clientToken ->
+        webClient.httpGet(url, apiHeaders(clientToken)).parseJson()
     }
 
-    private suspend fun postApiJsonArray(url: String, body: JSONObject): JSONArray = withDilarAccess {
-        webClient.httpPost(url.toHttpUrl(), body, apiHeaders(getClientToken())).parseJsonArray()
-    }
-
-    private suspend fun getClientToken(): String? {
-        cachedClientToken?.let { return it }
-        if (clientTokenChecked) return null
-        clientTokenChecked = true
-        return readClientToken()?.also { cachedClientToken = it }
-    }
-
-    private suspend fun <T> withDilarAccess(block: suspend () -> T): T = try {
-        block()
-    } catch (error: HttpStatusException) {
-        if (requiresBrowserEnrollment(error.statusCode)) {
-            cachedClientToken = null
-            clientTokenChecked = false
-            // Dilar enrolls the browser and stores dilar.client.credential on
-            // its normal site page. Opening the raw API URL can solve Turnstile
-            // without enrolling the client, which only leads to another 403/428.
-            loaderContext.requestBrowserAction(this, "https://$domain/")
+    private suspend fun postApiJsonArray(url: String, body: JSONObject): JSONArray =
+        withDilarTokenRetry { clientToken ->
+            webClient.httpPost(url.toHttpUrl(), body, apiHeaders(clientToken)).parseJsonArray()
         }
-        throw error
+
+    /**
+     * Dilar's public web client enrolls itself through this endpoint. An empty
+     * enrollment creates an unverified browser credential, which is sufficient
+     * for the free-chapter unlock endpoint and avoids sending the user into the
+     * website instead of the native reader.
+     */
+    private suspend fun enrollClient(): String {
+        val response = webClient.httpPost(
+            "https://$domain/api/enroll".toHttpUrl(),
+            JSONObject(),
+            apiHeaders(),
+        ).parseJson()
+        return response.optString("token").nullIfEmpty()
+            ?: throw ContentUnavailableException("Dilar client enrollment did not return a token")
+    }
+
+    private suspend fun getClientToken(): String {
+        cachedClientToken?.let { return it }
+        return (readClientToken() ?: enrollClient()).also { cachedClientToken = it }
+    }
+
+    private suspend fun <T> withDilarTokenRetry(block: suspend (String) -> T): T {
+        val token = getClientToken()
+        return try {
+            block(token)
+        } catch (error: HttpStatusException) {
+            if (!requiresClientReenrollment(error.statusCode)) throw error
+            cachedClientToken = null
+            block(getClientToken())
+        }
     }
 
     private fun apiHeaders(clientToken: String? = null): Headers = Headers.Builder()
@@ -510,7 +580,6 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         .build()
 
     private var cachedClientToken: String? = null
-    private var clientTokenChecked = false
 
     private fun encodeRawPublicKey(publicKey: ECPublicKey): ByteArray {
         val coordinateSize = (publicKey.params.curve.field.fieldSize + 7) / 8
@@ -544,6 +613,12 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
 
     private fun digest(algorithm: String, value: ByteArray): ByteArray =
         MessageDigest.getInstance(algorithm).digest(value)
+
+    private fun hmac(algorithm: String, key: ByteArray, value: ByteArray): ByteArray =
+        Mac.getInstance(algorithm).run {
+            init(SecretKeySpec(key, algorithm))
+            doFinal(value)
+        }
 
     private fun ByteArray.toHex(): String = joinToString(separator = "") { byte ->
         "%02x".format(Locale.ROOT, byte.toInt() and 0xff)
@@ -579,6 +654,6 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
     }
 
     internal companion object {
-        fun requiresBrowserEnrollment(statusCode: Int): Boolean = statusCode == 403 || statusCode == 428
+        fun requiresClientReenrollment(statusCode: Int): Boolean = statusCode == 403 || statusCode == 428
     }
 }
