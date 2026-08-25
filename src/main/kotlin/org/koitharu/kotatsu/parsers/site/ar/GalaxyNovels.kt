@@ -31,11 +31,13 @@ import org.koitharu.kotatsu.parsers.model.NovelChapterContent
 import org.koitharu.kotatsu.parsers.model.NovelImage
 import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
 import org.koitharu.kotatsu.parsers.model.SortOrder
+import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.util.attrAsRelativeUrlOrNull
 import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.insertCookies
 import org.koitharu.kotatsu.parsers.util.mapNotNullToSet
 import org.koitharu.kotatsu.parsers.util.parseHtml
+import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.parseRaw
 import org.koitharu.kotatsu.parsers.util.src
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
@@ -52,6 +54,10 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 ) {
 
 	override val configKeyDomain = ConfigKey.Domain("galaxynovels.com")
+
+	// Galaxy protects chapter pages more strictly than its catalogue. Those
+	// pages reject Android WebView identities while accepting normal Chrome.
+	override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_MOBILE)
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,
@@ -195,7 +201,11 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		return buildList {
 			for (index in 0 until array.length()) {
 				val item = array.optJSONObject(index) ?: continue
-				val url = item.optString("url").trim().takeIf(String::isNotEmpty) ?: continue
+				val publicUrl = item.optString("url").trim().takeIf(String::isNotEmpty) ?: continue
+				val contentApi = item.optString("content_api").trim().takeIf(String::isNotEmpty)
+					?: item.optLong("id").takeIf { it > 0L }
+						?.let { "/wp-json/wor-reader-app/v1/chapters/$it" }
+				val url = contentApi ?: publicUrl
 				val number = item.optString("number").toFloatOrNull()
 					?: item.optInt("position", index + 1).toFloat()
 				val label = item.optString("label").trim().ifEmpty { "الفصل ${formatNumber(number)}" }
@@ -234,12 +244,30 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+		if (chapter.url.contains(READER_API_PATH)) {
+			val response = webClient.httpGet(chapterUrl, apiHeaders()).parseJson()
+			return parseReaderApiContent(response)
+		}
 		// The normal chapter page is publicly readable and is more reliable than
 		// the protected REST content endpoint. Do not try a hidden WebView first:
 		// on Cloudflare responses it only waits for the full JS timeout before
 		// repeating the same request with OkHttp.
 		val document = webClient.httpGet(chapterUrl, siteHeaders("https://$domain/")).parseHtml()
 		val content = extractChapterContent(document) ?: return null
+		return sanitizeChapterContent(content, chapterUrl)
+	}
+
+	internal fun parseReaderApiContent(response: JSONObject): NovelChapterContent? {
+		val data = response.optJSONObject("data") ?: response
+		val html = data.optString("content_html").trim().takeIf(String::isNotEmpty) ?: return null
+		val chapterUrl = data.optString("url").trim().takeIf(String::isNotEmpty)
+			?.toAbsoluteUrl(domain)
+			?: "https://$domain/"
+		val content = org.jsoup.Jsoup.parseBodyFragment(html).body()
+		return sanitizeChapterContent(content, chapterUrl)
+	}
+
+	private fun sanitizeChapterContent(content: Element, chapterUrl: String): NovelChapterContent? {
 		content.select(
 			"script, style, iframe, noscript, form, button, nav, .ads, .ad-unit, " +
 				"[data-ad-position], [hidden], [aria-hidden=true]",
@@ -289,6 +317,12 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		.build()
 	}
 
+	private fun apiHeaders(): Headers = Headers.Builder()
+		.add("Accept", "application/json")
+		.add("Referer", "https://$domain/")
+		.add("User-Agent", config[userAgentKey])
+		.build()
+
 	private fun promoteLazyImage(image: Element) {
 		val current = image.attr("src").trim()
 		if (current.isNotEmpty() && !current.startsWith("data:", true) && current != "#") return
@@ -329,6 +363,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	internal companion object {
 		private const val PAGE_SIZE = 20
+		private const val READER_API_PATH = "/wp-json/wor-reader-app/v1/chapters/"
 		private val NUMBER = Regex("""\d+(?:\.\d+)?""")
 		private val DATE_PATTERNS = listOf(
 			SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.ENGLISH),
