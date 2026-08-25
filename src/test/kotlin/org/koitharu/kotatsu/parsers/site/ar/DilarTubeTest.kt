@@ -40,4 +40,43 @@ internal class DilarTubeTest {
 			material.joinToString(separator = "") { "%02x".format(it.toInt() and 0xff) },
 		)
 	}
+
+	@Test
+	fun derivesVersion12KeyNonceAndAdditionalDataLikeDilarWebClient() {
+		val parser = DilarTube(MangaLoaderContextMock)
+		val sharedSecret = ByteArray(32) { (it + 1).toByte() }
+		val clientPublicKey = ByteArray(65) { it.toByte() }
+		val serverPublicKey = ByteArray(65) { (64 - it).toByte() }
+		val envelopeIv = ByteArray(12) { (it + 10).toByte() }
+		val epoch = 1_787_350_000L
+
+		val material = parser.deriveV12KeyMaterial(
+			sharedSecret,
+			clientPublicKey,
+			serverPublicKey,
+			envelopeIv,
+			epoch,
+		)
+		val additionalData = parser.buildV12AdditionalData(
+			version = 12,
+			epoch = epoch,
+			serverPublicKey = serverPublicKey,
+			envelopeIv = envelopeIv,
+			cipherTextLength = 1234,
+		)
+
+		assertEquals(
+			"dfc650e264729e95485091bda472dca5c48c97d8d4d848fa59a31542e7d5598" +
+				"b0f4cb0cc48a0c5b12c2cc993",
+			material.toHex(),
+		)
+		assertEquals(
+			"85b82973319e50e941123ed0603a0238fa1e726c17642e804bf47d291f34d0a6",
+			additionalData.toHex(),
+		)
+	}
+
+	private fun ByteArray.toHex(): String = joinToString(separator = "") {
+		"%02x".format(it.toInt() and 0xff)
+	}
 }

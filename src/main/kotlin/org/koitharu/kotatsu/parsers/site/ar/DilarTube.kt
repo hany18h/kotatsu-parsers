@@ -345,7 +345,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
             apiHeaders(clientToken)
                 .newBuilder()
                 .add("X-DH-Pub", publicKeyHeader)
-                .add("X-Crypto-Caps", "1,10,11")
+                .add("X-Crypto-Caps", "1,10,11,12")
                 .apply {
                     freePass?.let { add("X-Unlock-Free-Chapter", it) }
                 }
@@ -361,7 +361,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         clientPublicKey: ByteArray,
     ): JSONObject {
         val version = envelope.getInt("v")
-        require(version == 1 || version == 10 || version == 11) {
+        require(version == 1 || version == 10 || version == 11 || version == 12) {
             "Unsupported Dilar encryption version: $version"
         }
         val serverPublicKeyRaw = decodeBase64Url(envelope.getString("epk"))
@@ -424,15 +424,40 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
                 material.copyOfRange(0, 32) to material.copyOfRange(32, 44)
             }
 
+            12 -> {
+                // Version 12 keeps a derived nonce, switches HKDF to SHA-384,
+                // and authenticates the envelope metadata as AES-GCM AAD.
+                val material = deriveV12KeyMaterial(
+                    sharedSecret,
+                    clientPublicKey,
+                    serverPublicKeyRaw,
+                    envelopeIv,
+                    epoch,
+                )
+                material.copyOfRange(0, 32) to material.copyOfRange(32, 44)
+            }
+
             else -> error("Unsupported Dilar encryption version: $version")
         }
-        val cipherText = decodeBase64Url(envelope.getString("ct")) + decodeBase64Url(envelope.getString("tag"))
+        val encryptedPayload = decodeBase64Url(envelope.getString("ct"))
+        val cipherText = encryptedPayload + decodeBase64Url(envelope.getString("tag"))
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(
             Cipher.DECRYPT_MODE,
             SecretKeySpec(aesKey, "AES"),
             GCMParameterSpec(128, nonce),
         )
+        if (version == 12) {
+            cipher.updateAAD(
+                buildV12AdditionalData(
+                    version,
+                    epoch,
+                    serverPublicKeyRaw,
+                    envelopeIv,
+                    encryptedPayload.size,
+                ),
+            )
+        }
         return JSONObject(String(cipher.doFinal(cipherText), StandardCharsets.UTF_8))
     }
 
@@ -457,6 +482,46 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
             .toByteArray(StandardCharsets.UTF_8)
         return hkdf(sharedSecret, salt, info, 44, "SHA-512")
     }
+
+    internal fun deriveV12KeyMaterial(
+        sharedSecret: ByteArray,
+        clientPublicKey: ByteArray,
+        serverPublicKey: ByteArray,
+        envelopeIv: ByteArray,
+        epoch: Long,
+    ): ByteArray {
+        val salt = hmac(
+            "HmacSHA512",
+            clientPublicKey,
+            lengthPrefixed(serverPublicKey, envelopeIv),
+        ).copyOf(32)
+        val ivFingerprint = digest("SHA-256", lengthPrefixed(envelopeIv))
+            .toByteString()
+            .base64Url()
+            .trimEnd('=')
+            .take(22)
+        val info = "dilar.response.ecies.v12|$epoch|$ivFingerprint"
+            .toByteArray(StandardCharsets.UTF_8)
+        return hkdf(sharedSecret, salt, info, 44, "SHA-384")
+    }
+
+    internal fun buildV12AdditionalData(
+        version: Int,
+        epoch: Long,
+        serverPublicKey: ByteArray,
+        envelopeIv: ByteArray,
+        cipherTextLength: Int,
+    ): ByteArray = digest(
+        "SHA-256",
+        lengthPrefixed(
+            "dilar.response.ecies.v12".toByteArray(StandardCharsets.UTF_8),
+            version.toString().toByteArray(StandardCharsets.UTF_8),
+            epoch.toString().toByteArray(StandardCharsets.UTF_8),
+            serverPublicKey,
+            envelopeIv,
+            int32BigEndian(cipherTextLength),
+        ),
+    )
 
     private suspend fun readClientToken(): String? {
         val result = loaderContext.evaluateJs(
@@ -610,6 +675,13 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         }
         return output
     }
+
+    private fun int32BigEndian(value: Int): ByteArray = byteArrayOf(
+        (value ushr 24).toByte(),
+        (value ushr 16).toByte(),
+        (value ushr 8).toByte(),
+        value.toByte(),
+    )
 
     private fun digest(algorithm: String, value: ByteArray): ByteArray =
         MessageDigest.getInstance(algorithm).digest(value)
