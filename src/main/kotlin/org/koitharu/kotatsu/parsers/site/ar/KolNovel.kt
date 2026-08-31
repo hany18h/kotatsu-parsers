@@ -1,5 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -15,7 +16,7 @@ import java.util.*
 internal class KolNovel(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.KOLNOVEL, pageSize = 20) {
 
-	override val configKeyDomain = ConfigKey.Domain("free.kolnovel.com")
+	override val configKeyDomain = ConfigKey.Domain("kolnovel.com")
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,
@@ -202,19 +203,21 @@ internal class KolNovel(context: MangaLoaderContext) :
 
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-		val contentElement = doc.selectFirst("#kol_content")
+		val sourceElement = doc.selectFirst("#kol_content")
 			?: doc.selectFirst(".epcontent.entry-content")
 			?: return null
+		val contentElement = sanitizeChapterElement(sourceElement)
 
-		// Remove ads and scripts
-		contentElement.select("script, .code-block, ins, iframe, [id^=pf-]").remove()
-
-		// Clean up: remove empty paragraphs and ad text
 		contentElement.select("p").forEach { p ->
 			val text = p.text().trim()
-			if (text.isEmpty() || text == "&nbsp;" || text.matches(Regex("^\\d+$"))) {
+			if (text.isEmpty() || text == "&nbsp;" || text.matches(ONLY_NUMBER)) {
 				p.remove()
 			}
+		}
+		contentElement.select("*").forEach { element ->
+			element.removeAttr("class")
+			element.removeAttr("id")
+			element.removeAttr("style")
 		}
 
 		val title = doc.selectFirst("h1.entry-title")?.text().orEmpty()
@@ -240,6 +243,37 @@ internal class KolNovel(context: MangaLoaderContext) :
 					)
 				}
 			}.distinctBy(NovelImage::url),
+		)
+	}
+
+	/**
+	 * KolNovel currently appends the Shola support widget's stylesheet and
+	 * JavaScript as bare text nodes inside #kol_content. Jsoup cannot remove
+	 * those with style/script selectors because they are not HTML elements, so
+	 * discard the injected tail before parsing and sanitising the fragment.
+	 */
+	internal fun sanitizeChapterElement(sourceElement: Element): Element {
+		val rawHtml = sourceElement.html()
+		val markerIndex = SHOLA_TAIL_MARKERS.map(rawHtml::indexOf)
+			.filter { it >= 0 }
+			.minOrNull()
+		val chapterHtml = markerIndex?.let { rawHtml.substring(0, it) } ?: rawHtml
+		return Jsoup.parseBodyFragment(chapterHtml).body().also { content ->
+			content.select(
+				"script, style, noscript, form, iframe, ins, .code-block, " +
+					"[id^=pf-], [id^=shola-], [class*=shola-], [hidden], [aria-hidden=true]",
+			).remove()
+		}
+	}
+
+	internal companion object {
+		private val ONLY_NUMBER = Regex("^\\d+$")
+		private val SHOLA_TAIL_MARKERS = listOf(
+			".shola-widget",
+			".shola-lb-wrap",
+			".shola-progress-wrap",
+			"function sholaTab(",
+			"function shola",
 		)
 	}
 }
