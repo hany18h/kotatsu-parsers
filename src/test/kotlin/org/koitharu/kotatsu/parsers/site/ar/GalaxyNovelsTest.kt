@@ -36,6 +36,25 @@ internal class GalaxyNovelsTest {
 	}
 
 	@Test
+	fun discoversVersionedFullChapterPackFromManifest() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+
+		val packUrl = parser.parseManifestPackUrl(
+			"""
+			{
+			  "total": 3155,
+			  "pack_url": "https://galaxynovels.com/wp-content/uploads/wor-reader-cache/chapters/packs/novel-269119-version.json"
+			}
+			""".trimIndent(),
+		)
+
+		assertEquals(
+			"https://galaxynovels.com/wp-content/uploads/wor-reader-cache/chapters/packs/novel-269119-version.json",
+			packUrl,
+		)
+	}
+
+	@Test
 	fun extractsCurrentReaderPageContentBeforeArticleFallback() {
 		val parser = GalaxyNovels(MangaLoaderContextMock)
 		val document = Jsoup.parse(
