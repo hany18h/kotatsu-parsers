@@ -1,5 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -7,6 +8,30 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 internal class CeneleTest {
+
+	@Test
+	fun parsesCleanOfficialAppChapterPayload() {
+		val parser = Cenele(org.koitharu.kotatsu.parsers.MangaLoaderContextMock)
+		val content = parser.parseAppChapterContent(
+			JSONObject(
+				"""
+				{
+				  "success": true,
+				  "data": {
+				    "content": "<p>النص الحقيقي للفصل</p><img data-src='/image.webp'>",
+				    "chapter": {"chapter_name": "الفصل 280"}
+				  }
+				}
+				""".trimIndent(),
+			),
+			"https://cenele.com/cont/example/chapter-280/",
+			"",
+		)
+
+		assertTrue(content?.html?.contains("النص الحقيقي للفصل") == true)
+		assertTrue(content?.html?.contains("الفصل 280") == true)
+		assertEquals("https://cenele.com/image.webp", content?.images?.single()?.url)
+	}
 
 	@Test
 	fun acceptsArticleAsChapterContentContainer() {

@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -292,6 +293,28 @@ internal class Cenele(context: MangaLoaderContext) :
 			.replace("?style=list", "")
 			.replace("&style=list", "")
 			.toAbsoluteUrl(domain)
+		val locator = parseCeneleChapterLocator(chapter.url)
+
+		// Cenele exposes the same clean chapter payload used by its official app.
+		// Prefer that public endpoint: the normal HTML page is protected by
+		// network-dependent Cloudflare/anti-copy layers and also injects fake
+		// paragraphs. Keep the HTML reader below for old saved chapters that do
+		// not contain a chapter locator and as a compatibility fallback.
+		if (locator != null) {
+			val appContent = runCatching {
+				webClient.httpGet(
+					"https://$domain/wp-json/cenele-app/v1/chapters/${locator.chapterId}",
+					Headers.Builder()
+						.add("Accept", "application/json")
+						.add("Referer", cleanUrl)
+						.add("User-Agent", config[userAgentKey])
+						.build(),
+				).parseJson()
+			}.getOrNull()?.let { response ->
+				parseAppChapterContent(response, cleanUrl, chapter.title.orEmpty())
+			}
+			if (appContent != null) return appContent
+		}
 
 		// Chapter markup is randomized on every response. Reusing an older cached
 		// document (or an empty 304 body) can therefore make an otherwise valid
@@ -306,7 +329,6 @@ internal class Cenele(context: MangaLoaderContext) :
 				.add("User-Agent", config[userAgentKey])
 				.build(),
 		).parseHtml()
-		val locator = parseCeneleChapterLocator(chapter.url)
 		val content = findDirectChapterContent(doc, locator)
 			?: locator?.let { loadChapterViaAjax(doc, cleanUrl, it) }
 		?: return null
@@ -334,6 +356,42 @@ internal class Cenele(context: MangaLoaderContext) :
 					)
 				}
 			}.distinctBy(NovelImage::url),
+		)
+	}
+
+	internal fun parseAppChapterContent(
+		response: JSONObject,
+		chapterUrl: String,
+		fallbackTitle: String,
+	): NovelChapterContent? {
+		if (!response.optBoolean("success")) return null
+		val data = response.optJSONObject("data") ?: return null
+		val html = data.optString("content").trim().takeIf(String::isNotEmpty) ?: return null
+		val content = Jsoup.parseBodyFragment(html, chapterUrl).body()
+		sanitizeChapterContent(content)
+		val title = data.optJSONObject("chapter")
+			?.optString("chapter_name")
+			?.trim()
+			?.takeIf(String::isNotEmpty)
+			?: fallbackTitle
+		val images = content.select("img").mapNotNull { image ->
+			image.src()?.let { url ->
+				NovelImage(
+					url = url,
+					headers = mapOf(
+						"Referer" to chapterUrl,
+						"User-Agent" to config[userAgentKey],
+					),
+				)
+			}
+		}.distinctBy(NovelImage::url)
+		if (content.text().isBlank() && images.isEmpty()) return null
+		return NovelChapterContent(
+			html = buildString {
+				if (title.isNotBlank()) append(Element("h1").text(title).outerHtml())
+				append(content.html())
+			},
+			images = images,
 		)
 	}
 

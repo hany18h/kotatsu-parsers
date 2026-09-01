@@ -180,28 +180,31 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 	}
 
 	private suspend fun loadChapters(mangaUrl: String, document: Document): List<MangaChapter> {
-		// The public novel page already contains the full chapter list. Prefer it
-		// over wor-reader-cache: Cloudflare now rejects that cache endpoint for a
-		// portion of mobile networks even after a browser challenge was solved.
-		val publicChapters = parseHtmlChapters(document)
-		if (publicChapters.isNotEmpty()) {
-			return publicChapters.distinctBy(MangaChapter::id).sortedBy(MangaChapter::number)
-		}
-		val novelId = document.selectFirst("[data-novel-id]")?.attr("data-novel-id")
-			?.takeIf(String::isNotBlank)
-		val cached = novelId?.let { id ->
+		// The page only renders the first 30 chapters. Its public manifest points
+		// to a versioned pack containing the complete list (often thousands of
+		// chapters) and, unlike the old unversioned cache URL, is not rejected by
+		// Cloudflare on mobile networks.
+		val manifestUrl = document.selectFirst("[data-wor-chapters-container][data-manifest-url]")
+			?.attr("data-manifest-url")
+			?.trim()
+			?.takeIf(String::isNotEmpty)
+			?.toAbsoluteUrl(domain)
+		val packedChapters = manifestUrl?.let { url ->
 			runCatching {
-				webClient.httpGet(
-					"https://$domain/wp-content/uploads/wor-reader-cache/chapters/novel-$id.json",
-					siteHeaders(mangaUrl),
-				).parseRaw()
+				val manifest = webClient.httpGet(url, siteHeaders(mangaUrl)).parseRaw()
+				val packUrl = parseManifestPackUrl(manifest) ?: return@runCatching emptyList()
+				parseCachedChapters(webClient.httpGet(packUrl, siteHeaders(mangaUrl)).parseRaw())
 			}.getOrNull()
-		}
-		val chapters = cached?.let(::parseCachedChapters).orEmpty()
+		}.orEmpty()
+		val chapters = packedChapters.ifEmpty { parseHtmlChapters(document) }
 		return chapters
 			.distinctBy(MangaChapter::id)
 			.sortedBy(MangaChapter::number)
 	}
+
+	internal fun parseManifestPackUrl(raw: String): String? = runCatching {
+		JSONObject(raw).optString("pack_url").trim().takeIf(String::isNotEmpty)
+	}.getOrNull()
 
 	internal fun parseCachedChapters(raw: String): List<MangaChapter> {
 		val array = runCatching { JSONObject(raw).optJSONArray("chapters") }.getOrNull() ?: return emptyList()
