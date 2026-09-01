@@ -32,7 +32,7 @@ internal class GalaxyNovelsTest {
 
 		assertEquals(listOf(12.5f, 2f), chapters.map { it.number })
 		assertEquals("الفصل 12.5 — العودة", chapters.first().title)
-		assertEquals("/wp-json/wor-reader-app/v1/chapters/412", chapters.first().url)
+		assertEquals("/novel/a/chapter-12/", chapters.first().url)
 	}
 
 	@Test

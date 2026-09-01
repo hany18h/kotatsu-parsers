@@ -180,6 +180,13 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 	}
 
 	private suspend fun loadChapters(mangaUrl: String, document: Document): List<MangaChapter> {
+		// The public novel page already contains the full chapter list. Prefer it
+		// over wor-reader-cache: Cloudflare now rejects that cache endpoint for a
+		// portion of mobile networks even after a browser challenge was solved.
+		val publicChapters = parseHtmlChapters(document)
+		if (publicChapters.isNotEmpty()) {
+			return publicChapters.distinctBy(MangaChapter::id).sortedBy(MangaChapter::number)
+		}
 		val novelId = document.selectFirst("[data-novel-id]")?.attr("data-novel-id")
 			?.takeIf(String::isNotBlank)
 		val cached = novelId?.let { id ->
@@ -191,7 +198,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			}.getOrNull()
 		}
 		val chapters = cached?.let(::parseCachedChapters).orEmpty()
-		return (if (chapters.isNotEmpty()) chapters else parseHtmlChapters(document))
+		return chapters
 			.distinctBy(MangaChapter::id)
 			.sortedBy(MangaChapter::number)
 	}
@@ -202,10 +209,9 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			for (index in 0 until array.length()) {
 				val item = array.optJSONObject(index) ?: continue
 				val publicUrl = item.optString("url").trim().takeIf(String::isNotEmpty) ?: continue
-				val contentApi = item.optString("content_api").trim().takeIf(String::isNotEmpty)
-					?: item.optLong("id").takeIf { it > 0L }
-						?.let { "/wp-json/wor-reader-app/v1/chapters/$it" }
-				val url = contentApi ?: publicUrl
+				// content_api is protected and may return "server blocked you" while
+				// the same chapter's normal public reader URL works normally.
+				val url = publicUrl
 				val number = item.optString("number").toFloatOrNull()
 					?: item.optInt("position", index + 1).toFloat()
 				val label = item.optString("label").trim().ifEmpty { "الفصل ${formatNumber(number)}" }
@@ -245,8 +251,12 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
 		if (chapter.url.contains(READER_API_PATH)) {
-			val response = webClient.httpGet(chapterUrl, apiHeaders()).parseJson()
-			return parseReaderApiContent(response)
+			// Compatibility for chapter objects saved by older parser versions.
+			// The protected endpoint may still work with an existing browser session;
+			// newly refreshed chapter lists always use the public page URL instead.
+			return runCatching {
+				parseReaderApiContent(webClient.httpGet(chapterUrl, apiHeaders()).parseJson())
+			}.getOrNull()
 		}
 		// The normal chapter page is publicly readable and is more reliable than
 		// the protected REST content endpoint. Do not try a hidden WebView first:
