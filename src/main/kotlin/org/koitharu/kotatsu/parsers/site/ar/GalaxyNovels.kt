@@ -9,6 +9,9 @@ package org.koitharu.kotatsu.parsers.site.ar
  */
 
 import okhttp3.Headers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -34,7 +37,6 @@ import org.koitharu.kotatsu.parsers.model.SortOrder
 import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.util.attrAsRelativeUrlOrNull
 import org.koitharu.kotatsu.parsers.util.generateUid
-import org.koitharu.kotatsu.parsers.util.insertCookies
 import org.koitharu.kotatsu.parsers.util.mapNotNullToSet
 import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.parseJson
@@ -45,10 +47,11 @@ import org.koitharu.kotatsu.parsers.util.urlEncoded
 import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 @MangaSourceParser("GALAXYNOVELS", "مجرة الروايات", "ar", ContentType.NOVEL)
-internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : PagedMangaParser(
-	context = loaderContext,
+internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
+	context = context,
 	source = MangaParserSource.GALAXYNOVELS,
 	pageSize = PAGE_SIZE,
 ) {
@@ -252,6 +255,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = emptyList()
 
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
+		waitForChapterRequestSlot()
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
 		if (chapter.url.contains(READER_API_PATH)) {
 			// Compatibility for chapter objects saved by older parser versions.
@@ -312,12 +316,9 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 	) ?: document.selectFirst("article")
 
 	private fun siteHeaders(referer: String): Headers {
-		// Store this as a real cookie so OkHttp's CookieJar merges it with
-		// cf_clearance instead of replacing the explicit Cookie header.
-		loaderContext.cookieJar.insertCookies(
-			domain,
-			"wor_reader_js=1; Path=/; Secure; SameSite=Lax",
-		)
+		// Do not forge the site's JavaScript-reader cookie. Galaxy uses it with
+		// rapid-reading telemetry; setting it from a parser without executing the
+		// matching browser flow makes server-side risk scoring more aggressive.
 		return Headers.Builder()
 		.add("Referer", referer)
 		.add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
@@ -328,6 +329,15 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		.add("Upgrade-Insecure-Requests", "1")
 		.add("User-Agent", config[userAgentKey])
 		.build()
+	}
+
+	private suspend fun waitForChapterRequestSlot() = CHAPTER_REQUEST_MUTEX.withLock {
+		val now = System.nanoTime()
+		val elapsed = TimeUnit.NANOSECONDS.toMillis(now - lastChapterRequestNanos)
+		if (lastChapterRequestNanos != 0L && elapsed < CHAPTER_REQUEST_INTERVAL_MS) {
+			delay(CHAPTER_REQUEST_INTERVAL_MS - elapsed)
+		}
+		lastChapterRequestNanos = System.nanoTime()
 	}
 
 	private fun apiHeaders(): Headers = Headers.Builder()
@@ -376,6 +386,10 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	internal companion object {
 		private const val PAGE_SIZE = 20
+		private const val CHAPTER_REQUEST_INTERVAL_MS = 20_000L
+		private val CHAPTER_REQUEST_MUTEX = Mutex()
+		@Volatile
+		private var lastChapterRequestNanos = 0L
 		private const val READER_API_PATH = "/wp-json/wor-reader-app/v1/chapters/"
 		private val NUMBER = Regex("""\d+(?:\.\d+)?""")
 		private val DATE_PATTERNS = listOf(
