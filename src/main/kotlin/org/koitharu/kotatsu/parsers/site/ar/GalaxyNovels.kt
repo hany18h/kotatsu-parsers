@@ -39,7 +39,6 @@ import org.koitharu.kotatsu.parsers.util.attrAsRelativeUrlOrNull
 import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.mapNotNullToSet
 import org.koitharu.kotatsu.parsers.util.parseHtml
-import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.parseRaw
 import org.koitharu.kotatsu.parsers.util.src
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
@@ -257,21 +256,22 @@ internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		waitForChapterRequestSlot()
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
-		if (chapter.url.contains(READER_API_PATH)) {
-			// Compatibility for chapter objects saved by older parser versions.
-			// The protected endpoint may still work with an existing browser session;
-			// newly refreshed chapter lists always use the public page URL instead.
-			return runCatching {
-				parseReaderApiContent(webClient.httpGet(chapterUrl, apiHeaders()).parseJson())
-			}.getOrNull()
-		}
+		val requestUrl = findLegacyChapterPostId(chapter.url)?.let { postId ->
+			// Older versions stored wor-reader-app REST URLs. That endpoint is now
+			// rejected with 403, even while the public chapter remains available.
+			// WordPress' canonical post resolver redirects the same chapter id to
+			// its normal reader URL, so existing libraries recover automatically.
+			"https://$domain/?p=$postId"
+		} ?: chapterUrl
 		// The normal chapter page is publicly readable and is more reliable than
 		// the protected REST content endpoint. Do not try a hidden WebView first:
 		// on Cloudflare responses it only waits for the full JS timeout before
 		// repeating the same request with OkHttp.
-		val document = webClient.httpGet(chapterUrl, siteHeaders("https://$domain/")).parseHtml()
+		val response = webClient.httpGet(requestUrl, siteHeaders("https://$domain/"))
+		val resolvedChapterUrl = response.request.url.toString()
+		val document = response.parseHtml()
 		val content = extractChapterContent(document) ?: return null
-		return sanitizeChapterContent(content, chapterUrl)
+		return sanitizeChapterContent(content, resolvedChapterUrl)
 	}
 
 	internal fun parseReaderApiContent(response: JSONObject): NovelChapterContent? {
@@ -340,12 +340,6 @@ internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
 		lastChapterRequestNanos = System.nanoTime()
 	}
 
-	private fun apiHeaders(): Headers = Headers.Builder()
-		.add("Accept", "application/json")
-		.add("Referer", "https://$domain/")
-		.add("User-Agent", config[userAgentKey])
-		.build()
-
 	private fun promoteLazyImage(image: Element) {
 		val current = image.attr("src").trim()
 		if (current.isNotEmpty() && !current.startsWith("data:", true) && current != "#") return
@@ -390,7 +384,11 @@ internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
 		private val CHAPTER_REQUEST_MUTEX = Mutex()
 		@Volatile
 		private var lastChapterRequestNanos = 0L
-		private const val READER_API_PATH = "/wp-json/wor-reader-app/v1/chapters/"
+		private val READER_API_CHAPTER_ID = Regex("""/wp-json/wor-reader-app/v1/chapters/(\d+)""")
+
+		internal fun findLegacyChapterPostId(url: String): String? =
+			READER_API_CHAPTER_ID.find(url)?.groupValues?.getOrNull(1)
+
 		private val NUMBER = Regex("""\d+(?:\.\d+)?""")
 		private val DATE_PATTERNS = listOf(
 			SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.ENGLISH),
