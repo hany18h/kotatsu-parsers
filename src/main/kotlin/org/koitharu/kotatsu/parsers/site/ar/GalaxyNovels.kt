@@ -9,9 +9,6 @@ package org.koitharu.kotatsu.parsers.site.ar
  */
 
 import okhttp3.Headers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -48,7 +45,6 @@ import org.koitharu.kotatsu.parsers.util.urlEncoded
 import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
-import java.util.concurrent.TimeUnit
 
 @MangaSourceParser("GALAXYNOVELS", "مجرة الروايات", "ar", ContentType.NOVEL)
 internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : PagedMangaParser(
@@ -256,7 +252,6 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = emptyList()
 
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
-		waitForChapterRequestSlot()
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
 		val requestUrl = findLegacyChapterPostId(chapter.url)?.let { postId ->
 			// Older versions stored wor-reader-app REST URLs. That endpoint is now
@@ -265,10 +260,21 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			// its normal reader URL, so existing libraries recover automatically.
 			"https://$domain/?p=$postId"
 		} ?: chapterUrl
-		// Prefer the normal public chapter page. Galaxy applies a stricter WAF rule
-		// to chapter paths than to its catalogue, so keep its JavaScript-reader
-		// cookie and continuous-reader request marker exactly as the public reader
-		// and the NovelSourcery implementation do.
+
+		// Galaxy rejects OkHttp's TLS/browser fingerprint on chapter paths while
+		// serving the same public page to a real browser. Start with WebView so a
+		// successful chapter is not delayed by the known-to-fail HTTP attempt.
+		val webViewResult = runCatchingCancellable {
+			loadChapterDocumentInWebView(requestUrl)
+		}
+		webViewResult.getOrNull()?.let { document ->
+			extractChapterContent(document)?.let { content ->
+				return sanitizeChapterContent(content, requestUrl)
+			}
+		}
+
+		// Keep the normal HTTP reader as a fallback for environments where WebView
+		// is unavailable or when Galaxy relaxes its chapter-page WAF.
 		val directResult = runCatchingCancellable {
 			val response = webClient.httpGet(
 				requestUrl,
@@ -282,17 +288,8 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 				return sanitizeChapterContent(content, resolvedChapterUrl)
 			}
 		}
-
-		// Cloudflare can still reject OkHttp's TLS/browser fingerprint on selected
-		// mobile networks even when the same public page opens in Android WebView.
-		// Use the real browser engine only as a fallback and return just the native
-		// chapter element, never the website UI.
-		loadChapterDocumentInWebView(requestUrl)?.let { document ->
-			extractChapterContent(document)?.let { content ->
-				return sanitizeChapterContent(content, requestUrl)
-			}
-		}
 		directResult.exceptionOrNull()?.let { throw it }
+		webViewResult.exceptionOrNull()?.let { throw it }
 		return null
 	}
 
@@ -301,10 +298,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			chapterUrl,
 			"""
 			(function() {
-			  var content = document.querySelector(
-			    '.wor-reading-page__content, .wor-chapter-content, .entry-content, ' +
-			    '.chapter-content, .post-content, article .content'
-			  );
+			  var content = document.querySelector('$CHAPTER_CONTENT_SELECTOR');
 			  return content ? content.outerHTML : null;
 			})()
 			""".trimIndent(),
@@ -353,10 +347,8 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		return NovelChapterContent(html = content.html(), images = images)
 	}
 
-	internal fun extractChapterContent(document: Document): Element? = document.selectFirst(
-		".wor-reading-page__content, .wor-chapter-content, .entry-content, " +
-			".chapter-content, .post-content, article .content",
-	) ?: document.selectFirst("article")
+	internal fun extractChapterContent(document: Document): Element? =
+		document.selectFirst(CHAPTER_CONTENT_SELECTOR) ?: document.selectFirst("article")
 
 	internal fun siteHeaders(referer: String, isChapterRequest: Boolean = false): Headers {
 		return Headers.Builder()
@@ -375,15 +367,6 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			}
 		}
 		.build()
-	}
-
-	private suspend fun waitForChapterRequestSlot() = CHAPTER_REQUEST_MUTEX.withLock {
-		val now = System.nanoTime()
-		val elapsed = TimeUnit.NANOSECONDS.toMillis(now - lastChapterRequestNanos)
-		if (lastChapterRequestNanos != 0L && elapsed < CHAPTER_REQUEST_INTERVAL_MS) {
-			delay(CHAPTER_REQUEST_INTERVAL_MS - elapsed)
-		}
-		lastChapterRequestNanos = System.nanoTime()
 	}
 
 	private fun promoteLazyImage(image: Element) {
@@ -426,10 +409,9 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	internal companion object {
 		private const val PAGE_SIZE = 20
-		private const val CHAPTER_REQUEST_INTERVAL_MS = 20_000L
-		private val CHAPTER_REQUEST_MUTEX = Mutex()
-		@Volatile
-		private var lastChapterRequestNanos = 0L
+		internal const val CHAPTER_CONTENT_SELECTOR =
+			".wor-reader-text-surface, .wor-reading-page__content, .wor-chapter-content, " +
+				".entry-content, .chapter-content, .post-content, article .content"
 		private val READER_API_CHAPTER_ID = Regex("""/wp-json/wor-reader-app/v1/chapters/(\d+)""")
 
 		internal fun findLegacyChapterPostId(url: String): String? =
