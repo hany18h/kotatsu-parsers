@@ -10,6 +10,17 @@ import org.koitharu.kotatsu.parsers.network.UserAgents
 internal class GalaxyNovelsTest {
 
 	@Test
+	fun resolvesChapterIdFromLegacyProtectedApiUrl() {
+		assertEquals(
+			"71040",
+			GalaxyNovels.findLegacyChapterPostId(
+				"/wp-json/wor-reader-app/v1/chapters/71040",
+			),
+		)
+		assertEquals(null, GalaxyNovels.findLegacyChapterPostId("/novel/example/chapter-1/"))
+	}
+
+	@Test
 	fun usesBrowserUserAgentAcceptedByReaderPages() {
 		val parser = GalaxyNovels(MangaLoaderContextMock)
 
