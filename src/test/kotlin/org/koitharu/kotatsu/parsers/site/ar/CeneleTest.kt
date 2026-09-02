@@ -10,6 +10,31 @@ import org.junit.jupiter.api.Test
 internal class CeneleTest {
 
 	@Test
+	fun preservesOfficialNovelAndChapterLocatorsWithoutChangingPublicPath() {
+		val novel = attachCeneleNovelLocator("/cont/return-hua/", "20368")
+		val chapter = attachCeneleChapterLocator(
+			"/cont/return-hua/%d8%a7%d9%84%d9%81%d8%b5%d9%84-1822/",
+			"20368",
+			"87692",
+		)
+
+		assertEquals("20368", parseCeneleNovelLocator(novel))
+		assertEquals("return-hua", extractCeneleNovelSlug(novel))
+		assertEquals(CeneleChapterLocator("20368", "87692"), parseCeneleChapterLocator(chapter))
+	}
+
+	@Test
+	fun extractsVolumeOnlyFromNestedChapterUrls() {
+		assertEquals(
+			"%d8%a7%d9%84%d9%85%d8%ac%d9%84%d8%af-2",
+			extractCeneleVolumeSlug(
+				"/cont/example/%d8%a7%d9%84%d9%85%d8%ac%d9%84%d8%af-2/%d8%a7%d9%84%d9%81%d8%b5%d9%84-80/",
+			),
+		)
+		assertEquals(null, extractCeneleVolumeSlug("/cont/return-hua/%d8%a7%d9%84%d9%81%d8%b5%d9%84-1822/"))
+	}
+
+	@Test
 	fun parsesCleanOfficialAppChapterPayload() {
 		val parser = Cenele(org.koitharu.kotatsu.parsers.MangaLoaderContextMock)
 		val content = parser.parseAppChapterContent(
