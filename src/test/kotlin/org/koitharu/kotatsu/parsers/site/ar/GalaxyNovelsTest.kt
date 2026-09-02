@@ -105,6 +105,24 @@ internal class GalaxyNovelsTest {
 	}
 
 	@Test
+	fun extractsCurrentTextSurfaceUsedByLiveReader() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+		val document = Jsoup.parse(
+			"""
+			<article class="wor-reading-page">
+			  <header class="wor-reading-page__header">عنوان الفصل</header>
+			  <div class="wor-reader-text-surface"><p>نص الفصل الحالي</p></div>
+			</article>
+			""".trimIndent(),
+		)
+
+		val content = parser.extractChapterContent(document)
+
+		assertEquals("نص الفصل الحالي", content?.text())
+		assertEquals("wor-reader-text-surface", content?.className())
+	}
+
+	@Test
 	fun extractsNativeContentFromPublicReaderApi() {
 		val parser = GalaxyNovels(MangaLoaderContextMock)
 		val content = parser.parseReaderApiContent(
