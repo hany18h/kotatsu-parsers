@@ -28,6 +28,27 @@ internal class GalaxyNovelsTest {
 	}
 
 	@Test
+	fun usesGalaxyReaderCookieAndContinuousHeaderForChapterPages() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+		val headers = parser.siteHeaders("https://galaxynovels.com/", isChapterRequest = true)
+
+		assertEquals("wor_reader_js=1", headers["Cookie"])
+		assertEquals("1", headers["X-Wor-Continuous"])
+	}
+
+	@Test
+	fun decodesChapterHtmlReturnedByAndroidWebView() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+
+		assertEquals(
+			"<div class=\"wor-reading-page__content\"><p>نص الفصل</p></div>",
+			parser.decodeWebViewString(
+				"\"<div class=\\\"wor-reading-page__content\\\"><p>نص الفصل</p></div>\"",
+			),
+		)
+	}
+
+	@Test
 	fun parsesAndOrdersCachedChapterMetadata() {
 		val parser = GalaxyNovels(MangaLoaderContextMock)
 		val chapters = parser.parseCachedChapters(
