@@ -13,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -40,6 +41,7 @@ import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.mapNotNullToSet
 import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.parseRaw
+import org.koitharu.kotatsu.parsers.util.runCatchingCancellable
 import org.koitharu.kotatsu.parsers.util.src
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
 import org.koitharu.kotatsu.parsers.util.urlEncoded
@@ -49,8 +51,8 @@ import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 @MangaSourceParser("GALAXYNOVELS", "مجرة الروايات", "ar", ContentType.NOVEL)
-internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
-	context = context,
+internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : PagedMangaParser(
+	context = loaderContext,
 	source = MangaParserSource.GALAXYNOVELS,
 	pageSize = PAGE_SIZE,
 ) {
@@ -263,16 +265,57 @@ internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
 			// its normal reader URL, so existing libraries recover automatically.
 			"https://$domain/?p=$postId"
 		} ?: chapterUrl
-		// The normal chapter page is publicly readable and is more reliable than
-		// the protected REST content endpoint. Do not try a hidden WebView first:
-		// on Cloudflare responses it only waits for the full JS timeout before
-		// repeating the same request with OkHttp.
-		val response = webClient.httpGet(requestUrl, siteHeaders("https://$domain/"))
-		val resolvedChapterUrl = response.request.url.toString()
-		val document = response.parseHtml()
-		val content = extractChapterContent(document) ?: return null
-		return sanitizeChapterContent(content, resolvedChapterUrl)
+		// Prefer the normal public chapter page. Galaxy applies a stricter WAF rule
+		// to chapter paths than to its catalogue, so keep its JavaScript-reader
+		// cookie and continuous-reader request marker exactly as the public reader
+		// and the NovelSourcery implementation do.
+		val directResult = runCatchingCancellable {
+			val response = webClient.httpGet(
+				requestUrl,
+				siteHeaders("https://$domain/", isChapterRequest = true),
+			)
+			val resolvedChapterUrl = response.request.url.toString()
+			response.parseHtml() to resolvedChapterUrl
+		}
+		directResult.getOrNull()?.let { (document, resolvedChapterUrl) ->
+			extractChapterContent(document)?.let { content ->
+				return sanitizeChapterContent(content, resolvedChapterUrl)
+			}
+		}
+
+		// Cloudflare can still reject OkHttp's TLS/browser fingerprint on selected
+		// mobile networks even when the same public page opens in Android WebView.
+		// Use the real browser engine only as a fallback and return just the native
+		// chapter element, never the website UI.
+		loadChapterDocumentInWebView(requestUrl)?.let { document ->
+			extractChapterContent(document)?.let { content ->
+				return sanitizeChapterContent(content, requestUrl)
+			}
+		}
+		directResult.exceptionOrNull()?.let { throw it }
+		return null
 	}
+
+	private suspend fun loadChapterDocumentInWebView(chapterUrl: String): Document? {
+		val rawResult = loaderContext.evaluateJs(
+			chapterUrl,
+			"""
+			(function() {
+			  var content = document.querySelector(
+			    '.wor-reading-page__content, .wor-chapter-content, .entry-content, ' +
+			    '.chapter-content, .post-content, article .content'
+			  );
+			  return content ? content.outerHTML : null;
+			})()
+			""".trimIndent(),
+		) ?: return null
+		val html = decodeWebViewString(rawResult) ?: return null
+		return Jsoup.parse(html, chapterUrl)
+	}
+
+	internal fun decodeWebViewString(rawResult: String): String? = runCatching {
+		JSONObject("{\"value\":$rawResult}").optString("value").trim().takeIf(String::isNotEmpty)
+	}.getOrNull()
 
 	internal fun parseReaderApiContent(response: JSONObject): NovelChapterContent? {
 		val data = response.optJSONObject("data") ?: response
@@ -315,12 +358,10 @@ internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
 			".chapter-content, .post-content, article .content",
 	) ?: document.selectFirst("article")
 
-	private fun siteHeaders(referer: String): Headers {
-		// Do not forge the site's JavaScript-reader cookie. Galaxy uses it with
-		// rapid-reading telemetry; setting it from a parser without executing the
-		// matching browser flow makes server-side risk scoring more aggressive.
+	internal fun siteHeaders(referer: String, isChapterRequest: Boolean = false): Headers {
 		return Headers.Builder()
 		.add("Referer", referer)
+		.add("Cookie", "wor_reader_js=1")
 		.add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 		.add("Accept-Language", "ar,en-US;q=0.7,en;q=0.3")
 		.add("Sec-Fetch-Dest", "document")
@@ -328,6 +369,11 @@ internal class GalaxyNovels(context: MangaLoaderContext) : PagedMangaParser(
 		.add("Sec-Fetch-Site", "same-origin")
 		.add("Upgrade-Insecure-Requests", "1")
 		.add("User-Agent", config[userAgentKey])
+		.apply {
+			if (isChapterRequest) {
+				add("X-Wor-Continuous", "1")
+			}
+		}
 		.build()
 	}
 
