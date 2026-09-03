@@ -115,7 +115,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 				append(if (order == SortOrder.ALPHABETICAL) "name" else "")
 			}
 		}
-		val document = webClient.httpGet(url, siteHeaders("https://$domain/")).parseHtml()
+		val document = loadPublicDocument(url, "https://$domain/")
 		return parseNovelList(document)
 	}
 
@@ -151,7 +151,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val mangaUrl = manga.url.toAbsoluteUrl(domain)
-		val document = webClient.httpGet(mangaUrl, siteHeaders("https://$domain/")).parseHtml()
+		val document = loadPublicDocument(mangaUrl, "https://$domain/")
 		val coverElement = document.selectFirst("img.wor-cover-img")
 		val cover = coverElement?.attr("data-src")?.trim()?.takeIf(String::isNotEmpty)
 			?: coverElement?.src()
@@ -251,6 +251,24 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = emptyList()
 
+	private suspend fun loadPublicDocument(url: String, referer: String): Document {
+		val directResult = runCatchingCancellable {
+			webClient.httpGet(url, siteHeaders(referer)).parseHtml()
+		}
+		directResult.getOrNull()?.let { return it }
+
+		// Galaxy occasionally rejects OkHttp at the edge based on its TLS
+		// fingerprint while the same catalogue page works in Android WebView.
+		val webViewResult = runCatchingCancellable {
+			loadPageDocumentInWebView(url)
+		}
+		webViewResult.getOrNull()?.let { return it }
+
+		directResult.exceptionOrNull()?.let { throw it }
+		webViewResult.exceptionOrNull()?.let { throw it }
+		error("Galaxy returned no readable document")
+	}
+
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
 		val requestUrl = findLegacyChapterPostId(chapter.url)?.let { postId ->
@@ -307,6 +325,21 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		return Jsoup.parse(html, chapterUrl)
 	}
 
+	private suspend fun loadPageDocumentInWebView(pageUrl: String): Document? {
+		val rawResult = loaderContext.evaluateJs(
+			pageUrl,
+			"""
+			(function() {
+			  if (document.readyState === 'loading') return null;
+			  var root = document.documentElement;
+			  return root ? root.outerHTML : null;
+			})()
+			""".trimIndent(),
+		) ?: return null
+		val html = decodeWebViewString(rawResult) ?: return null
+		return Jsoup.parse(html, pageUrl)
+	}
+
 	internal fun decodeWebViewString(rawResult: String): String? = runCatching {
 		JSONObject("{\"value\":$rawResult}").optString("value").trim().takeIf(String::isNotEmpty)
 	}.getOrNull()
@@ -353,7 +386,6 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 	internal fun siteHeaders(referer: String, isChapterRequest: Boolean = false): Headers {
 		return Headers.Builder()
 		.add("Referer", referer)
-		.add("Cookie", "wor_reader_js=1")
 		.add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 		.add("Accept-Language", "ar,en-US;q=0.7,en;q=0.3")
 		.add("Sec-Fetch-Dest", "document")
@@ -363,6 +395,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		.add("User-Agent", config[userAgentKey])
 		.apply {
 			if (isChapterRequest) {
+				add("Cookie", "wor_reader_js=1")
 				add("X-Wor-Continuous", "1")
 			}
 		}
