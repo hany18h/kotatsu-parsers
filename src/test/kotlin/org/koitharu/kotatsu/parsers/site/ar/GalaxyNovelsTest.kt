@@ -37,6 +37,15 @@ internal class GalaxyNovelsTest {
 	}
 
 	@Test
+	fun doesNotSendReaderTelemetryHeadersToCataloguePages() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+		val headers = parser.siteHeaders("https://galaxynovels.com/")
+
+		assertEquals(null, headers["Cookie"])
+		assertEquals(null, headers["X-Wor-Continuous"])
+	}
+
+	@Test
 	fun decodesChapterHtmlReturnedByAndroidWebView() {
 		val parser = GalaxyNovels(MangaLoaderContextMock)
 
