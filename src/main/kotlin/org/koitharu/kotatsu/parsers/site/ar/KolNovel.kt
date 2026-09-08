@@ -36,13 +36,14 @@ internal class KolNovel(context: MangaLoaderContext) :
 	)
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+		val query = filter.query?.trim().orEmpty()
 		val url = buildString {
 			append("https://")
 			append(domain)
 			when {
-				!filter.query.isNullOrEmpty() -> {
+				query.isNotEmpty() -> {
 					append("/?s=")
-					append(filter.query.urlEncoded())
+					append(query.urlEncoded())
 					append("&page=")
 					append(page)
 				}
@@ -206,7 +207,10 @@ internal class KolNovel(context: MangaLoaderContext) :
 		val sourceElement = doc.selectFirst("#kol_content")
 			?: doc.selectFirst(".epcontent.entry-content")
 			?: return null
-		val contentElement = sanitizeChapterElement(sourceElement)
+		val contentElement = sanitizeChapterElement(
+			sourceElement = sourceElement,
+			hiddenClasses = findHiddenChapterClasses(doc, sourceElement),
+		)
 
 		contentElement.select("p").forEach { p ->
 			val text = p.text().trim()
@@ -252,13 +256,21 @@ internal class KolNovel(context: MangaLoaderContext) :
 	 * those with style/script selectors because they are not HTML elements, so
 	 * discard the injected tail before parsing and sanitising the fragment.
 	 */
-	internal fun sanitizeChapterElement(sourceElement: Element): Element {
+	internal fun sanitizeChapterElement(
+		sourceElement: Element,
+		hiddenClasses: Set<String> = emptySet(),
+	): Element {
 		val rawHtml = sourceElement.html()
 		val markerIndex = SHOLA_TAIL_MARKERS.map(rawHtml::indexOf)
 			.filter { it >= 0 }
 			.minOrNull()
 		val chapterHtml = markerIndex?.let { rawHtml.substring(0, it) } ?: rawHtml
 		return Jsoup.parseBodyFragment(chapterHtml).body().also { content ->
+			// KolNovel sends the real chapter and shuffled decoy paragraphs together.
+			// Random class names declared in the page's inline CSS identify the decoys.
+			hiddenClasses.forEach { className ->
+				content.getElementsByClass(className).remove()
+			}
 			content.select(
 				"script, style, noscript, form, iframe, ins, .code-block, " +
 					"[id^=pf-], [id^=shola-], [class*=shola-], [hidden], [aria-hidden=true]",
@@ -266,8 +278,33 @@ internal class KolNovel(context: MangaLoaderContext) :
 		}
 	}
 
+	internal fun findHiddenChapterClasses(document: Document, sourceElement: Element): Set<String> {
+		val chapterClasses = sourceElement.select("[class]")
+			.flatMapTo(HashSet()) { it.classNames() }
+		if (chapterClasses.isEmpty()) return emptySet()
+
+		return buildSet {
+			document.select("style").forEach { style ->
+				CSS_RULE.findAll(style.data() + style.html()).forEach { rule ->
+					val declarations = rule.groupValues[2]
+					if (!isHiddenDecoyRule(declarations)) return@forEach
+					CLASS_SELECTOR.findAll(rule.groupValues[1]).forEach { selector ->
+						selector.groupValues[1].takeIf(chapterClasses::contains)?.let(::add)
+					}
+				}
+			}
+		}
+	}
+
 	internal companion object {
 		private val ONLY_NUMBER = Regex("^\\d+$")
+		private val CSS_RULE = Regex("""([^{}]+)\{([^{}]+)}""")
+		private val CLASS_SELECTOR = Regex("""\.([A-Za-z][\w-]*)""")
+		private val ZERO_OPACITY = Regex("""(?:^|;)\s*opacity\s*:\s*0(?:\.0+)?\s*(?:!important)?\s*(?:;|$)""", RegexOption.IGNORE_CASE)
+		private val HIDDEN_POSITION = Regex(
+			"""(?:position\s*:\s*fixed|text-indent\s*:\s*-\d{3,}|bottom\s*:\s*-\d{2,}px|height\s*:\s*0(?:\.\d+)?px)""",
+			RegexOption.IGNORE_CASE,
+		)
 		private val SHOLA_TAIL_MARKERS = listOf(
 			".shola-widget",
 			".shola-lb-wrap",
@@ -275,5 +312,8 @@ internal class KolNovel(context: MangaLoaderContext) :
 			"function sholaTab(",
 			"function shola",
 		)
+
+		private fun isHiddenDecoyRule(declarations: String): Boolean =
+			ZERO_OPACITY.containsMatchIn(declarations) && HIDDEN_POSITION.containsMatchIn(declarations)
 	}
 }

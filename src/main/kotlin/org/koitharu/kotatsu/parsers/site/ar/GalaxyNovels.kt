@@ -252,21 +252,27 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = emptyList()
 
 	private suspend fun loadPublicDocument(url: String, referer: String): Document {
-		val directResult = runCatchingCancellable {
-			webClient.httpGet(url, siteHeaders(referer)).parseHtml()
-		}
-		directResult.getOrNull()?.let { return it }
-
 		// Galaxy occasionally rejects OkHttp at the edge based on its TLS
-		// fingerprint while the same catalogue page works in Android WebView.
+		// fingerprint while the same public page works in Android WebView. Start
+		// with WebView so the known rejected request does not surface as a block.
 		val webViewResult = runCatchingCancellable {
 			loadPageDocumentInWebView(url)
 		}
-		webViewResult.getOrNull()?.let { return it }
+		webViewResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
 
-		directResult.exceptionOrNull()?.let { throw it }
+		val directResult = runCatchingCancellable {
+			webClient.httpGet(url, siteHeaders(referer)).parseHtml()
+		}
+		directResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
+
 		webViewResult.exceptionOrNull()?.let { throw it }
+		directResult.exceptionOrNull()?.let { throw it }
 		error("Galaxy returned no readable document")
+	}
+
+	internal fun isBlockedDocument(document: Document): Boolean {
+		val text = document.text().lowercase(Locale.ROOT)
+		return BLOCK_PAGE_MARKERS.any(text::contains)
 	}
 
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
@@ -442,6 +448,13 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	internal companion object {
 		private const val PAGE_SIZE = 20
+		private val BLOCK_PAGE_MARKERS = listOf(
+			"تم حظرك من قبل الخادم",
+			"حاول استخدام شبكة اتصال مختلفة",
+			"you have been blocked",
+			"attention required! | cloudflare",
+			"sorry, you have been blocked",
+		)
 		internal const val CHAPTER_CONTENT_SELECTOR =
 			".wor-reader-text-surface, .wor-reading-page__content, .wor-chapter-content, " +
 				".entry-content, .chapter-content, .post-content, article .content"

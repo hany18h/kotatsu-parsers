@@ -58,6 +58,20 @@ internal class GalaxyNovelsTest {
 	}
 
 	@Test
+	fun recognizesServerBlockPagesBeforeParsingThemAsCatalogueContent() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+
+		assertEquals(
+			true,
+			parser.isBlockedDocument(Jsoup.parse("<h1>Sorry, you have been blocked</h1>")),
+		)
+		assertEquals(
+			false,
+			parser.isBlockedDocument(Jsoup.parse("<main><h1>مكتبة الروايات</h1></main>")),
+		)
+	}
+
+	@Test
 	fun parsesAndOrdersCachedChapterMetadata() {
 		val parser = GalaxyNovels(MangaLoaderContextMock)
 		val chapters = parser.parseCachedChapters(

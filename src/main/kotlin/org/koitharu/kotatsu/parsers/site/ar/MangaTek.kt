@@ -1,25 +1,30 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
-import org.json.JSONArray
+import okhttp3.Headers
 import org.json.JSONObject
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
+import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
 import java.util.*
 
 @MangaSourceParser("MANGATEK", "MangaTek", "ar", ContentType.MANGA)
-internal class MangaTek(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.MANGATEK, pageSize = 24) {
+internal class MangaTek(private val loaderContext: MangaLoaderContext) :
+    PagedMangaParser(loaderContext, MangaParserSource.MANGATEK, pageSize = 24) {
 
     override val configKeyDomain = ConfigKey.Domain("mangatek.com")
+    override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_MOBILE)
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
         keys.add(userAgentKey)
+        keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
     }
 
     override val filterCapabilities: MangaListFilterCapabilities
@@ -39,15 +44,16 @@ internal class MangaTek(context: MangaLoaderContext) :
     override suspend fun getFilterOptions() = MangaListFilterOptions()
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        val query = filter.query?.trim().orEmpty()
         val url = buildString {
             append("https://")
             append(domain)
             append("/manga-list")
             
             when {
-                !filter.query.isNullOrEmpty() -> {
+                query.isNotEmpty() -> {
                     append("?search=")
-                    append(filter.query.urlEncoded())
+                    append(query.urlEncoded())
                 }
                 else -> {
                     append("?sort=")
@@ -67,7 +73,7 @@ internal class MangaTek(context: MangaLoaderContext) :
             }
         }
 
-        val doc = webClient.httpGet(url).parseHtml()
+        val doc = loadDocument(url)
         
         // إزالة العناصر المزعجة
         cleanDocument(doc)
@@ -103,7 +109,7 @@ internal class MangaTek(context: MangaLoaderContext) :
 
     override suspend fun getDetails(manga: Manga): Manga {
         val url = "https://$domain/manga/${manga.url}"
-        val doc = webClient.httpGet(url).parseHtml()
+        val doc = loadDocument(url)
         
         // إزالة العناصر المزعجة
         cleanDocument(doc)
@@ -134,7 +140,7 @@ internal class MangaTek(context: MangaLoaderContext) :
         val ratingText = doc.selectFirst("span:has(i.fa-star)")?.text()
         val rating = ratingText?.replace(Regex("[^0-9.]"), "")?.toFloatOrNull()?.div(10) ?: manga.rating
         
-        val chapters = fetchChaptersFromApi(manga.url)
+        val chapters = parseChapters(manga.url, doc)
         
         return manga.copy(
             title = title,
@@ -209,16 +215,7 @@ internal class MangaTek(context: MangaLoaderContext) :
         return null
     }
 
-    /**
-     * جلب الفصول من API الخاص بالموقع
-     */
-    private suspend fun fetchChaptersFromApi(mangaSlug: String): List<MangaChapter> {
-        val pageUrl = "https://$domain/manga/$mangaSlug"
-        val doc = webClient.httpGet(pageUrl).parseHtml()
-        
-        // تنظيف الوثيقة
-        cleanDocument(doc)
-        
+    private fun parseChapters(mangaSlug: String, doc: Document): List<MangaChapter> {
         val scriptContent = doc.select("astro-island[component-url*='MangaChaptersLoader']")
             .attr("props")
         
@@ -288,14 +285,14 @@ internal class MangaTek(context: MangaLoaderContext) :
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val fullUrl = "https://$domain${chapter.url}"
-        val doc = webClient.httpGet(fullUrl).parseHtml()
+        val fullUrl = chapter.url.toAbsoluteUrl(domain)
+        val doc = loadDocument(fullUrl)
         
         // تنظيف صفحة القراءة من العناصر المزعجة
         cleanDocument(doc)
         
         return doc.select("div.manga-page img[src], div.manga-page img[data-src]").mapIndexed { index, img ->
-            val imageUrl = img.attr("src").ifEmpty { img.attr("data-src") }
+            val imageUrl = img.attr("src").ifEmpty { img.attr("data-src") }.toAbsoluteUrl(domain)
             
             MangaPage(
                 id = generateUid("${chapter.id}-$index"),
@@ -305,6 +302,54 @@ internal class MangaTek(context: MangaLoaderContext) :
             )
         }
     }
+
+    /**
+     * MangaTek sometimes rejects OkHttp's network fingerprint and asks the app
+     * for a CAPTCHA although the public page opens normally in Chrome. Load the
+     * same public HTML through WebView first, then keep HTTP as a lightweight
+     * fallback for devices where WebView is unavailable.
+     */
+    private suspend fun loadDocument(url: String): Document {
+        val webViewResult = runCatchingCancellable {
+            val rawResult = loaderContext.evaluateJs(
+                url,
+                """
+                (function() {
+                  if (document.readyState === 'loading') return null;
+                  return document.documentElement ? document.documentElement.outerHTML : null;
+                })()
+                """.trimIndent(),
+            ) ?: return@runCatchingCancellable null
+            decodeWebViewString(rawResult)?.let { Jsoup.parse(it, url) }
+        }
+        webViewResult.getOrNull()?.takeUnless(::isCaptchaPage)?.let { return it }
+
+        val directResult = runCatchingCancellable {
+            webClient.httpGet(url, siteHeaders("https://$domain/")).parseHtml()
+        }
+        directResult.getOrNull()?.takeUnless(::isCaptchaPage)?.let { return it }
+
+        webViewResult.exceptionOrNull()?.let { throw it }
+        directResult.exceptionOrNull()?.let { throw it }
+        error("MangaTek returned a CAPTCHA page instead of public content")
+    }
+
+    internal fun decodeWebViewString(rawResult: String): String? = runCatching {
+        JSONObject("{\"value\":$rawResult}").optString("value").trim().takeIf(String::isNotEmpty)
+    }.getOrNull()
+
+    internal fun isCaptchaPage(document: Document): Boolean {
+        val text = (document.title() + " " + document.text()).lowercase(Locale.ROOT)
+        return CAPTCHA_MARKERS.any(text::contains)
+    }
+
+    private fun siteHeaders(referer: String): Headers = Headers.Builder()
+        .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .add("Accept-Language", "ar,en-US;q=0.7,en;q=0.3")
+        .add("Referer", referer)
+        .add("Upgrade-Insecure-Requests", "1")
+        .add("User-Agent", config[userAgentKey])
+        .build()
 
     private fun parseDate(dateText: String?): Long {
         if (dateText.isNullOrEmpty()) return 0L
@@ -326,5 +371,15 @@ internal class MangaTek(context: MangaLoaderContext) :
         } catch (e: Exception) {
             0L
         }
+    }
+
+    internal companion object {
+        private val CAPTCHA_MARKERS = listOf(
+            "captcha",
+            "cf-turnstile",
+            "verify you are human",
+            "التحقق من أنك إنسان",
+            "مطلوب التحقق",
+        )
     }
 }

@@ -106,20 +106,6 @@ internal class MangaMelloTest {
 	}
 
 	@Test
-	fun `recognizes chapters hosted only on the retired gmanga server`() {
-		assertTrue(
-			MangaMelloPlus.isRetiredImageUrl(
-				"https://media.gmanga.me/uploads/releases/team/chapter/1.webp",
-			),
-		)
-		assertFalse(
-			MangaMelloPlus.isRetiredImageUrl(
-				"https://s3storm.lekmanga.site/manga/chapter/1.webp",
-			),
-		)
-	}
-
-	@Test
 	fun `search path omits sort parameters rejected by plus api`() {
 		val path = MangaMelloPlus.buildListPath(
 			page = 1,

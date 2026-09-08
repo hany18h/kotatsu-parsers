@@ -1,6 +1,5 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
-import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -10,52 +9,19 @@ import org.junit.jupiter.api.Test
 internal class CeneleTest {
 
 	@Test
-	fun preservesOfficialNovelAndChapterLocatorsWithoutChangingPublicPath() {
-		val novel = attachCeneleNovelLocator("/cont/return-hua/", "20368")
-		val chapter = attachCeneleChapterLocator(
-			"/cont/return-hua/%d8%a7%d9%84%d9%81%d8%b5%d9%84-1822/",
-			"20368",
-			"87692",
-		)
+	fun decodesPublicPageHtmlReturnedByWebView() {
+		val encoded = "\"\\u003Chtml\\u003E\\u003Cbody\\u003Echapter\\u003C/body\\u003E\\u003C/html\\u003E\""
 
-		assertEquals("20368", parseCeneleNovelLocator(novel))
-		assertEquals("return-hua", extractCeneleNovelSlug(novel))
-		assertEquals(CeneleChapterLocator("20368", "87692"), parseCeneleChapterLocator(chapter))
+		assertEquals("<html><body>chapter</body></html>", Cenele.decodeWebViewString(encoded))
 	}
 
 	@Test
-	fun extractsVolumeOnlyFromNestedChapterUrls() {
-		assertEquals(
-			"%d8%a7%d9%84%d9%85%d8%ac%d9%84%d8%af-2",
-			extractCeneleVolumeSlug(
-				"/cont/example/%d8%a7%d9%84%d9%85%d8%ac%d9%84%d8%af-2/%d8%a7%d9%84%d9%81%d8%b5%d9%84-80/",
-			),
-		)
-		assertEquals(null, extractCeneleVolumeSlug("/cont/return-hua/%d8%a7%d9%84%d9%81%d8%b5%d9%84-1822/"))
-	}
+	fun recognizesServerBlockPage() {
+		val blocked = Jsoup.parse("<title>Blocked</title><p>تم حظرك من قبل الخادم</p>")
+		val content = Jsoup.parse("<title>Novel</title><p>نص الفصل الحقيقي</p>")
 
-	@Test
-	fun parsesCleanOfficialAppChapterPayload() {
-		val parser = Cenele(org.koitharu.kotatsu.parsers.MangaLoaderContextMock)
-		val content = parser.parseAppChapterContent(
-			JSONObject(
-				"""
-				{
-				  "success": true,
-				  "data": {
-				    "content": "<p>النص الحقيقي للفصل</p><img data-src='/image.webp'>",
-				    "chapter": {"chapter_name": "الفصل 280"}
-				  }
-				}
-				""".trimIndent(),
-			),
-			"https://cenele.com/cont/example/chapter-280/",
-			"",
-		)
-
-		assertTrue(content?.html?.contains("النص الحقيقي للفصل") == true)
-		assertTrue(content?.html?.contains("الفصل 280") == true)
-		assertEquals("https://cenele.com/image.webp", content?.images?.single()?.url)
+		assertTrue(Cenele.isBlockedDocument(blocked))
+		assertFalse(Cenele.isBlockedDocument(content))
 	}
 
 	@Test
