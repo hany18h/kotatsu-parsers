@@ -72,6 +72,28 @@ internal class GalaxyNovelsTest {
 	}
 
 	@Test
+	fun parsesCurrentCatalogueCards() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+		val document = Jsoup.parse(
+			"""
+			<article class="wor-novel-card">
+			  <a class="wor-novel-card__cover" href="/novel/first/"><img class="wor-cover-img" data-src="/first.jpg"></a>
+			  <h3><a href="/novel/first/">الرواية الأولى</a></h3>
+			</article>
+			<article class="wor-library-card">
+			  <a class="wor-library-card__cover" href="/novel/second/"><img src="https://galaxynovels.com/second.jpg"></a>
+			  <h2 class="wor-library-card__title"><a href="/novel/second/">الرواية الثانية</a></h2>
+			</article>
+			""".trimIndent(),
+		)
+
+		val novels = parser.parseNovelList(document)
+
+		assertEquals(listOf("الرواية الأولى", "الرواية الثانية"), novels.map { it.title })
+		assertEquals("https://galaxynovels.com/first.jpg", novels.first().coverUrl)
+	}
+
+	@Test
 	fun parsesAndOrdersCachedChapterMetadata() {
 		val parser = GalaxyNovels(MangaLoaderContextMock)
 		val chapters = parser.parseCachedChapters(

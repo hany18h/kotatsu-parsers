@@ -298,7 +298,10 @@ internal class KolNovel(context: MangaLoaderContext) :
 
 	internal companion object {
 		private val ONLY_NUMBER = Regex("^\\d+$")
-		private val CSS_RULE = Regex("""([^{}]+)\{([^{}]+)}""")
+		// Android's ICU regex engine does not accept an unmatched literal closing
+		// brace here, although the desktop JVM does. Escape both CSS braces so class
+		// initialization works consistently across Android versions.
+		private val CSS_RULE = Regex("""([^{}]+)\{([^{}]+)\}""")
 		private val CLASS_SELECTOR = Regex("""\.([A-Za-z][\w-]*)""")
 		private val ZERO_OPACITY = Regex("""(?:^|;)\s*opacity\s*:\s*0(?:\.0+)?\s*(?:!important)?\s*(?:;|$)""", RegexOption.IGNORE_CASE)
 		private val HIDDEN_POSITION = Regex(
