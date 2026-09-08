@@ -129,7 +129,7 @@ internal class AlHilalLibrary(private val loaderContext: MangaLoaderContext) : P
 			?: error("PDF URL is missing")
 		val author = book.optString("author").trim().takeIf(String::isNotEmpty)
 		val category = book.optString("category").trim().takeIf(String::isNotEmpty)
-		val chapterUrl = "$pdfUrl#$PDF_BOOK_FRAGMENT$pageCount"
+		val chapterUrl = "${resolvePdfUrl(bookId, pdfUrl)}#$PDF_BOOK_FRAGMENT$pageCount"
 		return manga.copy(
 			title = book.optString("title").trim().takeIf(String::isNotEmpty) ?: manga.title,
 			description = book.optString("description").trim().takeIf(String::isNotEmpty),
@@ -210,6 +210,13 @@ internal class AlHilalLibrary(private val loaderContext: MangaLoaderContext) : P
 		return inner.substring(2 + paddingLength)
 	}
 
+	internal fun resolvePdfUrl(bookId: Int, apiPdfUrl: String): String =
+		if (KNOWN_PDF_REDIRECT.matches(apiPdfUrl)) {
+			"https://alkawn-lib.site/Books/PDF/Book$bookId.pdf"
+		} else {
+			apiPdfUrl
+		}
+
 	private fun randomToken(length: Int): String = buildString(length) {
 		repeat(length) { append(TOKEN_ALPHABET[Random.nextInt(TOKEN_ALPHABET.length)]) }
 	}
@@ -229,5 +236,9 @@ internal class AlHilalLibrary(private val loaderContext: MangaLoaderContext) : P
 		private const val BASE64_ALPHABET =
 			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
 		private val PDF_BOOK_PAGES = Regex("#$PDF_BOOK_FRAGMENT(\\d+)")
+		private val KNOWN_PDF_REDIRECT = Regex(
+			"""https?://(?:www\.)?(?:alkawn|alhilal)-lib\.site/API/v4/bookPDF\.php(?:\?.*)?""",
+			RegexOption.IGNORE_CASE,
+		)
 	}
 }

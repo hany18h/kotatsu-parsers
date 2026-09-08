@@ -46,4 +46,16 @@ internal class AlHilalLibraryTest {
 		assertEquals("روايات عربية", book.tags.single().title)
 		assertTrue(book.rating > 0.9f)
 	}
+
+	@Test
+	fun skipsKnownPdfRedirectEndpoint() {
+		assertEquals(
+			"https://alkawn-lib.site/Books/PDF/Book6623.pdf",
+			parser.resolvePdfUrl(6623, "https://alkawn-lib.site/API/v4/bookPDF.php?id=6623"),
+		)
+		assertEquals(
+			"https://cdn.example.org/book.pdf",
+			parser.resolvePdfUrl(6623, "https://cdn.example.org/book.pdf"),
+		)
+	}
 }

@@ -115,12 +115,12 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 				append(if (order == SortOrder.ALPHABETICAL) "name" else "")
 			}
 		}
-		val document = loadPublicDocument(url, "https://$domain/")
+		val document = loadPublicDocument(url, "https://$domain/", CATALOG_CARD_SELECTOR)
 		return parseNovelList(document)
 	}
 
-	private fun parseNovelList(document: Document): List<Manga> =
-		document.select("article.wor-novel-card, article.wor-library-card").mapNotNull { card ->
+	internal fun parseNovelList(document: Document): List<Manga> =
+		document.select(CATALOG_CARD_SELECTOR).mapNotNull { card ->
 			val link = card.selectFirst(
 				"h2.wor-library-card__title a[href], h3 a[href], " +
 					"a.wor-novel-card__cover[href], a.wor-library-card__cover[href]",
@@ -151,7 +151,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val mangaUrl = manga.url.toAbsoluteUrl(domain)
-		val document = loadPublicDocument(mangaUrl, "https://$domain/")
+		val document = loadPublicDocument(mangaUrl, "https://$domain/", DETAILS_READY_SELECTOR)
 		val coverElement = document.selectFirst("img.wor-cover-img")
 		val cover = coverElement?.attr("data-src")?.trim()?.takeIf(String::isNotEmpty)
 			?: coverElement?.src()
@@ -251,22 +251,25 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = emptyList()
 
-	private suspend fun loadPublicDocument(url: String, referer: String): Document {
-		// Galaxy occasionally rejects OkHttp at the edge based on its TLS
-		// fingerprint while the same public page works in Android WebView. Start
-		// with WebView so the known rejected request does not surface as a block.
-		val webViewResult = runCatchingCancellable {
-			loadPageDocumentInWebView(url)
-		}
-		webViewResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
-
+	private suspend fun loadPublicDocument(url: String, referer: String, readySelector: String): Document {
+		// Public catalogue and novel pages normally work over HTTP and arrive with
+		// their useful markup already present. Prefer that fast path. The previous
+		// WebView-first implementation could return at DOM interactive state before
+		// Galaxy's scripts inserted any cards, resulting in a successful empty list.
 		val directResult = runCatchingCancellable {
 			webClient.httpGet(url, siteHeaders(referer)).parseHtml()
 		}
 		directResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
 
-		webViewResult.exceptionOrNull()?.let { throw it }
+		// Some networks are still challenged at the HTTP edge. In that case use a
+		// real WebView, but keep polling until the page's useful content exists.
+		val webViewResult = runCatchingCancellable {
+			loadPageDocumentInWebView(url, readySelector)
+		}
+		webViewResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
+
 		directResult.exceptionOrNull()?.let { throw it }
+		webViewResult.exceptionOrNull()?.let { throw it }
 		error("Galaxy returned no readable document")
 	}
 
@@ -331,12 +334,12 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		return Jsoup.parse(html, chapterUrl)
 	}
 
-	private suspend fun loadPageDocumentInWebView(pageUrl: String): Document? {
+	private suspend fun loadPageDocumentInWebView(pageUrl: String, readySelector: String): Document? {
 		val rawResult = loaderContext.evaluateJs(
 			pageUrl,
 			"""
 			(function() {
-			  if (document.readyState === 'loading') return null;
+			  if (document.readyState === 'loading' || !document.querySelector('$readySelector')) return null;
 			  var root = document.documentElement;
 			  return root ? root.outerHTML : null;
 			})()
@@ -448,6 +451,9 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	internal companion object {
 		private const val PAGE_SIZE = 20
+		internal const val CATALOG_CARD_SELECTOR = "article.wor-novel-card, article.wor-library-card"
+		private const val DETAILS_READY_SELECTOR =
+			"[data-wor-chapters-container][data-manifest-url], article.wor-novel-chapter-item"
 		private val BLOCK_PAGE_MARKERS = listOf(
 			"تم حظرك من قبل الخادم",
 			"حاول استخدام شبكة اتصال مختلفة",
