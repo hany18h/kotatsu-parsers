@@ -10,12 +10,25 @@ internal class AnimeWitcherTest {
 	fun usesOfficialAlgoliaFallbackHosts() {
 		assertEquals(
 			listOf(
-				"D8LH9I7ZL7-dsn.algolia.net",
-				"D8LH9I7ZL7-1.algolianet.com",
-				"D8LH9I7ZL7-2.algolianet.com",
-				"D8LH9I7ZL7-3.algolianet.com",
+				"QVHT7NPEJG-dsn.algolia.net",
+				"QVHT7NPEJG-1.algolianet.com",
+				"QVHT7NPEJG-2.algolianet.com",
+				"QVHT7NPEJG-3.algolianet.com",
 			),
 			AnimeWitcher.ALGOLIA_READ_HOSTS,
+		)
+	}
+
+	@Test
+	fun buildsFallbackHostsForRotatedAppId() {
+		assertEquals(
+			listOf(
+				"NEWAPP1234-dsn.algolia.net",
+				"NEWAPP1234-1.algolianet.com",
+				"NEWAPP1234-2.algolianet.com",
+				"NEWAPP1234-3.algolianet.com",
+			),
+			AnimeWitcher.algoliaReadHosts("NEWAPP1234"),
 		)
 	}
 

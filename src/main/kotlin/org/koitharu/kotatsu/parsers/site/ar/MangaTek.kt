@@ -304,12 +304,16 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     }
 
     /**
-     * MangaTek sometimes rejects OkHttp's network fingerprint and asks the app
-     * for a CAPTCHA although the public page opens normally in Chrome. Load the
-     * same public HTML through WebView first, then keep HTTP as a lightweight
-     * fallback for devices where WebView is unavailable.
+     * MangaTek currently ships the catalog, chapter list and reader images in
+     * the initial HTML. Prefer the lightweight HTTP path so opening the source
+     * does not wait for a WebView; keep WebView only for challenged networks.
      */
     private suspend fun loadDocument(url: String): Document {
+        val directResult = runCatchingCancellable {
+            webClient.httpGet(url, siteHeaders("https://$domain/")).parseHtml()
+        }
+        directResult.getOrNull()?.takeUnless(::isCaptchaPage)?.let { return it }
+
         val webViewResult = runCatchingCancellable {
             val rawResult = loaderContext.evaluateJs(
                 url,
@@ -324,13 +328,8 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         }
         webViewResult.getOrNull()?.takeUnless(::isCaptchaPage)?.let { return it }
 
-        val directResult = runCatchingCancellable {
-            webClient.httpGet(url, siteHeaders("https://$domain/")).parseHtml()
-        }
-        directResult.getOrNull()?.takeUnless(::isCaptchaPage)?.let { return it }
-
-        webViewResult.exceptionOrNull()?.let { throw it }
         directResult.exceptionOrNull()?.let { throw it }
+        webViewResult.exceptionOrNull()?.let { throw it }
         error("MangaTek returned a CAPTCHA page instead of public content")
     }
 

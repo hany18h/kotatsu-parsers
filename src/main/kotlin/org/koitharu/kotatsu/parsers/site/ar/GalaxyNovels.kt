@@ -288,20 +288,9 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			"https://$domain/?p=$postId"
 		} ?: chapterUrl
 
-		// Galaxy rejects OkHttp's TLS/browser fingerprint on chapter paths while
-		// serving the same public page to a real browser. Start with WebView so a
-		// successful chapter is not delayed by the known-to-fail HTTP attempt.
-		val webViewResult = runCatchingCancellable {
-			loadChapterDocumentInWebView(requestUrl)
-		}
-		webViewResult.getOrNull()?.let { document ->
-			extractChapterContent(document)?.let { content ->
-				return sanitizeChapterContent(content, requestUrl)
-			}
-		}
-
-		// Keep the normal HTTP reader as a fallback for environments where WebView
-		// is unavailable or when Galaxy relaxes its chapter-page WAF.
+		// The public reader is normally available as complete HTML. Avoid starting
+		// WebView for every chapter; it is slower and can return before client-side
+		// markup settles. WebView remains the challenge fallback below.
 		val directResult = runCatchingCancellable {
 			val response = webClient.httpGet(
 				requestUrl,
@@ -313,6 +302,15 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		directResult.getOrNull()?.let { (document, resolvedChapterUrl) ->
 			extractChapterContent(document)?.let { content ->
 				return sanitizeChapterContent(content, resolvedChapterUrl)
+			}
+		}
+
+		val webViewResult = runCatchingCancellable {
+			loadChapterDocumentInWebView(requestUrl)
+		}
+		webViewResult.getOrNull()?.let { document ->
+			extractChapterContent(document)?.let { content ->
+				return sanitizeChapterContent(content, requestUrl)
 			}
 		}
 		directResult.exceptionOrNull()?.let { throw it }

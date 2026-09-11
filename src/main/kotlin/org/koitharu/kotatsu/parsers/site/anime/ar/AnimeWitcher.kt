@@ -65,6 +65,9 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 	override val authUrl: String = "https://www.animewitcher.com/"
 
 	private val authMutex = Mutex()
+	private val searchConfigMutex = Mutex()
+	@Volatile
+	private var cachedSearchConfig: SearchConfig? = null
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.NEWEST,
@@ -186,11 +189,7 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 			.put("hitsPerPage", PAGE_SIZE)
 			.put("page", page - 1)
 			.put("attributesToRetrieve", ALGOLIA_ATTRIBUTES)
-		val headers = Headers.Builder()
-			.add("X-Algolia-Application-Id", ALGOLIA_APP_ID)
-			.add("X-Algolia-API-Key", ALGOLIA_SEARCH_KEY)
-			.build()
-		val response = queryAlgolia(index, body, headers)
+		val response = queryCatalog(index, body)
 		val hits = response.optJSONArray("hits") ?: return emptyList()
 		return buildList {
 			for (i in 0 until hits.length()) {
@@ -199,9 +198,28 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 		}.distinctBy(Manga::id)
 	}
 
-	private suspend fun queryAlgolia(index: String, body: JSONObject, headers: Headers): JSONObject {
+	private suspend fun queryCatalog(index: String, body: JSONObject): JSONObject {
+		val config = searchConfig(forceRefresh = false)
+		return try {
+			queryAlgolia(index, body, config)
+		} catch (error: CancellationException) {
+			throw error
+		} catch (error: Exception) {
+			// Credentials are intentionally rotated in a public settings document.
+			// Refresh once so a rotation does not leave the catalog on HTTP 403.
+			val refreshed = searchConfig(forceRefresh = true)
+			if (refreshed == config) throw error
+			queryAlgolia(index, body, refreshed)
+		}
+	}
+
+	private suspend fun queryAlgolia(index: String, body: JSONObject, config: SearchConfig): JSONObject {
+		val headers = Headers.Builder()
+			.add("X-Algolia-Application-Id", config.appId)
+			.add("X-Algolia-API-Key", config.apiKey)
+			.build()
 		var lastError: Exception? = null
-		for (host in ALGOLIA_READ_HOSTS) {
+		for (host in algoliaReadHosts(config.appId)) {
 			try {
 				return webClient.httpPost(
 					"https://$host/1/indexes/$index/query".toHttpUrl(),
@@ -215,6 +233,28 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 			}
 		}
 		throw lastError ?: IllegalStateException("AnimeWitcher catalog is unavailable")
+	}
+
+	private suspend fun searchConfig(forceRefresh: Boolean): SearchConfig {
+		if (!forceRefresh) cachedSearchConfig?.let { return it }
+		return searchConfigMutex.withLock {
+			if (!forceRefresh) cachedSearchConfig?.let { return@withLock it }
+			val resolved = runCatching {
+				val fields = fetchDocument("Settings", "constants").optJSONObject("fields")
+				val search = fields?.firestoreMap("search_settings")
+				val appId = search?.firestoreString("app_id_v3")
+					?: search?.firestoreString("app_id")
+				val apiKey = search?.firestoreString("api_key")
+				require(!appId.isNullOrBlank() && !apiKey.isNullOrBlank()) {
+					"AnimeWitcher public search configuration is empty"
+				}
+				SearchConfig(appId, apiKey)
+			}.getOrElse {
+				cachedSearchConfig ?: SearchConfig(ALGOLIA_APP_ID, ALGOLIA_SEARCH_KEY)
+			}
+			cachedSearchConfig = resolved
+			resolved
+		}
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
@@ -874,6 +914,8 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 
 	private fun decode(value: String): String = URLDecoder.decode(value, "UTF-8")
 
+	private data class SearchConfig(val appId: String, val apiKey: String)
+
 	internal companion object {
 		private const val PAGE_SIZE = 30
 		private const val EPISODES_PAGE_SIZE = 1000
@@ -881,13 +923,14 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 		private const val MAX_FIRESTORE_PAGES = 20
 		private const val ANIME_PATH = "/anime/"
 		private const val EPISODE_PATH = "/episode/"
-		private const val ALGOLIA_APP_ID = "D8LH9I7ZL7"
-		private const val ALGOLIA_SEARCH_KEY = "b56c01ef52540ef334bcdbaa00ded9e4"
-		internal val ALGOLIA_READ_HOSTS = listOf(
-			"$ALGOLIA_APP_ID-dsn.algolia.net",
-			"$ALGOLIA_APP_ID-1.algolianet.com",
-			"$ALGOLIA_APP_ID-2.algolianet.com",
-			"$ALGOLIA_APP_ID-3.algolianet.com",
+		private const val ALGOLIA_APP_ID = "QVHT7NPEJG"
+		private const val ALGOLIA_SEARCH_KEY = "ce13098070fa521b536571bafbcfc083"
+		internal val ALGOLIA_READ_HOSTS = algoliaReadHosts(ALGOLIA_APP_ID)
+		internal fun algoliaReadHosts(appId: String) = listOf(
+			"$appId-dsn.algolia.net",
+			"$appId-1.algolianet.com",
+			"$appId-2.algolianet.com",
+			"$appId-3.algolianet.com",
 		)
 		private const val FIREBASE_API_KEY = "AIzaSyAcbWRwfFNnCpoydDXlEALWnM_TYVcJOMU"
 		private const val FIRESTORE_DOCUMENTS =

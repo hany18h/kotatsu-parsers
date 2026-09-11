@@ -323,9 +323,14 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		referer: String,
 		noCache: Boolean = false,
 	): Document {
-		// The public site sometimes blocks OkHttp's TLS fingerprint while the
-		// same page opens normally in Android WebView. Use the public browser
-		// page first; no private Cenele application API is involved here.
+		// The useful public markup is normally present in the initial response.
+		// Prefer that fast path and reserve WebView for networks that are actually
+		// challenged, otherwise every catalog/chapter open pays a browser startup.
+		val directResult = runCatchingCancellable {
+			webClient.httpGet(url, siteHeaders(referer, noCache)).parseHtml()
+		}
+		directResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
+
 		val webViewResult = runCatchingCancellable {
 			val rawResult = loaderContext.evaluateJs(
 				url,
@@ -340,13 +345,8 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		}
 		webViewResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
 
-		val directResult = runCatchingCancellable {
-			webClient.httpGet(url, siteHeaders(referer, noCache)).parseHtml()
-		}
-		directResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
-
-		webViewResult.exceptionOrNull()?.let { throw it }
 		directResult.exceptionOrNull()?.let { throw it }
+		webViewResult.exceptionOrNull()?.let { throw it }
 		error("Cenele returned a server block page instead of public content")
 	}
 
