@@ -10,6 +10,25 @@ import org.koitharu.kotatsu.parsers.network.UserAgents
 internal class GalaxyNovelsTest {
 
 	@Test
+	fun waitsForUsefulMarkupButAcceptsRealEmptySearchResults() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+		val selector = "${GalaxyNovels.CATALOG_CARD_SELECTOR}, .wor-library-empty"
+		assertEquals(false, parser.isReadableDocument(Jsoup.parse("<main>Loading...</main>"), selector))
+		assertEquals(true, parser.isReadableDocument(Jsoup.parse("<div class='wor-library-empty'>No results</div>"), selector))
+		assertEquals(false, parser.isReadableDocument(Jsoup.parse("<script>window._cf_chl_opt = {};</script>"), selector))
+	}
+
+	@Test
+	fun neverTreatsAProtectionArticleAsChapterText() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+		assertEquals(null, parser.extractChapterContent(Jsoup.parse(
+			"<article><div class='entry-content'>Sorry, you have been blocked</div></article>",
+		)))
+		assertEquals(null, parser.extractChapterContent(Jsoup.parse("<article>Please enable JavaScript</article>")))
+		assertEquals(true, parser.isBlockedDocument(Jsoup.parse("<form id='challenge-form'></form>")))
+	}
+
+	@Test
 	fun resolvesChapterIdFromLegacyProtectedApiUrl() {
 		assertEquals(
 			"71040",

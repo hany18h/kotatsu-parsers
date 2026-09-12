@@ -11,6 +11,34 @@ import org.junit.jupiter.api.Test
 internal class CloudFlareHelperTest {
 
 	@Test
+	fun challengeInsideGenericErrorContainerIsNotAHardBan() {
+		response(403, """
+			<title>Just a moment...</title><div id="cf-error-details">
+			<span data-translate="error">Checking your browser</span>
+			<form id="challenge-form"></form></div>
+		""").use {
+			assertEquals(CloudFlareHelper.PROTECTION_CAPTCHA, CloudFlareHelper.checkResponseForProtection(it))
+		}
+	}
+
+	@Test
+	fun genericCloudflareOutageIsNotABan() {
+		response(503, "<div id='cf-error-details'><span class='cf-error-code'>503</span>Service unavailable</div>").use {
+			assertEquals(CloudFlareHelper.PROTECTION_NOT_DETECTED, CloudFlareHelper.checkResponseForProtection(it))
+		}
+	}
+
+	@Test
+	fun hardBlockRemainsBlockedEvenWithTelemetryScript() {
+		response(403, """
+			<h2 data-translate="blocked_why_headline">Why have I been blocked?</h2>
+			<script src="/cdn-cgi/challenge-platform/telemetry.js"></script>
+		""").use {
+			assertEquals(CloudFlareHelper.PROTECTION_BLOCKED, CloudFlareHelper.checkResponseForProtection(it))
+		}
+	}
+
+	@Test
 	fun detectsCurrentManagedChallenge() {
 		val response = response(
 			code = 403,

@@ -1,6 +1,7 @@
 package org.koitharu.kotatsu.parsers
 
 import okhttp3.CookieJar
+import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
@@ -45,6 +46,10 @@ public abstract class MangaLoaderContext {
 	 * @return execution result as string, may be null
 	 */
 	public abstract suspend fun evaluateJs(baseUrl: String, script: String): String?
+
+	/** Navigate with the parser's headers/identity; older hosts retain the default implementation. */
+	public open suspend fun evaluateJs(baseUrl: String, script: String, headers: Headers): String? =
+		evaluateJs(baseUrl, script)
 
 	/**
 	 * Open [url] in browser for some external action (e.g. captcha solving or non cookie-based authorization)

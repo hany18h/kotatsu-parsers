@@ -21,7 +21,7 @@ public object CloudFlareHelper {
 			return PROTECTION_NOT_DETECTED
 		}
 		val content = try {
-			response.peekBody(Long.MAX_VALUE).use {
+			response.peekBody(512L * 1024L).use {
 				Jsoup.parse(it.byteStream(), Charsets.UTF_8.name(), response.request.url.toString())
 			}
 		} catch (_: IllegalStateException) {
@@ -32,13 +32,12 @@ public object CloudFlareHelper {
 		val html = content.html().lowercase(Locale.ROOT)
 		return when {
 			content.selectFirst(
-				"h2[data-translate=\"blocked_why_headline\"], " +
-					"#cf-error-details, .cf-error-details, [data-translate=\"error\"], " +
-					".cf-error-code",
+				"h2[data-translate=\"blocked_why_headline\"]",
 			) != null ||
 				"sorry, you have been blocked" in bodyText ||
 				"error 1020" in bodyText ||
-				"access denied" in bodyText && response.header("Server").equals("cloudflare", ignoreCase = true) ->
+				("access denied" in title || content.select("h1, h2").any { it.text().equals("Access denied", true) }) &&
+				response.header("Server").equals("cloudflare", ignoreCase = true) ->
 				PROTECTION_BLOCKED
 
 			content.selectFirst(
