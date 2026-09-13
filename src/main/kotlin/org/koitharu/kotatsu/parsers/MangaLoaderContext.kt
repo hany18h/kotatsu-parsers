@@ -51,6 +51,10 @@ public abstract class MangaLoaderContext {
 	public open suspend fun evaluateJs(baseUrl: String, script: String, headers: Headers): String? =
 		evaluateJs(baseUrl, script)
 
+	/** Allow public pages with paginated DOM content to finish within a bounded timeout. */
+	public open suspend fun evaluateJs(baseUrl: String, script: String, headers: Headers, timeoutMillis: Long): String? =
+		evaluateJs(baseUrl, script, headers)
+
 	/**
 	 * Open [url] in browser for some external action (e.g. captcha solving or non cookie-based authorization)
 	 */

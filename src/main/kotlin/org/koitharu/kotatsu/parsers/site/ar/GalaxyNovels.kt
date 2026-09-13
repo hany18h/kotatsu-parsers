@@ -195,15 +195,47 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			?.toAbsoluteUrl(domain)
 		val packedChapters = manifestUrl?.let { url ->
 			// Do not turn a denied manifest/pack into a successful but truncated library.
-			val manifest = webClient.httpGet(url, siteHeaders(mangaUrl)).parseRaw()
+			val manifest = loadPublicJson(url, mangaUrl)
 			val packUrl = checkNotNull(parseManifestPackUrl(manifest)) { "Galaxy chapter manifest is incomplete" }
-			parseCachedChapters(webClient.httpGet(packUrl.toAbsoluteUrl(domain), siteHeaders(mangaUrl)).parseRaw())
+			val metadata = JSONObject(manifest)
+			val packed = parseCachedChapters(loadPublicJson(packUrl.toAbsoluteUrl(domain), mangaUrl))
+			val recent = metadata.optJSONArray("live_tail")?.let {
+				parseCachedChapters(JSONObject().put("chapters", it).toString())
+			}.orEmpty()
+			(packed + recent).distinctBy(MangaChapter::id).also {
+				check(it.isNotEmpty() && it.size >= metadata.optInt("total", 0)) {
+					"Galaxy returned an incomplete chapter pack"
+				}
+			}
 		}.orEmpty()
 		val chapters = packedChapters.ifEmpty { parseHtmlChapters(document) }
 		return chapters
 			.distinctBy(MangaChapter::id)
 			.sortedBy(MangaChapter::number)
 	}
+
+	private suspend fun loadPublicJson(url: String, referer: String): String {
+		val headers = siteHeaders(referer).newBuilder().set("Accept", "application/json").build()
+		val direct = runCatchingCancellable { webClient.httpGet(url, headers).parseRaw() }
+		rethrowPublicPageNetworkError(direct.exceptionOrNull())
+		direct.getOrNull()?.takeIf(::isJsonObject)?.let { return it }
+		// Public chapter packs can be challenged independently of the novel page.
+		// Keep the browser session for these navigations too; do not return a
+		// truncated 30-chapter list when the HTTP stack is rejected.
+		val browser = runCatchingCancellable {
+			loaderContext.evaluateJs(url, """
+				(function() {
+				  var text = document.body ? document.body.innerText.trim() : '';
+				  try { var value = JSON.parse(text); return value && typeof value === 'object' ? text : null; }
+				  catch (e) { return null; }
+				})()
+			""".trimIndent(), headers)?.let(::decodeWebViewString)
+		}
+		browser.getOrNull()?.takeIf(::isJsonObject)?.let { return it }
+		loaderContext.requestBrowserAction(this, referer)
+	}
+
+	private fun isJsonObject(raw: String): Boolean = runCatching { JSONObject(raw) }.isSuccess
 
 	internal fun parseManifestPackUrl(raw: String): String? = runCatching {
 		JSONObject(raw).optString("pack_url").trim().takeIf(String::isNotEmpty)
@@ -262,6 +294,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		val directResult = runCatchingCancellable {
 			webClient.httpGet(url, siteHeaders(referer)).parseHtml()
 		}
+		rethrowPublicPageNetworkError(directResult.exceptionOrNull())
 		directResult.getOrNull()?.takeIf { isReadableDocument(it, readySelector) }?.let { return it }
 
 		// Some networks are still challenged at the HTTP edge. In that case use a
@@ -271,12 +304,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		}
 		webViewResult.getOrNull()?.takeIf { isReadableDocument(it, readySelector) }?.let { return it }
 
-		directResult.exceptionOrNull()?.let { throw it }
-		webViewResult.exceptionOrNull()?.let { throw it }
-		if (listOfNotNull(directResult.getOrNull(), webViewResult.getOrNull()).any(::isBlockedDocument)) {
-			loaderContext.requestBrowserAction(this, url)
-		}
-		error("Galaxy returned no readable document")
+		loaderContext.requestBrowserAction(this, url)
 	}
 
 	internal fun isReadableDocument(document: Document, readySelector: String): Boolean =
@@ -312,6 +340,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			val resolvedChapterUrl = response.request.url.toString()
 			response.parseHtml() to resolvedChapterUrl
 		}
+		rethrowPublicPageNetworkError(directResult.exceptionOrNull())
 		directResult.getOrNull()?.let { (document, resolvedChapterUrl) ->
 			extractChapterContent(document)?.let { content ->
 				return sanitizeChapterContent(content, resolvedChapterUrl)
@@ -326,13 +355,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 				return sanitizeChapterContent(content, requestUrl)
 			}
 		}
-		directResult.exceptionOrNull()?.let { throw it }
-		webViewResult.exceptionOrNull()?.let { throw it }
-		if (directResult.getOrNull()?.first?.let(::isBlockedDocument) == true ||
-			webViewResult.getOrNull()?.let(::isBlockedDocument) == true) {
-			loaderContext.requestBrowserAction(this, requestUrl)
-		}
-		return null
+		loaderContext.requestBrowserAction(this, requestUrl)
 	}
 
 	private suspend fun loadChapterDocumentInWebView(chapterUrl: String): Document? {
@@ -341,7 +364,8 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			"""
 			(function() {
 			  var content = document.querySelector('$CHAPTER_CONTENT_SELECTOR');
-			  if (document.querySelector('#challenge-form, #cf-error-details') || window._cf_chl_opt) return document.documentElement.outerHTML;
+			  if (document.querySelector('#challenge-form, #challenge-running') || window._cf_chl_opt) return null;
+			  if (document.querySelector('#cf-error-details')) return document.documentElement.outerHTML;
 			  return content && (content.textContent.trim() || content.querySelector('img')) ? content.outerHTML : null;
 			})()
 			""".trimIndent(),
@@ -357,7 +381,8 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			"""
 			(function() {
 			  if (document.readyState === 'loading') return null;
-			  if (!document.querySelector('$readySelector, #challenge-form, #cf-error-details') && !window._cf_chl_opt) return null;
+			  if (document.querySelector('#challenge-form, #challenge-running') || window._cf_chl_opt) return null;
+			  if (!document.querySelector('$readySelector, #cf-error-details')) return null;
 			  var root = document.documentElement;
 			  return root ? root.outerHTML : null;
 			})()

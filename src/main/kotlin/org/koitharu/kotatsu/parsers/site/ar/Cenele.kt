@@ -1,7 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
 import okhttp3.Headers
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -42,7 +41,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
-		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = false))
 	}
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
@@ -101,7 +100,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val pageUrl = manga.url.substringBefore('#').toAbsoluteUrl(domain)
-		val doc = loadPublicDocument(pageUrl, "https://$domain/cont/")
+		val doc = loadPublicDocument(pageUrl, "https://$domain/cont/", noCache = true)
 		val state = parseState(
 			doc.selectFirst(".nhv-novel-status, .post-status .summary-content")?.text().orEmpty(),
 		)
@@ -133,103 +132,32 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		)
 	}
 
-	private suspend fun loadDescription(doc: Document): String? {
-		val fallback = doc.selectFirst(".nhv-novel-synopsis, div.summary__content, .manga-excerpt .excerpt-content")
+	private fun loadDescription(doc: Document): String? =
+		doc.selectFirst(".nhv-novel-synopsis, div.summary__content, .manga-excerpt .excerpt-content")
 			?.html()?.trim()?.takeIf(String::isNotEmpty)
-		val readMore = doc.selectFirst("#nhv-synopsis-readmore") ?: return fallback
-		val postId = readMore.attr("data-post-id").trim().takeIf(String::isNotEmpty) ?: return fallback
-		val nonce = readMore.attr("data-nonce").trim().takeIf(String::isNotEmpty) ?: return fallback
-
-		return runCatching {
-			webClient.httpPost(
-				"https://$domain/wp-admin/admin-ajax.php",
-				mapOf(
-					"action" to "nhv_get_manga_synopsis",
-					"nonce" to nonce,
-					"post_id" to postId,
-				),
-			).parseJson()
-				.optJSONObject("data")
-				?.optString("html")
-				?.trim()
-				?.takeIf(String::isNotEmpty)
-		}.getOrNull() ?: fallback
-	}
 
 	private suspend fun loadChapters(mangaUrl: String, doc: Document): List<MangaChapter> {
-		val scripts = doc.select("script").joinToString("\n") { it.data() + it.html() }
-		val mangaId = CHAPTERS_POST_ID.find(scripts)?.groupValues?.getOrNull(1)
-			?.takeIf(String::isNotBlank)
-			?: doc.selectFirst("[data-manga-id]")?.attr("data-manga-id")?.takeIf(String::isNotBlank)
-			?: doc.selectFirst("#manga-chapters-holder")?.attr("data-id")?.takeIf(String::isNotBlank)
-		val nonce = CHAPTERS_NONCE.find(scripts)?.groupValues?.getOrNull(1)?.takeIf(String::isNotBlank)
-		if (mangaId == null || nonce == null) return loadChaptersLegacy(mangaUrl, doc)
-
-		val items = org.jsoup.select.Elements()
-		var page = 1
-		do {
-			val response = webClient.httpPost(
-				"https://$domain/wp-admin/admin-ajax.php".toHttpUrl(),
-				mapOf(
-					"action" to "nhv_manga_single_chapters_page",
-					"nonce" to nonce,
-					"manga_id" to mangaId,
-					"volume" to "-1",
-					"page" to page.toString(),
-					"per_page" to CHAPTERS_PER_PAGE.toString(),
-					"order" to "desc",
-				),
-				Headers.Builder()
-					.add("Accept", "application/json")
-					.add("Referer", mangaUrl)
-					.add("X-Requested-With", "XMLHttpRequest")
-					.add("User-Agent", config[userAgentKey])
-					.build(),
-			).parseJson()
-			if (!response.optBoolean("success")) break
-			val fragment = Jsoup.parseBodyFragment(response.optString("html"), mangaUrl)
-			val pageItems = fragment.select("li.wp-manga-chapter[data-chapter-id]")
-			if (pageItems.isEmpty()) break
-			items.addAll(pageItems)
-			page++
-			val hasMore = response.optBoolean("has_more")
-		} while (hasMore && page <= MAX_CHAPTER_PAGES)
-
-		return if (items.isEmpty()) loadChaptersLegacy(mangaUrl, doc) else parseChapterElements(items, mangaId)
-	}
-
-	private suspend fun loadChaptersLegacy(mangaUrl: String, doc: Document): List<MangaChapter> {
-		val mangaId = doc.selectFirst("[data-manga-id]")?.attr("data-manga-id")
-			?.takeIf(String::isNotBlank)
-			?: doc.selectFirst("#manga-chapters-holder")?.attr("data-id")?.takeIf(String::isNotBlank)
-
-		// أولاً جرب inline chapters
+		val mangaId = doc.selectFirst("[data-manga-id], [data-post]")?.let {
+			it.attr("data-manga-id").ifEmpty { it.attr("data-post") }
+		}?.takeIf(String::isNotBlank)
+		// Older public pages contain the entire list. Modern pages expose a
+		// volumes accordion. Let the site's own buttons load it in the browser;
+		// never call Cenele's REST/AJAX endpoints from the parser.
 		val inline = doc.select("ul.main li.wp-manga-chapter")
 		if (inline.isNotEmpty()) return parseChapterElements(inline, mangaId)
-
-		// ثم جرب ajax/chapters/ (الطريقة الأحدث في Madara)
-		val ajaxDoc = runCatching {
-			val ajaxUrl = mangaUrl.trimEnd('/') + "/ajax/chapters/"
-			webClient.httpPost(ajaxUrl, emptyMap()).parseHtml()
-		}.getOrNull()
-
-		if (ajaxDoc != null) {
-			val items = ajaxDoc.select("ul.main li.wp-manga-chapter")
-			if (items.isNotEmpty()) {
-				val ajaxMangaId = ajaxDoc.selectFirst("[data-manga-id]")?.attr("data-manga-id")
-					?.takeIf(String::isNotBlank)
-					?: mangaId
-				return parseChapterElements(items, ajaxMangaId)
-			}
+		val raw = loaderContext.evaluateJs(
+			mangaUrl,
+			CenelePublicChapters.SCRIPT,
+			siteHeaders(mangaUrl, noCache = true),
+			timeoutMillis = 180_000L,
+		)?.let(::decodeWebViewString)
+		val result = raw?.let(::JSONObject)
+		if (result?.optBoolean("complete") != true) {
+			loaderContext.requestBrowserAction(this, mangaUrl)
 		}
-
-		// أخيراً جرب admin-ajax.php
-		if (mangaId == null) return emptyList()
-		val adminDoc = webClient.httpPost(
-			"https://$domain/wp-admin/admin-ajax.php",
-			mapOf("action" to "manga_get_chapters", "manga" to mangaId),
-		).parseHtml()
-		return parseChapterElements(adminDoc.select("ul.main li.wp-manga-chapter"), mangaId)
+		val chaptersDoc = Jsoup.parse(result.getString("html"), mangaUrl)
+		return parseChapterElements(chaptersDoc.select("li.wp-manga-chapter"), mangaId)
+			.distinctBy(MangaChapter::id).sortedBy(MangaChapter::number)
 	}
 
 	private fun parseChapterElements(
@@ -289,8 +217,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		// response, so bypass cached/304 bodies and locate the stable chapter marker.
 		val doc = loadPublicDocument(cleanUrl, "https://$domain/", noCache = true)
 		val content = findDirectChapterContent(doc, locator)
-			?: locator?.let { loadChapterViaAjax(doc, cleanUrl, it) }
-		?: return null
+			?: return null
 
 		sanitizeChapterContent(content)
 
@@ -329,6 +256,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		val directResult = runCatchingCancellable {
 			webClient.httpGet(url, siteHeaders(referer, noCache)).parseHtml()
 		}
+		rethrowPublicPageNetworkError(directResult.exceptionOrNull())
 		directResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
 
 		val webViewResult = runCatchingCancellable {
@@ -337,17 +265,18 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 				"""
 				(function() {
 				  if (document.readyState === 'loading') return null;
-				  return document.documentElement ? document.documentElement.outerHTML : null;
+				  if (document.querySelector('#challenge-form, #challenge-running') || window._cf_chl_opt) return null;
+				  if (!document.querySelector('article.nhv-library-card, .c-tabs-item__content, h1.nhv-novel-title, .post-title h1, .reading-content, .nhv-library-empty, .no-results, #cf-error-details')) return null;
+				  return document.documentElement.outerHTML;
 				})()
 				""".trimIndent(),
+				headers = siteHeaders(referer, noCache),
 			) ?: return@runCatchingCancellable null
 			decodeWebViewString(rawResult)?.let { Jsoup.parse(it, url) }
 		}
 		webViewResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
 
-		directResult.exceptionOrNull()?.let { throw it }
-		webViewResult.exceptionOrNull()?.let { throw it }
-		error("Cenele returned a server block page instead of public content")
+		loaderContext.requestBrowserAction(this, url)
 	}
 
 	private fun siteHeaders(referer: String, noCache: Boolean = false): Headers = Headers.Builder()
@@ -364,34 +293,6 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		}
 		.build()
 
-	private suspend fun loadChapterViaAjax(
-		doc: Document,
-		referer: String,
-		locator: CeneleChapterLocator,
-	): Element? {
-		val scripts = doc.select("script").joinToString("\n") { it.data() }
-		val nonce = LOAD_NONCE.find(scripts)?.groupValues?.getOrNull(1)
-			?.takeIf(String::isNotBlank)
-			?: return null
-		return runCatching {
-			webClient.httpPost(
-				"https://$domain/wp-admin/admin-ajax.php".toHttpUrl(),
-				mapOf(
-					"action" to "load_chapter",
-					"manga_id" to locator.mangaId,
-					"chapter_id" to locator.chapterId,
-					"nonce" to nonce,
-				),
-				Headers.Builder()
-					.add("Accept", "text/html, */*;q=0.8")
-					.add("Referer", referer)
-					.add("X-Requested-With", "XMLHttpRequest")
-					.add("User-Agent", config[userAgentKey])
-					.build(),
-			).parseHtml().selectFirst(".text-left")
-		}.getOrNull()
-	}
-
 	internal companion object {
 
 		internal fun decodeWebViewString(rawResult: String): String? = runCatching {
@@ -400,19 +301,16 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 
 		internal fun isBlockedDocument(document: Document): Boolean {
 			val text = (document.title() + " " + document.text()).lowercase(Locale.ROOT)
-			return BLOCK_PAGE_MARKERS.any(text::contains)
+			return document.selectFirst("#challenge-form, #challenge-running, script[src*='/cdn-cgi/challenge-platform/']") != null ||
+				document.select("script").any { "window._cf_chl_opt" in it.data() } ||
+				BLOCK_PAGE_MARKERS.any(text::contains)
 		}
 
 		private val ZERO_WIDTH_MARKS = Regex("[\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\uFEFF]")
-		private val LOAD_NONCE = Regex("""["']load_nonce["']\s*:\s*["']([^"']+)""")
-		private val CHAPTERS_POST_ID = Regex("""["']postId["']\s*:\s*["']?(\d+)""")
-		private val CHAPTERS_NONCE = Regex("""["']chaptersNonce["']\s*:\s*["']([^"']+)""")
 		private val HIDDEN_CSS_CLASS = Regex(
 			"""\.([A-Za-z][\w-]*)\s*\{[^{}]*display\s*:\s*none(?:\s*!important)?[^{}]*\}""",
 			RegexOption.IGNORE_CASE,
 		)
-		private const val CHAPTERS_PER_PAGE = 100
-		private const val MAX_CHAPTER_PAGES = 50
 		private const val HTML_LIBRARY_PAGE_SIZE = 10
 		private val CENELE_GENRES = listOf(
 			"أكشن", "استراتجي", "انتقام", "بالغ", "بطل شرير", "بناء مملكة", "بوليسي",
