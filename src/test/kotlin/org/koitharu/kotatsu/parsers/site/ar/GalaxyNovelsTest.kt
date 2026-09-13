@@ -6,8 +6,19 @@ import org.jsoup.Jsoup
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
 import org.koitharu.kotatsu.parsers.network.UserAgents
+import org.koitharu.kotatsu.parsers.model.MangaListFilter
+import org.koitharu.kotatsu.parsers.model.SortOrder
 
 internal class GalaxyNovelsTest {
+
+	@Test
+	fun followsCurrentSitePaginationInsteadOfRepeatingFirstPage() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+		assertEquals("https://galaxynovels.com/recent/?recent_page=2", parser.getListPageUrl(2, SortOrder.UPDATED, MangaListFilter()))
+		assertEquals("https://galaxynovels.com/library/?sort=name&library_page=2", parser.getListPageUrl(2, SortOrder.ALPHABETICAL, MangaListFilter()))
+		assertEquals("https://galaxynovels.com/novels/page/2/?sort=popular&period=all", parser.getListPageUrl(2, SortOrder.POPULARITY, MangaListFilter()))
+		assertEquals("https://galaxynovels.com/library/?library_page=2&q=test&sort=", parser.getListPageUrl(2, SortOrder.UPDATED, MangaListFilter(query = "test")))
+	}
 
 	@Test
 	fun waitsForUsefulMarkupButAcceptsRealEmptySearchResults() {

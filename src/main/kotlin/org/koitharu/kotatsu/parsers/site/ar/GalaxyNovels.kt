@@ -86,18 +86,24 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		order: SortOrder,
 		filter: MangaListFilter,
 	): List<Manga> {
+		val url = getListPageUrl(page, order, filter)
+		val document = loadPublicDocument(url, "https://$domain/", "$CATALOG_CARD_SELECTOR, .wor-library-empty")
+		return parseNovelList(document)
+	}
+
+	internal fun getListPageUrl(page: Int, order: SortOrder, filter: MangaListFilter): String {
 		val query = filter.query?.trim().orEmpty()
 		val url = if (query.isEmpty() && filter.tags.isEmpty() && filter.states.isEmpty()) {
 			when (order) {
-				SortOrder.UPDATED -> "https://$domain/recent/?page=$page"
-				SortOrder.ALPHABETICAL -> "https://$domain/library/?sort=name&page=$page"
-				else -> "https://$domain/novels/?sort=popular&period=all&page=$page"
+				SortOrder.UPDATED -> "https://$domain/recent/?recent_page=$page"
+				SortOrder.ALPHABETICAL -> "https://$domain/library/?sort=name&library_page=$page"
+				else -> "https://$domain/novels/${if (page > 1) "page/$page/" else ""}?sort=popular&period=all"
 			}
 		} else {
 			buildString {
 				append("https://")
 				append(domain)
-				append("/library/?page=")
+				append("/library/?library_page=")
 				append(page)
 				if (query.isNotEmpty()) {
 					append("&q=")
@@ -115,8 +121,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 				append(if (order == SortOrder.ALPHABETICAL) "name" else "")
 			}
 		}
-		val document = loadPublicDocument(url, "https://$domain/", "$CATALOG_CARD_SELECTOR, .wor-library-empty")
-		return parseNovelList(document)
+		return url
 	}
 
 	internal fun parseNovelList(document: Document): List<Manga> =
