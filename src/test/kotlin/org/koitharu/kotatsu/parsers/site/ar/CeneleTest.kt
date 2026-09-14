@@ -218,4 +218,67 @@ internal class CeneleTest {
 		assertTrue(content.text().contains("الفقرة الحقيقية الثانية"))
 		assertFalse(content.text().contains("نص طُعم متغير"))
 	}
+
+	@Test
+	fun removesRepeatedOffscreenBaitWithRandomClassesAndText() {
+		// Current public pages position these figures offscreen instead of using display:none.
+		val content = Jsoup.parseBodyFragment(
+			"""
+			<style>.reading-content .random{position:fixed!important;inset:auto auto -200vh -200vw!important;width:1px!important;height:1px!important;overflow:hidden!important;}</style>
+			<p>الفقرة الأولى.</p>
+			<figure class="random" inert data-nosnippet="true"><p>رسالة متغيرة 45fba08117</p><i></i></figure>
+			<p>الفقرة الثانية.</p>
+			<section class="other-random" inert data-nosnippet="true"><p>رسالة أخرى cdc5e866c6</p></section>
+			<p>الفقرة الثالثة.</p>
+			""".trimIndent(),
+		).body()
+
+		Cenele.sanitizeChapterContent(content)
+
+		assertEquals(listOf("الفقرة الأولى.", "الفقرة الثانية.", "الفقرة الثالثة."), content.select("p").eachText())
+		assertTrue(content.select("[inert][data-nosnippet]").isEmpty())
+	}
+
+	@Test
+	fun removesReportedWarningWithoutStructuralMarkers() {
+		val warning = "توقف الصدى للحظة واحدة. هذا التطبيق يسرق من موقع وتطبيق فضاء الروايات 45fba08117 " +
+			"اقرأ آلاف الفصول لأشهر الروايات على موقع وتطبيق فضاء الروايات 45fba08117"
+		val content = Jsoup.parseBodyFragment("<p>قبل الرسالة.</p><p>$warning</p><p>بعد الرسالة.</p><p>$warning</p>").body()
+
+		Cenele.sanitizeChapterContent(content)
+
+		assertEquals(listOf("قبل الرسالة.", "بعد الرسالة."), content.select("p").eachText())
+	}
+
+	@Test
+	fun removesDecoratedInlineWarningWhileKeepingSurroundingText() {
+		val warning = "هـٰـذَا اﻟـتـطـبـيـق يـسـرـق مِـن مـوـقـع وـتـطـبـيـق فــضـاـء اﻟـرـوـاـيـاـت"
+		val content = Jsoup.parseBodyFragment(
+			"<p>بداية الفقرة. <span><b>${warning.replace(" ", "&nbsp;\u2063")}</b></span> <em>نهاية الفقرة.</em></p>",
+		).body()
+
+		Cenele.sanitizeChapterContent(content)
+
+		assertEquals("بداية الفقرة. نهاية الفقرة.", content.text())
+		assertEquals("نهاية الفقرة.", content.selectFirst("em")?.text())
+	}
+
+	@Test
+	fun keepsOrdinaryFiguresSourceMentionsAndEitherAttributeAlone() {
+		val content = Jsoup.parseBodyFragment(
+			"""
+			<p>توقف الصدى للحظة واحدة.</p>
+			<p>ترجمة فضاء الروايات، القس المجنون.</p>
+			<figure><img src="https://cenele.com/illustration.jpg"><figcaption>رسم توضيحي.</figcaption></figure>
+			<p inert>نص حقيقي غير تفاعلي.</p>
+			<p data-nosnippet="true">نص حقيقي مستبعد من نتائج البحث.</p>
+			""".trimIndent(),
+		).body()
+		val expectedText = content.text()
+
+		Cenele.sanitizeChapterContent(content)
+
+		assertEquals(expectedText, content.text())
+		assertEquals("https://cenele.com/illustration.jpg", content.selectFirst("img")?.attr("src"))
+	}
 }

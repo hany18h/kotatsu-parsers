@@ -12,6 +12,7 @@ import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.util.*
+import java.text.Normalizer
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -307,6 +308,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		}
 
 		private val ZERO_WIDTH_MARKS = Regex("[\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\uFEFF]")
+		private val ARABIC_DECORATION = Regex("[\\u0640\\u0610-\\u061A\\u064B-\\u065F\\u0670\\u06D6-\\u06ED]")
 		private val HIDDEN_CSS_CLASS = Regex(
 			"""\.([A-Za-z][\w-]*)\s*\{[^{}]*display\s*:\s*none(?:\s*!important)?[^{}]*\}""",
 			RegexOption.IGNORE_CASE,
@@ -351,6 +353,9 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		}
 
 		internal fun sanitizeChapterContent(content: Element): Element {
+			// Public reader bait is now positioned offscreen, not display:none.
+			// Both attributes identify its wrapper even when tags, classes and text change.
+			content.select("[inert][data-nosnippet]").remove()
 			val hiddenClasses = content.select("style").flatMap { style ->
 				HIDDEN_CSS_CLASS.findAll(style.data() + style.html()).map { it.groupValues[1] }.toList()
 			}.distinct()
@@ -383,13 +388,10 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 					"[id^=ezoic], [id^=pf-], [id^=bg-ssp]",
 			).remove()
 
-			// Use ownText first so a future unrecognised hidden child cannot cause a
-			// real paragraph to be deleted together with the watermark.
-			content.select("p, span").forEach { element ->
-				if (
-					isAntiCopyText(element.ownText()) ||
-					(element.children().isEmpty() && isAntiCopyText(element.text()))
-				) {
+			// Work from the innermost span outwards so formatted inline bait is
+			// removed before checking the real paragraph that contains it.
+			content.select("p, span").asReversed().forEach { element ->
+				if (isAntiCopyText(element.text())) {
 					element.remove()
 				}
 			}
@@ -403,7 +405,11 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		}
 
 		internal fun isAntiCopyText(value: String): Boolean {
-			val normalized = ZERO_WIDTH_MARKS.replace(value, "")
+			// Normalize Arabic presentation forms, tatweel, diacritics and invisible
+			// separators only for matching; never rewrite the actual chapter text.
+			val normalized = Normalizer.normalize(value, Normalizer.Form.NFKC)
+				.let { ZERO_WIDTH_MARKS.replace(it, "") }
+				.let { ARABIC_DECORATION.replace(it, "") }
 				.replace(Regex("\\s+"), " ")
 				.trim()
 				.lowercase(Locale.ROOT)
@@ -411,6 +417,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 			return "نص تمويهي" in normalized ||
 				"هذا تنبيه" in normalized ||
 				"تطبيق سارق" in normalized ||
+				"هذا التطبيق يسرق" in normalized ||
 				"المصدر مسروق" in normalized
 		}
 
