@@ -5,8 +5,17 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
 
 internal class CeneleTest {
+
+	@Test
+	fun usesReaderAcceptedMobileUserAgent() {
+		val parser = Cenele(MangaLoaderContextMock)
+
+		assertEquals(Cenele.CENELE_MOBILE_USER_AGENT, parser.getRequestHeaders()["User-Agent"])
+		assertFalse(parser.getRequestHeaders()["User-Agent"].orEmpty().contains("Chrome/114"))
+	}
 
 	@Test
 	fun decodesPublicPageHtmlReturnedByWebView() {
@@ -217,6 +226,27 @@ internal class CeneleTest {
 		assertTrue(content.text().contains("الفقرة الحقيقية الأولى"))
 		assertTrue(content.text().contains("الفقرة الحقيقية الثانية"))
 		assertFalse(content.text().contains("نص طُعم متغير"))
+	}
+
+	@Test
+	fun acceptsCompleteChapterWithCloudflareJsdFooter() {
+		val document = Jsoup.parse(
+			"""
+			<div class="reading-content current"><p>نص الفصل الحقيقي</p></div>
+			<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>
+			""".trimIndent(),
+		)
+
+		assertFalse(Cenele.isBlockedDocument(document))
+	}
+
+	@Test
+	fun rejectsCloudflareChallengeScriptWithoutPublicContent() {
+		val document = Jsoup.parse(
+			"""<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script>""",
+		)
+
+		assertTrue(Cenele.isBlockedDocument(document))
 	}
 
 	@Test

@@ -10,7 +10,6 @@ import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
-import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.util.*
 import java.text.Normalizer
 import java.text.SimpleDateFormat
@@ -25,7 +24,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 	}
 
 	override val configKeyDomain = ConfigKey.Domain("cenele.com")
-	override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_MOBILE)
+	override val userAgentKey = ConfigKey.UserAgent(CENELE_MOBILE_USER_AGENT)
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,
@@ -295,6 +294,9 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		.build()
 
 	internal companion object {
+		internal const val CENELE_MOBILE_USER_AGENT =
+			"Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) " +
+				"Chrome/131.0.0.0 Mobile Safari/537.36"
 
 		internal fun decodeWebViewString(rawResult: String): String? = runCatching {
 			JSONObject("{\"value\":$rawResult}").optString("value").trim().takeIf(String::isNotEmpty)
@@ -302,9 +304,21 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 
 		internal fun isBlockedDocument(document: Document): Boolean {
 			val text = (document.title() + " " + document.text()).lowercase(Locale.ROOT)
-			return document.selectFirst("#challenge-form, #challenge-running, script[src*='/cdn-cgi/challenge-platform/']") != null ||
+			if (document.selectFirst("#challenge-form, #challenge-running") != null ||
 				document.select("script").any { "window._cf_chl_opt" in it.data() } ||
 				BLOCK_PAGE_MARKERS.any(text::contains)
+			) {
+				return true
+			}
+			// Cloudflare may append its lightweight JSD script to a complete public
+			// page. Treat it as a challenge only when none of Cenele's useful public
+			// markup is present, otherwise a valid chapter is sent to browser action.
+			val hasPublicMarkup = document.selectFirst(
+				"article.nhv-library-card, .c-tabs-item__content, h1.nhv-novel-title, " +
+					".post-title h1, .reading-content, .nhv-library-empty, .no-results",
+			) != null
+			return !hasPublicMarkup &&
+				document.selectFirst("script[src*='/cdn-cgi/challenge-platform/']") != null
 		}
 
 		private val ZERO_WIDTH_MARKS = Regex("[\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\uFEFF]")
