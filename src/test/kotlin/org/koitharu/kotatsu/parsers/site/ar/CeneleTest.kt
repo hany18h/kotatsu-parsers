@@ -18,6 +18,17 @@ internal class CeneleTest {
 	}
 
 	@Test
+	fun upgradesPreviouslySavedLegacyUserAgent() {
+		val legacy =
+			"Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) " +
+				"Chrome/114.0.5735.196 Mobile Safari/537.36"
+		val custom = "Custom browser user agent"
+
+		assertEquals(Cenele.CENELE_MOBILE_USER_AGENT, Cenele.upgradeReaderUserAgent(legacy))
+		assertEquals(custom, Cenele.upgradeReaderUserAgent(custom))
+	}
+
+	@Test
 	fun decodesPublicPageHtmlReturnedByWebView() {
 		val encoded = "\"\\u003Chtml\\u003E\\u003Cbody\\u003Echapter\\u003C/body\\u003E\\u003C/html\\u003E\""
 

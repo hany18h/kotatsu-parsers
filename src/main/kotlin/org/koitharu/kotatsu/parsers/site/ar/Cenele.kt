@@ -44,6 +44,10 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		keys.add(ConfigKey.InterceptCloudflare(defaultValue = false))
 	}
 
+	override fun getRequestHeaders(): Headers = Headers.Builder()
+		.add("User-Agent", readerUserAgent())
+		.build()
+
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
 		availableTags = CENELE_GENRES.mapTo(LinkedHashSet()) { title ->
 			MangaTag(key = title, title = title, source = source)
@@ -237,7 +241,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 						url = url,
 						headers = mapOf(
 							"Referer" to cleanUrl,
-							"User-Agent" to config[userAgentKey],
+							"User-Agent" to readerUserAgent(),
 						),
 					)
 				}
@@ -284,7 +288,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		.add("Accept-Language", "ar,en-US;q=0.7,en;q=0.3")
 		.add("Referer", referer)
 		.add("Upgrade-Insecure-Requests", "1")
-		.add("User-Agent", config[userAgentKey])
+		.add("User-Agent", readerUserAgent())
 		.apply {
 			if (noCache) {
 				add("Cache-Control", "no-cache, no-store")
@@ -293,10 +297,18 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		}
 		.build()
 
+	private fun readerUserAgent(): String = upgradeReaderUserAgent(config[userAgentKey])
+
 	internal companion object {
 		internal const val CENELE_MOBILE_USER_AGENT =
 			"Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) " +
 				"Chrome/131.0.0.0 Mobile Safari/537.36"
+		private const val LEGACY_CENELE_MOBILE_USER_AGENT =
+			"Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) " +
+				"Chrome/114.0.5735.196 Mobile Safari/537.36"
+
+		internal fun upgradeReaderUserAgent(value: String): String =
+			if (value == LEGACY_CENELE_MOBILE_USER_AGENT) CENELE_MOBILE_USER_AGENT else value
 
 		internal fun decodeWebViewString(rawResult: String): String? = runCatching {
 			JSONObject("{\"value\":$rawResult}").optString("value").trim().takeIf(String::isNotEmpty)
