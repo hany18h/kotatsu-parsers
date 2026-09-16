@@ -20,6 +20,7 @@ internal class DilarTubeTest {
 	fun retriesEnrollmentForAuthenticationResponses() {
 		assertTrue(DilarTube.requiresClientReenrollment(403))
 		assertTrue(DilarTube.requiresClientReenrollment(428))
+		assertFalse(DilarTube.requiresClientReenrollment(429))
 		assertFalse(DilarTube.requiresClientReenrollment(404))
 	}
 

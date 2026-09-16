@@ -1,5 +1,8 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import okhttp3.Cookie
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okio.ByteString.Companion.decodeBase64
@@ -523,7 +526,12 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         ),
     )
 
-    private suspend fun readClientToken(): String? {
+    private data class ClientCredential(
+        val token: String,
+        val expiresAtSeconds: Long,
+    )
+
+    private suspend fun readBrowserCredential(): ClientCredential? {
         val result = loaderContext.evaluateJs(
             "https://$domain/",
             """
@@ -533,21 +541,29 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
                 if (!raw) return '__missing__';
                 var value = JSON.parse(raw);
                 if (!value || typeof value.token !== 'string') return '__missing__';
-                // Match Dilar's own renewal window: credentials with less than
-                // 12 hours remaining are deliberately renewed by the website.
-                if (typeof value.expiresAt === 'number' && value.expiresAt <= Math.floor(Date.now() / 1000) + 43200) {
+                // Keep using a valid credential until shortly before expiry.
+                // Renewing it hours early creates needless enroll requests.
+                if (typeof value.expiresAt === 'number' && value.expiresAt <= Math.floor(Date.now() / 1000) + 300) {
                   return '__missing__';
                 }
-                return value.token;
+                return value.token + '|' + (typeof value.expiresAt === 'number' ? value.expiresAt : 0);
               } catch (e) {
                 return '__missing__';
               }
             })()
             """.trimIndent(),
         )?.trim()?.takeIf { it != "null" } ?: return null
-        return runCatching { JSONObject("{\"value\":$result}").optString("value").nullIfEmpty() }
+        val encoded = runCatching { JSONObject("{\"value\":$result}").optString("value").nullIfEmpty() }
             .getOrNull()
             ?.takeUnless { it == "__missing__" }
+            ?: return null
+        val separator = encoded.lastIndexOf('|')
+        val token = encoded.substring(0, separator.takeIf { it > 0 } ?: encoded.length).nullIfEmpty()
+            ?: return null
+        val expiresAt = encoded.substringAfterLast('|', "0").toLongOrNull()
+            ?.takeIf { it > 0L }
+            ?: defaultCredentialExpirySeconds()
+        return ClientCredential(token, expiresAt).takeIf(::isCredentialUsable)
     }
 
     private suspend fun requestFreePassRaw(releaseId: String, clientToken: String): String {
@@ -594,14 +610,23 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         }
     }
 
-    private suspend fun getApiJson(url: String): JSONObject = withDilarTokenRetry { clientToken ->
-        webClient.httpGet(url, apiHeaders(clientToken)).parseJson()
+    private suspend fun getApiJson(url: String): JSONObject = try {
+        webClient.httpGet(url, apiHeaders()).parseJson()
+    } catch (error: HttpStatusException) {
+        if (!requiresClientReenrollment(error.statusCode)) throw error
+        withDilarTokenRetry { clientToken ->
+            webClient.httpGet(url, apiHeaders(clientToken)).parseJson()
+        }
     }
 
-    private suspend fun postApiJsonArray(url: String, body: JSONObject): JSONArray =
+    private suspend fun postApiJsonArray(url: String, body: JSONObject): JSONArray = try {
+        webClient.httpPost(url.toHttpUrl(), body, apiHeaders()).parseJsonArray()
+    } catch (error: HttpStatusException) {
+        if (!requiresClientReenrollment(error.statusCode)) throw error
         withDilarTokenRetry { clientToken ->
             webClient.httpPost(url.toHttpUrl(), body, apiHeaders(clientToken)).parseJsonArray()
         }
+    }
 
     /**
      * Dilar's public web client enrolls itself through this endpoint. An empty
@@ -609,19 +634,37 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
      * for the free-chapter unlock endpoint and avoids sending the user into the
      * website instead of the native reader.
      */
-    private suspend fun enrollClient(): String {
+    private suspend fun enrollClient(): ClientCredential {
         val response = webClient.httpPost(
             "https://$domain/api/enroll".toHttpUrl(),
             JSONObject(),
             apiHeaders(),
         ).parseJson()
-        return response.optString("token").nullIfEmpty()
+        val token = response.optString("token").nullIfEmpty()
             ?: throw ContentUnavailableException("Dilar client enrollment did not return a token")
+        val expiresAt = response.optLong("expires_at")
+            .takeIf { it > 0L }
+            ?: defaultCredentialExpirySeconds()
+        return ClientCredential(token, expiresAt)
     }
 
     private suspend fun getClientToken(): String {
-        cachedClientToken?.let { return it }
-        return (readClientToken() ?: enrollClient()).also { cachedClientToken = it }
+        cachedClientCredential?.takeIf(::isCredentialUsable)?.let { return it.token }
+        readStoredCredential()?.let {
+            cachedClientCredential = it
+            return it.token
+        }
+        return enrollmentMutex.withLock {
+            cachedClientCredential?.takeIf(::isCredentialUsable)?.let { return@withLock it.token }
+            readStoredCredential()?.let {
+                cachedClientCredential = it
+                return@withLock it.token
+            }
+            val credential = readBrowserCredential() ?: enrollClient()
+            saveStoredCredential(credential)
+            cachedClientCredential = credential
+            credential.token
+        }
     }
 
     private suspend fun <T> withDilarTokenRetry(block: suspend (String) -> T): T {
@@ -630,9 +673,60 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
             block(token)
         } catch (error: HttpStatusException) {
             if (!requiresClientReenrollment(error.statusCode)) throw error
-            cachedClientToken = null
+            clearStoredCredential(token)
             block(getClientToken())
         }
+    }
+
+    private fun isCredentialUsable(credential: ClientCredential): Boolean =
+        credential.expiresAtSeconds > currentEpochSeconds() + CREDENTIAL_RENEWAL_MARGIN_SECONDS
+
+    private fun readStoredCredential(): ClientCredential? {
+        val credentialUrl = "https://$domain/".toHttpUrl()
+        val cookie = loaderContext.cookieJar.loadForRequest(credentialUrl)
+            .firstOrNull { it.name == CLIENT_TOKEN_COOKIE }
+            ?: return null
+        return ClientCredential(cookie.value, cookie.expiresAt / 1000L).takeIf(::isCredentialUsable)
+    }
+
+    private fun saveStoredCredential(credential: ClientCredential) {
+        val credentialUrl = "https://$domain/".toHttpUrl()
+        loaderContext.cookieJar.saveFromResponse(
+            credentialUrl,
+            listOf(
+                Cookie.Builder()
+                    .name(CLIENT_TOKEN_COOKIE)
+                    .value(credential.token)
+                    .hostOnlyDomain(credentialUrl.host)
+                    .path("/")
+                    .expiresAt(credential.expiresAtSeconds * 1000L)
+                    .secure()
+                    .httpOnly()
+                    .build(),
+            ),
+        )
+    }
+
+    private fun clearStoredCredential(rejectedToken: String) {
+        cachedClientCredential = null
+        val credentialUrl = "https://$domain/".toHttpUrl()
+        val stored = loaderContext.cookieJar.loadForRequest(credentialUrl)
+            .firstOrNull { it.name == CLIENT_TOKEN_COOKIE }
+        if (stored != null && stored.value != rejectedToken) return
+        loaderContext.cookieJar.saveFromResponse(
+            credentialUrl,
+            listOf(
+                Cookie.Builder()
+                    .name(CLIENT_TOKEN_COOKIE)
+                    .value("")
+                    .hostOnlyDomain(credentialUrl.host)
+                    .path("/")
+                    .expiresAt(0L)
+                    .secure()
+                    .httpOnly()
+                    .build(),
+            ),
+        )
     }
 
     private fun apiHeaders(clientToken: String? = null): Headers = Headers.Builder()
@@ -644,7 +738,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         .apply { clientToken?.let { add("X-Client-Token", it) } }
         .build()
 
-    private var cachedClientToken: String? = null
+    private var cachedClientCredential: ClientCredential? = null
 
     private fun encodeRawPublicKey(publicKey: ECPublicKey): ByteArray {
         val coordinateSize = (publicKey.params.curve.field.fieldSize + 7) / 8
@@ -726,6 +820,16 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
     }
 
     internal companion object {
+        private const val CLIENT_TOKEN_COOKIE = "mangapeak_dilar_client_token"
+        private const val CREDENTIAL_RENEWAL_MARGIN_SECONDS = 5L * 60L
+        private const val DEFAULT_CREDENTIAL_LIFETIME_SECONDS = 7L * 24L * 60L * 60L
+        private val enrollmentMutex = Mutex()
+
+        private fun currentEpochSeconds(): Long = System.currentTimeMillis() / 1000L
+
+        private fun defaultCredentialExpirySeconds(): Long =
+            currentEpochSeconds() + DEFAULT_CREDENTIAL_LIFETIME_SECONDS
+
         fun requiresClientReenrollment(statusCode: Int): Boolean = statusCode == 403 || statusCode == 428
     }
 }

@@ -3,12 +3,42 @@ package org.koitharu.kotatsu.parsers.site.anime.ar
 import org.json.JSONArray
 import org.jsoup.Jsoup
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Test
 import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.network.UserAgents
 
 internal class AnimeSlayerTest {
+
+	@Test
+	fun removesDuplicateEpisodeWhenAnimeSlayerShiftsItsInternalNumbers() {
+		val episodes = JSONArray(
+			"""[
+				{"episode_id":"86776","episode_number":"1","episode_name":"الحلقة : 1"},
+				{"episode_id":"87035","episode_number":"6","episode_name":"الحلقة : 6"},
+				{"episode_id":"87081","episode_number":"7","episode_name":"الحلقة : 7"},
+				{"episode_id":"87080","episode_number":"8","episode_name":"الحلقة : 7"},
+				{"episode_id":"87272","episode_number":"9","episode_name":"الحلقة : 8"},
+				{"episode_id":"87273","episode_number":"10","episode_name":"الحلقة : 9"},
+				{"episode_id":"87319","episode_number":"11","episode_name":"الحلقة : 10"}
+			]""".trimIndent(),
+		)
+
+		val parsed = AnimeSlayer(MangaLoaderContextMock).parseEpisodes("14509", episodes)
+
+		assertEquals(listOf(1f, 6f, 7f, 8f, 9f, 10f), parsed.map { it.number })
+		assertEquals("/episode/14509/87081", parsed.first { it.number == 7f }.url)
+		assertEquals("/episode/14509/87272", parsed.first { it.number == 8f }.url)
+	}
+
+	@Test
+	fun rejectsBlockedPagesAsAnimeTitles() {
+		assertNull(AnimeSlayer.validAnimeTitle("Access Denied"))
+		assertNull(AnimeSlayer.validAnimeTitle("Acess Denied"))
+		assertNull(AnimeSlayer.validAnimeTitle("403 Forbidden"))
+		assertEquals("Frieren", AnimeSlayer.validAnimeTitle(" Frieren "))
+	}
 
 	@Test
 	fun ignoresPersistedUserAgentAndUsesTheSameIdentityInDebugAndRelease() {

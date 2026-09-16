@@ -139,11 +139,17 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			?: details.optString("anime_cover_image_url").takeIf(String::isNotBlank)
 			?: manga.coverUrl
 		val tags = parseTags(details.optString("anime_genres"))
-		val englishTitle = details.optString("anime_english_title").takeIf(String::isNotBlank)
+		val englishTitle = validAnimeTitle(details.optString("anime_english_title"))
+		val resolvedTitle = validAnimeTitle(details.optString("anime_name"))
+			?: englishTitle
+			?: validAnimeTitle(manga.title)
+			?: "Anime Slayer #$animeId"
 
 		return manga.copy(
-			title = details.optString("anime_name").takeIf(String::isNotBlank) ?: manga.title,
-			altTitles = setOfNotNull(englishTitle).ifEmpty { manga.altTitles },
+			title = resolvedTitle,
+			altTitles = setOfNotNull(englishTitle)
+				.filterNotTo(LinkedHashSet()) { it.equals(resolvedTitle, ignoreCase = true) }
+				.ifEmpty { manga.altTitles.filterNotTo(LinkedHashSet(), ::isBlockedTitle) },
 			publicUrl = "https://anslayer.com/",
 			coverUrl = cover,
 			largeCoverUrl = cover,
@@ -206,7 +212,9 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 
 	private fun parseAnime(item: JSONObject): Manga? {
 		val animeId = item.optString("anime_id").takeIf(String::isNotBlank) ?: return null
-		val title = item.optString("anime_name").takeIf(String::isNotBlank) ?: return null
+		val title = validAnimeTitle(item.optString("anime_name"))
+			?: validAnimeTitle(item.optString("anime_english_title"))
+			?: return null
 		val tags = parseTags(item.optString("anime_genres"))
 		return Manga(
 			id = generateUid(animeId),
@@ -231,33 +239,52 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			MangaTag(title = title, key = title, source = source)
 		}
 
-	private fun parseEpisodes(animeId: String, episodes: JSONArray?): List<MangaChapter> {
+	internal fun parseEpisodes(animeId: String, episodes: JSONArray?): List<MangaChapter> {
 		if (episodes == null) return emptyList()
-		return buildList {
-			for (index in 0 until episodes.length()) {
-				val item = episodes.optJSONObject(index) ?: continue
-				val episodeId = item.optString("episode_id").takeIf(String::isNotBlank) ?: continue
-				val number = item.optString("episode_number").toFloatOrNull()
-					?: (index + 1).toFloat()
-				val title = item.optString("episode_name").trim().ifEmpty {
-					"الحلقة ${formatNumber(number)}"
-				}
-				add(
-					MangaChapter(
-						id = generateUid("$animeId/$episodeId"),
-						title = title,
-						number = number,
-						volume = 0,
-						url = "$EPISODE_PATH$animeId/$episodeId",
-						scanlator = "Anime Slayer",
-						uploadDate = 0L,
-						branch = null,
-						source = source,
-					),
-				)
+		val uniqueEpisodes = LinkedHashMap<String, Pair<MangaChapter, Boolean>>()
+		for (index in 0 until episodes.length()) {
+			val item = episodes.optJSONObject(index) ?: continue
+			val episodeId = item.optString("episode_id").takeIf(String::isNotBlank) ?: continue
+			val serverNumber = item.optString("episode_number").toFloatOrNull()
+			val rawTitle = item.optString("episode_name").trim()
+			val titleNumber = extractEpisodeNumber(rawTitle)
+			val number = titleNumber ?: serverNumber ?: (index + 1).toFloat()
+			val title = rawTitle.ifEmpty { "الحلقة ${formatNumber(number)}" }
+			val chapter = MangaChapter(
+				id = generateUid("$animeId/$episodeId"),
+				title = title,
+				number = number,
+				volume = 0,
+				url = "$EPISODE_PATH$animeId/$episodeId",
+				scanlator = "Anime Slayer",
+				uploadDate = 0L,
+				branch = null,
+				source = source,
+			)
+			val key = episodeKey(number, title)
+			val serverNumberMatchesTitle = serverNumber != null &&
+				abs(serverNumber - number) <= EPISODE_NUMBER_EPSILON
+			val previous = uniqueEpisodes[key]
+			if (previous == null || (!previous.second && serverNumberMatchesTitle)) {
+				uniqueEpisodes[key] = chapter to serverNumberMatchesTitle
 			}
-		}.distinctBy(MangaChapter::id).sortedBy(MangaChapter::number)
+		}
+		return uniqueEpisodes.values
+			.map { it.first }
+			.sortedBy(MangaChapter::number)
 	}
+
+	private fun episodeKey(number: Float, title: String): String = if (number.isFinite()) {
+		"number:${formatNumber(number)}"
+	} else {
+		"title:${title.trim().lowercase(Locale.ROOT)}"
+	}
+
+	private fun extractEpisodeNumber(title: String): Float? = EPISODE_TITLE_NUMBER
+		.find(title)
+		?.groupValues
+		?.getOrNull(1)
+		?.toFloatOrNull()
 
 	private suspend fun resolveServer(server: JSONObject): List<AnimeStream> {
 		val serverName = sequenceOf("episode_server_name", "server_name", "name")
@@ -450,6 +477,10 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		const val ANIME_PATH = "/anime/"
 		const val EPISODE_PATH = "/episode/"
 		const val EPISODE_NUMBER_EPSILON = 0.001f
+		val EPISODE_TITLE_NUMBER = Regex(
+			"""(?:الحلقة|حلقة|episode|ep\.?)\s*[:#\-–—]?\s*(\d+(?:\.\d+)?)""",
+			RegexOption.IGNORE_CASE,
+		)
 
 		val QUALITY_NUMBER = Regex("""(?:^|[_\-.])(\d{3,4})p?(?:[_\-.]|$)""", RegexOption.IGNORE_CASE)
 		val DIRECT_MEDIA_URL = Regex(
@@ -486,16 +517,30 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			RegexOption.IGNORE_CASE,
 		)
 
+		internal fun validAnimeTitle(value: String): String? = value.trim()
+			.takeIf(String::isNotEmpty)
+			?.takeUnless(::isBlockedTitle)
+
+		internal fun isBlockedTitle(value: String): Boolean {
+			val normalized = value.trim().lowercase(Locale.ROOT).replace(Regex("""\s+"""), " ")
+			return normalized.startsWith("access denied") ||
+				normalized.startsWith("acess denied") ||
+				normalized.startsWith("403 forbidden") ||
+				normalized.startsWith("attention required")
+		}
+
 		fun findEpisode(episodes: JSONArray, episodeId: String, episodeNumber: Float): JSONObject? {
-			val availableEpisodes = (0 until episodes.length())
-				.asSequence()
-				.mapNotNull(episodes::optJSONObject)
-				.toList()
-			return availableEpisodes.firstOrNull { it.optString("episode_id") == episodeId }
-				?: availableEpisodes.firstOrNull {
-					val freshNumber = it.optString("episode_number").toFloatOrNull()
-					freshNumber != null && abs(freshNumber - episodeNumber) <= EPISODE_NUMBER_EPSILON
-				}
+			val availableEpisodes = (0 until episodes.length()).mapNotNull { index ->
+				episodes.optJSONObject(index)?.let { index to it }
+			}
+			return availableEpisodes.firstOrNull { (_, item) -> item.optString("episode_id") == episodeId }?.second
+				?: availableEpisodes.firstOrNull { (index, item) ->
+					val freshNumber = EPISODE_TITLE_NUMBER.find(item.optString("episode_name"))
+						?.groupValues?.getOrNull(1)?.toFloatOrNull()
+						?: item.optString("episode_number").toFloatOrNull()
+						?: (index + 1).toFloat()
+					abs(freshNumber - episodeNumber) <= EPISODE_NUMBER_EPSILON
+				}?.second
 		}
 
 		fun alternativeEndpointCandidates(serverUrl: String): List<String> = buildList {
