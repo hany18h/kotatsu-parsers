@@ -291,9 +291,7 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         // تنظيف صفحة القراءة من العناصر المزعجة
         cleanDocument(doc)
         
-        return doc.select("div.manga-page img[src], div.manga-page img[data-src]").mapIndexed { index, img ->
-            val imageUrl = img.attr("src").ifEmpty { img.attr("data-src") }.toAbsoluteUrl(domain)
-            
+        return extractReaderImageUrls(doc, domain).mapIndexed { index, imageUrl ->
             MangaPage(
                 id = generateUid("${chapter.id}-$index"),
                 url = imageUrl,
@@ -373,6 +371,16 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     }
 
     internal companion object {
+        internal fun extractReaderImageUrls(document: Document, domain: String): List<String> = document
+            .select("div.manga-page img[data-url], div.manga-page img[data-src], div.manga-page img[src]")
+            .mapNotNull { image ->
+                sequenceOf("data-url", "data-src", "src")
+                    .map { image.attr(it).trim() }
+                    .firstOrNull { it.isNotEmpty() && !it.startsWith("data:", ignoreCase = true) }
+                    ?.toAbsoluteUrl(domain)
+            }
+            .distinct()
+
         private val CAPTCHA_MARKERS = listOf(
             "captcha",
             "cf-turnstile",

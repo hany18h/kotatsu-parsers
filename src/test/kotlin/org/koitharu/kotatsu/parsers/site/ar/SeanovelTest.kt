@@ -8,6 +8,21 @@ import org.junit.jupiter.api.Test
 internal class SeanovelTest {
 
 	@Test
+	fun combinesEveryReaderSegmentInsteadOfDroppingTheRemainder() {
+		val document = Jsoup.parse(
+			"""
+			<article class="reader-content"><p>بداية الفصل</p></article>
+			<article class="reader-content"><p>نهاية الفصل</p></article>
+			""".trimIndent(),
+		)
+
+		val content = Seanovel.extractChapterContent(document)!!
+
+		assertTrue(content.text().contains("بداية الفصل"))
+		assertTrue(content.text().contains("نهاية الفصل"))
+	}
+
+	@Test
 	fun keepsReaderBodyAndRemovesScreenReaderMetadata() {
 		val document = Jsoup.parse(
 			"""

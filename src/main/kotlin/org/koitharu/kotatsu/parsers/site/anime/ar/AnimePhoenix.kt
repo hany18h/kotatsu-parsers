@@ -4,6 +4,7 @@ import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -28,6 +29,7 @@ import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.oneOrThrowIfMany
 import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.parseJson
+import org.koitharu.kotatsu.parsers.util.runCatchingCancellable
 import org.koitharu.kotatsu.parsers.util.src
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
 import org.koitharu.kotatsu.parsers.util.toRelativeUrl
@@ -69,9 +71,9 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions {
-		val doc = webClient.httpGet("https://$domain/search/").parseHtml()
-		val tags = doc.select(".custom-select[data-filter=genre] .select-option[data-value]")
-			.mapNotNullTo(LinkedHashSet()) { option ->
+		val doc = runCatchingCancellable { loadDocument("https://$domain/search/") }.getOrNull()
+		val tags = doc?.select(".custom-select[data-filter=genre] .select-option[data-value]")
+			?.mapNotNullTo(LinkedHashSet()) { option ->
 				val key = option.attr("data-value").trim().takeIf(String::isNotEmpty)
 					?: return@mapNotNullTo null
 				MangaTag(
@@ -79,7 +81,7 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 					title = option.text().trim().ifEmpty { key },
 					source = source,
 				)
-			}
+			}.orEmpty()
 		return MangaListFilterOptions(
 			availableTags = tags,
 			availableStates = EnumSet.of(
@@ -95,9 +97,25 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 		order: SortOrder,
 		filter: MangaListFilter,
 	): List<Manga> {
-		val configDoc = webClient.httpGet("https://$domain/search/").parseHtml()
-		val searchConfig = extractSearchConfig(configDoc) ?: return emptyList()
-		val nonce = searchConfig.optString("nonce").takeIf(String::isNotBlank) ?: return emptyList()
+		val configDoc = runCatchingCancellable { loadDocument("https://$domain/search/") }.getOrNull()
+		val ajaxResult = configDoc?.let(::extractSearchConfig)?.let { searchConfig ->
+			runCatchingCancellable { loadAjaxResults(page, order, filter, searchConfig) }.getOrNull()
+		}
+		if (ajaxResult != null) return ajaxResult
+
+		// The search endpoint is occasionally protected by a JavaScript challenge.
+		// The public /index page remains a complete, dependency-free catalog.
+		val index = loadDocument("https://$domain/index")
+		return parseIndexPage(index, page, filter.query, order)
+	}
+
+	private suspend fun loadAjaxResults(
+		page: Int,
+		order: SortOrder,
+		filter: MangaListFilter,
+		searchConfig: JSONObject,
+	): List<Manga>? {
+		val nonce = searchConfig.optString("nonce").takeIf(String::isNotBlank) ?: return null
 		val ajaxUrl = searchConfig.optString("ajax_url")
 			.takeIf(String::isNotBlank)
 			?: "https://$domain/wp-admin/admin-ajax.php"
@@ -130,8 +148,8 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 			payload,
 			ajaxHeaders("https://$domain/search/"),
 		).parseJson()
-		if (!response.optBoolean("success")) return emptyList()
-		val results = response.optJSONObject("data")?.optJSONArray("results") ?: return emptyList()
+		if (!response.optBoolean("success")) return null
+		val results = response.optJSONObject("data")?.optJSONArray("results") ?: return null
 		return buildList {
 			for (i in 0 until results.length()) {
 				parseSearchResult(results.optJSONObject(i))?.let(::add)
@@ -176,7 +194,7 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val mangaUrl = manga.url.toAbsoluteUrl(domain)
-		val doc = webClient.httpGet(mangaUrl).parseHtml()
+		val doc = loadDocument(mangaUrl)
 		val series = findSeriesJson(doc)
 		val cover = doc.selectFirst(".FJ-Phoenix-Hero-Poster img")?.src()
 			?: series?.optString("image")?.takeIf(String::isNotBlank)
@@ -246,7 +264,7 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 
 	override suspend fun getVideoStreams(chapter: MangaChapter): List<AnimeStream> {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
-		val doc = webClient.httpGet(chapterUrl).parseHtml()
+		val doc = loadDocument(chapterUrl)
 		val result = ArrayList<AnimeStream>()
 
 		doc.select("#player-html-template source[src], video source[src]").forEach { sourceElement ->
@@ -273,6 +291,74 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 		),
 		quality = detectQuality(url),
 	)
+
+	private suspend fun loadDocument(url: String): Document {
+		val directResult = runCatchingCancellable { webClient.httpGet(url).parseHtml() }
+		directResult.getOrNull()?.takeUnless(::isBlockedPage)?.let { return it }
+
+		val browserResult = runCatchingCancellable {
+			val raw = context.evaluateJs(
+				url,
+				"""
+				(function() {
+				  if (document.readyState === 'loading') return null;
+				  return document.documentElement ? document.documentElement.outerHTML : null;
+				})()
+				""".trimIndent(),
+				getRequestHeaders(),
+			) ?: return@runCatchingCancellable null
+			decodeWebViewString(raw)?.let { Jsoup.parse(it, url) }
+		}
+		browserResult.getOrNull()?.takeUnless(::isBlockedPage)?.let { return it }
+
+		directResult.exceptionOrNull()?.let { throw it }
+		browserResult.exceptionOrNull()?.let { throw it }
+		error("Anime Phoenix returned an access challenge instead of public content")
+	}
+
+	internal fun parseIndexPage(
+		document: Document,
+		page: Int,
+		query: String?,
+		order: SortOrder,
+	): List<Manga> {
+		val normalizedQuery = query?.trim()?.lowercase(Locale.ROOT).orEmpty()
+		val entries = document.select("a[href*='/animes/']").mapNotNull { anchor ->
+			val publicUrl = anchor.attr("href").trim().takeIf(String::isNotEmpty)
+				?.toAbsoluteUrl(domain)
+				?: return@mapNotNull null
+			val path = publicUrl.toRelativeUrl(domain)
+			val title = sequenceOf(
+				anchor.selectFirst(".anime-card-title, .FJ-Card-Title, h2, h3, h4")?.text(),
+				anchor.attr("aria-label"),
+				anchor.attr("title"),
+				anchor.selectFirst("img[alt]")?.attr("alt"),
+				anchor.ownText(),
+			).mapNotNull { it?.trim()?.takeIf(String::isNotEmpty) }.firstOrNull()
+				?: return@mapNotNull null
+			if (normalizedQuery.isNotEmpty() && normalizedQuery !in title.lowercase(Locale.ROOT)) {
+				return@mapNotNull null
+			}
+			Manga(
+				id = generateUid(path),
+				title = title,
+				altTitles = emptySet(),
+				url = path,
+				publicUrl = publicUrl,
+				rating = RATING_UNKNOWN,
+				contentRating = ContentRating.SAFE,
+				coverUrl = anchor.selectFirst("img")?.src(),
+				tags = emptySet(),
+				state = null,
+				authors = emptySet(),
+				source = source,
+			)
+		}.distinctBy(Manga::url).let { items ->
+			if (order == SortOrder.ALPHABETICAL) items.sortedBy { it.title.lowercase(Locale.ROOT) } else items
+		}
+		val start = ((page.coerceAtLeast(1) - 1) * PAGE_SIZE).coerceAtMost(entries.size)
+		return entries.subList(start, (start + PAGE_SIZE).coerceAtMost(entries.size))
+	}
 
 	private fun ajaxHeaders(referer: String): Headers = Headers.Builder()
 		.add("Accept", "application/json, text/javascript, */*; q=0.01")
@@ -306,6 +392,23 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 		private val EPISODE_NUMBER = Regex("""episode-(\d+(?:\.\d+)?)(?:/)?$""", RegexOption.IGNORE_CASE)
 		private val QUALITY_NUMBER = Regex("""(?:^|[^\d])(\d{3,4})p(?:[^\d]|$)""", RegexOption.IGNORE_CASE)
 		private const val SEARCH_CONFIG_VARIABLE = "fjSearchPageData"
+		private val BLOCK_MARKERS = listOf(
+			"access denied",
+			"just a moment",
+			"cf-turnstile",
+			"challenge-form",
+			"verify you are human",
+			"requires javascript to function",
+		)
+
+		internal fun isBlockedPage(document: Document): Boolean {
+			val text = "${document.title()} ${document.body()?.text().orEmpty()}".lowercase(Locale.ROOT)
+			return BLOCK_MARKERS.any(text::contains)
+		}
+
+		internal fun decodeWebViewString(rawResult: String): String? = runCatching {
+			JSONObject("{\"value\":$rawResult}").optString("value").trim().takeIf(String::isNotEmpty)
+		}.getOrNull()
 
 		internal fun extractSearchConfig(document: Document): JSONObject? {
 			val script = document.select("script")

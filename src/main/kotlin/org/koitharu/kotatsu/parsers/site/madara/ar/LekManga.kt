@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.parsers.site.madara.ar
 
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
+import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.model.MangaParserSource
 import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 
@@ -12,4 +13,10 @@ internal class LekManga(context: MangaLoaderContext) :
 	// The site's admin-ajax endpoint returns a stale ten-item window. Its public
 	// paged search is current and includes newly published works.
 	override val withoutAjax = true
+	override val useBrowserFallback = true
+
+	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+		super.onCreateConfig(keys)
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
+	}
 }

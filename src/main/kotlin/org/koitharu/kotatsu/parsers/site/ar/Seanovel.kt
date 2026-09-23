@@ -267,7 +267,7 @@ internal class Seanovel(context: MangaLoaderContext) : PagedMangaParser(
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(chapterUrl).parseHtml()
-		val content = doc.selectFirst("article.reader-content") ?: return null
+		val content = extractChapterContent(doc) ?: return null
 		sanitizeChapterContent(content)
 		if (content.text().isBlank() && content.selectFirst("img") == null) return null
 
@@ -319,6 +319,17 @@ internal class Seanovel(context: MangaLoaderContext) : PagedMangaParser(
 		const val PAGE_SIZE = 24
 		const val CHAPTER_PAGE_SIZE = 100
 		private val ISO_DATE_FORMAT = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSX", Locale.US)
+
+		internal fun extractChapterContent(document: org.jsoup.nodes.Document): Element? {
+			val sections = document.select("article.reader-content").ifEmpty {
+				document.select("[data-reader-initial-content], .chapter-content")
+			}
+			if (sections.isEmpty()) return null
+			if (sections.size == 1) return sections.first()!!.clone()
+			return Element("article").addClass("reader-content").also { combined ->
+				sections.forEach { section -> combined.append(section.html()) }
+			}
+		}
 
 		internal fun sanitizeChapterContent(content: Element): Element {
 			content.select(

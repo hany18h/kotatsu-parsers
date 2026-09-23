@@ -4,6 +4,7 @@ import androidx.collection.scatterSetOf
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -35,6 +36,7 @@ internal abstract class MadaraParser(
 	// Change these values only if the site does not support manga listings via ajax
 	protected open val withoutAjax = false
 	protected open val authorSearchSupported = false
+	protected open val useBrowserFallback = false
 
 	override val availableSortOrders: Set<SortOrder> = setupAvailableSortOrders()
 
@@ -309,7 +311,7 @@ internal abstract class MadaraParser(
 					else -> {}
 				}
 			}
-			return parseMangaList(webClient.httpGet(url).parseHtml())
+			return parseMangaList(loadPublicDocument(url))
 		} else {
 
 			val payload = createRequestTemplate()
@@ -564,7 +566,7 @@ internal abstract class MadaraParser(
 
 	override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
 		val fullUrl = manga.url.toAbsoluteUrl(domain)
-		val doc = webClient.httpGet(fullUrl).parseHtml()
+		val doc = loadPublicDocument(fullUrl)
 
 		val href = doc.selectFirst("head meta[property='og:url']")?.attr("content")?.toRelativeUrl(domain) ?: manga.url
 		val testCheckAsync = doc.select(selectTestAsync)
@@ -673,7 +675,7 @@ internal abstract class MadaraParser(
 	}
 
 	override suspend fun getRelatedManga(seed: Manga): List<Manga> {
-		val doc = webClient.httpGet(seed.url.toAbsoluteUrl(domain)).parseHtml()
+		val doc = loadPublicDocument(seed.url.toAbsoluteUrl(domain))
 		val root = doc.body().selectFirstOrThrow(".related-manga")
 		return root.select("div.related-reading-wrap").mapNotNull { div ->
 			val a = div.selectFirst("a") ?: return@mapNotNull null
@@ -701,7 +703,7 @@ internal abstract class MadaraParser(
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val fullUrl = chapter.url.toAbsoluteUrl(domain)
-		val doc = webClient.httpGet(fullUrl).parseHtml()
+		val doc = loadPublicDocument(fullUrl)
 		val chapterProtector = doc.getElementById("chapter-protector-data")
 		if (chapterProtector == null) {
 			throw if (doc.selectFirst(selectRequiredLogin) != null) {
@@ -754,6 +756,31 @@ internal abstract class MadaraParser(
 			}
 
 		}
+	}
+
+	private suspend fun loadPublicDocument(url: String): Document {
+		val directResult = runCatchingCancellable { webClient.httpGet(url).parseHtml() }
+		val directDocument = directResult.getOrNull()
+		if (!useBrowserFallback || directDocument?.let(::isAccessChallengePage) == false) {
+			return directDocument ?: throw checkNotNull(directResult.exceptionOrNull())
+		}
+
+		val browserResult = runCatchingCancellable {
+			val raw = context.evaluateJs(
+				url,
+				"""
+				(function() {
+				  if (document.readyState === 'loading') return null;
+				  return document.documentElement ? document.documentElement.outerHTML : null;
+				})()
+				""".trimIndent(),
+				getRequestHeaders(),
+			) ?: return@runCatchingCancellable null
+			decodeBrowserHtml(raw)?.let { Jsoup.parse(it, url) }
+		}
+		browserResult.getOrNull()?.takeUnless(::isAccessChallengePage)?.let { return it }
+		browserResult.exceptionOrNull()?.let { throw it }
+		error("$domain returned an access challenge instead of public content")
 	}
 
 	protected fun parseChapterDate(dateFormat: DateFormat, date: String?): Long {
@@ -838,7 +865,26 @@ internal abstract class MadaraParser(
 		}
 	}
 
-	private companion object {
+	internal companion object {
+		internal fun isAccessChallengePage(document: Document): Boolean {
+			val title = document.title().trim().lowercase(Locale.ROOT)
+			val heading = document.selectFirst("h1")?.text()?.trim()?.lowercase(Locale.ROOT)
+			if (title in ACCESS_DENIED_TITLES || heading in ACCESS_DENIED_TITLES) return true
+			if (document.selectFirst("#challenge-form, .cf-turnstile, #cf-error-details") != null) return true
+			val text = document.body()?.text()?.lowercase(Locale.ROOT).orEmpty()
+			return BLOCK_MARKERS.any(text::contains)
+		}
+
+		internal fun decodeBrowserHtml(rawResult: String): String? = runCatching {
+			JSONObject("{\"value\":$rawResult}").optString("value").trim().takeIf(String::isNotEmpty)
+		}.getOrNull()
+
+		private val ACCESS_DENIED_TITLES = setOf("access denied", "acess denied")
+		private val BLOCK_MARKERS = listOf(
+			"this website requires javascript to function",
+			"verify you are human",
+			"checking your browser before accessing",
+		)
 
 		private fun createRequestTemplate() =
 			("action=madara_load_more&page=0&template=madara-core%2Fcontent%2Fcontent-search&vars%5Bs%5D=&vars%5Bpaged%5D=1&vars%5Btemplate%5D=search&vars%5Bmeta_query%5D%5B0%5D%5Brelation%5D=AND&vars%5Bmeta_query%5D%5Brelation%5D=AND&vars%5Bpost_type%5D=wp-manga&vars%5Bpost_status%5D=publish&vars%5Bmanga_archives_item_layout%5D=default").split(

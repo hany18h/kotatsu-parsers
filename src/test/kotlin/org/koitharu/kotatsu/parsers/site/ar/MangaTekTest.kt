@@ -34,4 +34,21 @@ internal class MangaTekTest {
             parser.decodeWebViewString("\"<main><div class=\\\"manga-page\\\"></div></main>\""),
         )
     }
+
+    @Test
+    fun prefersCanonicalLazyImageUrlOverPlaceholderSource() {
+        val document = Jsoup.parse(
+            """
+            <div class="manga-page">
+              <img src="data:image/gif;base64,placeholder" data-src="/lazy/1.webp" data-url="https://img.mangatek.com/1.webp">
+              <img src="/2.webp">
+            </div>
+            """.trimIndent(),
+        )
+
+        assertEquals(
+            listOf("https://img.mangatek.com/1.webp", "https://mangatek.com/2.webp"),
+            MangaTek.extractReaderImageUrls(document, "mangatek.com"),
+        )
+    }
 }
