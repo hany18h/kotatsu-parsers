@@ -310,6 +310,14 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         }
     }
 
+    override suspend fun getPageUrl(page: MangaPage): String = if (
+        page.url.startsWith(OVERLAY_PAGE_SCHEME, ignoreCase = true)
+    ) {
+        page.url
+    } else {
+        super.getPageUrl(page)
+    }
+
     /**
      * MangaTek keeps speech text outside the page image. The browser unlocks an
      * encrypted JSON overlay and paints it on canvas. Decode the same public
