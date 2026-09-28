@@ -284,7 +284,7 @@ internal class Azoramoon(context: MangaLoaderContext) :
 			)
 		}
 
-		val chapters = loadChapters(manga, doc)
+		val chapters = loadChaptersFromApi(manga) ?: loadChapters(manga, doc)
 
 		val coverUrl = doc.selectFirst("section img")?.src() ?: manga.coverUrl
 
@@ -336,7 +336,33 @@ internal class Azoramoon(context: MangaLoaderContext) :
 		val seriesSlug = manga.url.substringAfter("/series/", "").substringBefore('/')
 		if (seriesSlug.isEmpty()) return emptyList()
 
-		val chaptersJson = extractChaptersFromAstroProps(doc) ?: return emptyList()
+		val chaptersJson = extractChaptersFromAstroProps(doc)
+		if (chaptersJson == null) return parseChaptersFromHtml(manga, doc)
+		return parseApiChapters(manga, chaptersJson)
+	}
+
+	private suspend fun loadChaptersFromApi(manga: Manga): List<MangaChapter>? = runCatchingCancellable {
+		val seriesSlug = manga.url.substringAfter("/series/", "").substringBefore('/')
+		if (seriesSlug.isEmpty()) return@runCatchingCancellable null
+		val details = webClient.httpGet("https://api.$domain/api/post?postSlug=${seriesSlug.urlEncoded()}").parseJson()
+		val post = details.optJSONObject("post") ?: return@runCatchingCancellable null
+		val embedded = post.optJSONArray("chapters") ?: JSONArray()
+		val postId = post.optInt("id")
+		val expected = details.optInt("totalChapterCount", embedded.length())
+		val chapters = if (postId > 0 && expected > embedded.length()) {
+			val full = runCatchingCancellable {
+				webClient.httpGet("https://api.$domain/api/chapters?postId=$postId")
+					.parseJson().optJSONObject("post")?.optJSONArray("chapters")
+			}.getOrNull()
+			if (full != null && full.length() > embedded.length()) full else embedded
+		} else {
+			embedded
+		}
+		parseApiChapters(manga, chapters).takeIf { it.isNotEmpty() }
+	}.getOrNull()
+
+	internal fun parseApiChapters(manga: Manga, chaptersJson: JSONArray): List<MangaChapter> {
+		val seriesSlug = manga.url.substringAfter("/series/", "").substringBefore('/')
 
 		val chapters = ArrayList<MangaChapter>(chaptersJson.length())
 		for (i in 0 until chaptersJson.length()) {
@@ -372,6 +398,29 @@ internal class Azoramoon(context: MangaLoaderContext) :
 			)
 		}
 		return chapters.sortedBy { it.number }
+	}
+
+	internal fun parseChaptersFromHtml(manga: Manga, doc: Document): List<MangaChapter> {
+		val seriesSlug = manga.url.substringAfter("/series/", "").substringBefore('/')
+		return doc.select("a[href^='/series/$seriesSlug/chapter-']")
+			.mapNotNull { link ->
+				val url = link.attr("href").substringBefore('#').substringBefore('?')
+				val number = url.substringAfterLast('/').removePrefix("chapter-").toFloatOrNull()
+					?: return@mapNotNull null
+				MangaChapter(
+					id = generateUid(url),
+					title = "الفصل ${formatChapterNumber(number)}",
+					number = number,
+					volume = 0,
+					url = url,
+					scanlator = null,
+					uploadDate = 0L,
+					branch = null,
+					source = source,
+				)
+			}
+			.distinctBy { it.url }
+			.sortedBy { it.number }
 	}
 
 	private fun extractChaptersFromAstroProps(doc: Document): JSONArray? {

@@ -73,7 +73,7 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
             }
         }
 
-        val doc = loadDocument(url)
+        val doc = loadDocument(url, if (query.isEmpty()) "a.manga-card" else "main h1")
         
         // إزالة العناصر المزعجة
         cleanDocument(doc)
@@ -109,7 +109,7 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
 
     override suspend fun getDetails(manga: Manga): Manga {
         val url = "https://$domain/manga/${manga.url}"
-        val doc = loadDocument(url)
+        val doc = loadDocument(url, "astro-island[component-url*='MangaChaptersLoader'], a[href^='/reader/']")
         
         // إزالة العناصر المزعجة
         cleanDocument(doc)
@@ -164,10 +164,6 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         
         // إزالة overlays و modals
         doc.select(".overlay, .modal, .popup, [class*='overlay'], [id*='overlay']").remove()
-        
-        // إزالة رسائل التحذير الشائعة
-        doc.select("div:contains(مانع الإعلانات), div:contains(ad blocker), div:contains(AdBlock)").remove()
-        doc.select("div:contains(قم بتعطيل), div:contains(Please disable), div:contains(turn off)").remove()
         
         // إزالة الإعلانات
         doc.select(".ad, .ads, .advertisement, [class*='ad-'], [id*='ad-']").remove()
@@ -286,7 +282,7 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val fullUrl = chapter.url.toAbsoluteUrl(domain)
-        val doc = loadDocument(fullUrl)
+        val doc = loadDocument(fullUrl, "div.manga-page img[src], div.manga-page img[data-src]")
         
         // تنظيف صفحة القراءة من العناصر المزعجة
         cleanDocument(doc)
@@ -309,30 +305,35 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
      * same public HTML through WebView first, then keep HTTP as a lightweight
      * fallback for devices where WebView is unavailable.
      */
-    private suspend fun loadDocument(url: String): Document {
+    private suspend fun loadDocument(url: String, readySelector: String): Document {
+        val quotedSelector = JSONObject.quote(readySelector)
         val webViewResult = runCatchingCancellable {
             val rawResult = loaderContext.evaluateJs(
                 url,
                 """
                 (function() {
                   if (document.readyState === 'loading') return null;
+                  if (!document.querySelector($quotedSelector)) return null;
                   return document.documentElement ? document.documentElement.outerHTML : null;
                 })()
                 """.trimIndent(),
             ) ?: return@runCatchingCancellable null
             decodeWebViewString(rawResult)?.let { Jsoup.parse(it, url) }
         }
-        webViewResult.getOrNull()?.takeUnless(::isCaptchaPage)?.let { return it }
+        webViewResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
 
         val directResult = runCatchingCancellable {
             webClient.httpGet(url, siteHeaders("https://$domain/")).parseHtml()
         }
-        directResult.getOrNull()?.takeUnless(::isCaptchaPage)?.let { return it }
+        directResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
 
         webViewResult.exceptionOrNull()?.let { throw it }
         directResult.exceptionOrNull()?.let { throw it }
-        error("MangaTek returned a CAPTCHA page instead of public content")
+        error("MangaTek returned an incomplete page or a CAPTCHA instead of public content")
     }
+
+    internal fun isUsablePage(document: Document, readySelector: String): Boolean =
+        !isCaptchaPage(document) && document.selectFirst(readySelector) != null
 
     internal fun decodeWebViewString(rawResult: String): String? = runCatching {
         JSONObject("{\"value\":$rawResult}").optString("value").trim().takeIf(String::isNotEmpty)

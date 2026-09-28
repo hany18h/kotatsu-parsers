@@ -34,4 +34,14 @@ internal class MangaTekTest {
             parser.decodeWebViewString("\"<main><div class=\\\"manga-page\\\"></div></main>\""),
         )
     }
+
+    @Test
+    fun waitsForCatalogueCardsInsteadOfAcceptingAnEmptyShell() {
+        val parser = MangaTek(MangaLoaderContextMock)
+        val selector = "a.manga-card"
+
+        assertFalse(parser.isUsablePage(Jsoup.parse("<main><h1>قائمة المانجا</h1></main>"), selector))
+        assertTrue(parser.isUsablePage(Jsoup.parse("<main><a class='manga-card' href='/manga/example'>Example</a></main>"), selector))
+        assertFalse(parser.isUsablePage(Jsoup.parse("<h1>Verify you are human</h1><a class='manga-card'></a>"), selector))
+    }
 }

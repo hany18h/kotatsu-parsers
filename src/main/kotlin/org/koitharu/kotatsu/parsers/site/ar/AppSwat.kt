@@ -98,11 +98,14 @@ internal class MangaSwat(context: MangaLoaderContext) :
 
     override val availableSortOrders: Set<SortOrder> = LinkedHashSet(
         listOf(
+            SortOrder.UPDATED,
             SortOrder.RELEVANCE,
             SortOrder.POPULARITY,
             SortOrder.RATING,
         )
     )
+
+    override val defaultSortOrder: SortOrder = SortOrder.POPULARITY
 
     override suspend fun getFilterOptions() = MangaListFilterOptions(
         availableTags = fetchAvailableTags(),
@@ -127,6 +130,7 @@ internal class MangaSwat(context: MangaLoaderContext) :
     // ─── List ──────────────────────────────────────────────────────────────────
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        if (order == SortOrder.UPDATED) return getUpdatedListPage(page, filter)
         val url = buildString {
             append("$apiBaseUrl/series/?page=$page")
             if (!filter.query.isNullOrEmpty()) {
@@ -147,6 +151,37 @@ internal class MangaSwat(context: MangaLoaderContext) :
         return (0 until results.length()).map { i ->
             parseMangaFromJson(results.getJSONObject(i))
         }
+    }
+
+    private suspend fun getUpdatedListPage(page: Int, filter: MangaListFilter): List<Manga> {
+        val start = (page.coerceAtLeast(1) - 1) * 20
+        val targetSize = start + 20
+        val series = LinkedHashMap<Int, Manga>()
+        val query = filter.query?.trim().orEmpty()
+        var chapterPage = 1
+
+        while (series.size < targetSize) {
+            val response = webClient.httpGet(
+                "$apiBaseUrl/chapters/?page=$chapterPage&page_size=200&order_by=-created_at",
+                apiHeaders,
+            ).parseJson()
+            val chapters = response.getJSONArray("results")
+            if (chapters.length() == 0) break
+            for (i in 0 until chapters.length()) {
+                val seriesJson = chapters.getJSONObject(i).optJSONObject("serie") ?: continue
+                val id = seriesJson.optInt("id")
+                if (id == 0 || series.containsKey(id)) continue
+                val manga = parseMangaFromJson(seriesJson)
+                if (query.isNotEmpty() && !manga.title.contains(query, ignoreCase = true)) continue
+                if (filter.tags.any { selected -> manga.tags.none { it.key == selected.key } }) continue
+                series[id] = manga
+                if (series.size >= targetSize) break
+            }
+            if (response.isNull("next")) break
+            chapterPage++
+        }
+
+        return series.values.drop(start).take(20)
     }
 
     // ─── Parse Manga ───────────────────────────────────────────────────────────
