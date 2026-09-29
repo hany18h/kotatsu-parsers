@@ -6,7 +6,6 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
-import org.koitharu.kotatsu.parsers.network.UserAgents
 
 internal class MangaTekTest {
 
@@ -14,7 +13,7 @@ internal class MangaTekTest {
     fun usesChromeIdentityAcceptedByPublicPages() {
         val parser = MangaTek(MangaLoaderContextMock)
 
-        assertEquals(UserAgents.CHROME_MOBILE, parser.getRequestHeaders()["User-Agent"])
+        assertEquals(MangaTek.USER_AGENT, parser.getRequestHeaders()["User-Agent"])
     }
 
     @Test

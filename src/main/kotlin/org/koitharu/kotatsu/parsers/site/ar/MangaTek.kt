@@ -9,7 +9,6 @@ import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
-import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
 import java.util.*
@@ -19,7 +18,7 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     PagedMangaParser(loaderContext, MangaParserSource.MANGATEK, pageSize = 24) {
 
     override val configKeyDomain = ConfigKey.Domain("mangatek.com")
-    override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_MOBILE)
+    override val userAgentKey = ConfigKey.UserAgent(USER_AGENT)
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
@@ -300,12 +299,16 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     }
 
     /**
-     * MangaTek sometimes rejects OkHttp's network fingerprint and asks the app
-     * for a CAPTCHA although the public page opens normally in Chrome. Load the
-     * same public HTML through WebView first, then keep HTTP as a lightweight
-     * fallback for devices where WebView is unavailable.
+     * The site's current public pages reject the older Chrome 114 identity with
+     * HTTP 403. Try the current browser identity over HTTP first, then let
+     * WebView load the same public page if the HTTP client is still challenged.
      */
     private suspend fun loadDocument(url: String, readySelector: String): Document {
+        val directResult = runCatchingCancellable {
+            webClient.httpGet(url, siteHeaders("https://$domain/")).parseHtml()
+        }
+        directResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
+
         val quotedSelector = JSONObject.quote(readySelector)
         val webViewResult = runCatchingCancellable {
             val rawResult = loaderContext.evaluateJs(
@@ -321,11 +324,6 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
             decodeWebViewString(rawResult)?.let { Jsoup.parse(it, url) }
         }
         webViewResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
-
-        val directResult = runCatchingCancellable {
-            webClient.httpGet(url, siteHeaders("https://$domain/")).parseHtml()
-        }
-        directResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
 
         webViewResult.exceptionOrNull()?.let { throw it }
         directResult.exceptionOrNull()?.let { throw it }
@@ -375,6 +373,9 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     }
 
     internal companion object {
+        internal const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+
         private val CAPTCHA_MARKERS = listOf(
             "captcha",
             "cf-turnstile",
