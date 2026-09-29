@@ -65,7 +65,11 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 			val path = if (page <= 1) root else "${root}page/$page/"
 			"https://$domain$path?m_orderby=$sort"
 		}
-		val doc = loadPublicDocument(url, "https://$domain/")
+		val doc = loadPublicDocument(
+			url,
+			"https://$domain/",
+			"article.nhv-library-card, div.row.c-tabs-item__content",
+		)
 
 		return doc.select("article.nhv-library-card, div.row.c-tabs-item__content").mapNotNull { card ->
 			val link = card.selectFirst(".nhv-library-card__title a, .post-title a, h3 a, h4 a")
@@ -99,7 +103,11 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val pageUrl = manga.url.substringBefore('#').toAbsoluteUrl(domain)
-		val doc = loadPublicDocument(pageUrl, "https://$domain/cont/")
+		val doc = loadPublicDocument(
+			pageUrl,
+			"https://$domain/cont/",
+			"h1.nhv-novel-title, div.post-title h1",
+		)
 		val state = parseState(
 			doc.selectFirst(".nhv-novel-status, .post-status .summary-content")?.text().orEmpty(),
 		)
@@ -214,7 +222,12 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 
 		// Use only the public reader page. Its markup is randomized on every
 		// response, so bypass cached/304 bodies and locate the stable chapter marker.
-		val doc = loadPublicDocument(cleanUrl, "https://$domain/", noCache = true)
+		val doc = loadPublicDocument(
+			cleanUrl,
+			"https://$domain/",
+			".reading-content p, .reading-content img",
+			noCache = true,
+		)
 		val content = findDirectChapterContent(doc, locator) ?: return null
 
 		sanitizeChapterContent(content)
@@ -246,6 +259,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 	private suspend fun loadPublicDocument(
 		url: String,
 		referer: String,
+		readySelector: String,
 		noCache: Boolean = false,
 	): Document {
 		// Prefer the server-rendered public HTML. Android WebView is only a
@@ -256,18 +270,20 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		directResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
 
 		val webViewResult = runCatchingCancellable {
+			val quotedSelector = JSONObject.quote(readySelector)
 			val rawResult = loaderContext.evaluateJs(
 				url,
 				"""
 				(function() {
 				  if (document.readyState === 'loading') return null;
+				  if (!document.querySelector($quotedSelector)) return null;
 				  return document.documentElement ? document.documentElement.outerHTML : null;
 				})()
 				""".trimIndent(),
 			) ?: return@runCatchingCancellable null
 			decodeWebViewString(rawResult)?.let { Jsoup.parse(it, url) }
 		}
-		webViewResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
+		webViewResult.getOrNull()?.takeIf { isReadyDocument(it, readySelector) }?.let { return it }
 		directResult.exceptionOrNull()?.let { throw it }
 		webViewResult.exceptionOrNull()?.let { throw it }
 		error("Cenele returned a server block page instead of public content")
@@ -288,6 +304,9 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		.build()
 
 	internal companion object {
+		internal fun isReadyDocument(document: Document, selector: String): Boolean =
+			!isBlockedDocument(document) && document.selectFirst(selector) != null
+
 		internal fun selectPublicChapterElements(doc: Document): org.jsoup.select.Elements =
 			doc.select(".nhv-novel-recent__list li.wp-manga-chapter, ul.main li.wp-manga-chapter")
 
