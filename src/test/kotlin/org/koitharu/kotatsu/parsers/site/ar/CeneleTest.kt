@@ -40,6 +40,18 @@ internal class CeneleTest {
 	}
 
 	@Test
+	fun waitsForRealContentAfterBrowserChallenge() {
+		val challenge = Jsoup.parse("<title>Checking your browser</title><main>Please wait</main>")
+		val blocked = Jsoup.parse("<h1>Sorry, you have been blocked</h1><article class='nhv-library-card'></article>")
+		val library = Jsoup.parse("<article class='nhv-library-card'><h3>رواية</h3></article>")
+		val selector = "article.nhv-library-card"
+
+		assertFalse(Cenele.isReadyDocument(challenge, selector))
+		assertFalse(Cenele.isReadyDocument(blocked, selector))
+		assertTrue(Cenele.isReadyDocument(library, selector))
+	}
+
+	@Test
 	fun acceptsArticleAsChapterContentContainer() {
 		val document = Jsoup.parse(
 			"""<article class="text-left"><p>chapter body</p></article>""",
