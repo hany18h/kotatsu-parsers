@@ -9,6 +9,21 @@ import org.junit.jupiter.api.Test
 internal class CeneleTest {
 
 	@Test
+	fun readsOnlyChapterLinksPublishedInPublicHtml() {
+		val document = Jsoup.parse(
+			"""
+			<ul class="nhv-novel-chapters-list nhv-novel-recent__list">
+			  <li class="wp-manga-chapter" data-chapter-id="22"><a href="/cont/novel/chapter-22/">الفصل 22</a></li>
+			  <li class="wp-manga-chapter" data-chapter-id="21"><a href="/cont/novel/chapter-21/">الفصل 21</a></li>
+			</ul>
+			<div id="novel-chapters"><div class="nhv-chapter-drawer__list"></div></div>
+			""".trimIndent(),
+		)
+
+		assertEquals(2, Cenele.selectPublicChapterElements(document).size)
+	}
+
+	@Test
 	fun decodesPublicPageHtmlReturnedByWebView() {
 		val encoded = "\"\\u003Chtml\\u003E\\u003Cbody\\u003Echapter\\u003C/body\\u003E\\u003C/html\\u003E\""
 

@@ -29,4 +29,4 @@ jobs:
             run: ./gradlew compileKotlin
 
         -   name: Test changed Arabic parsers
-            run: ./gradlew test --tests org.koitharu.kotatsu.parsers.site.ar.MangaTekTest --tests org.koitharu.kotatsu.parsers.site.ar.AzoramoonTest
+            run: ./gradlew test --tests org.koitharu.kotatsu.parsers.site.ar.MangaTekTest --tests org.koitharu.kotatsu.parsers.site.ar.AzoramoonTest --tests org.koitharu.kotatsu.parsers.site.ar.CeneleTest --tests org.koitharu.kotatsu.parsers.site.ar.CeneleChapterLocatorTest
