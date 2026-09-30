@@ -47,6 +47,16 @@ public abstract class MangaLoaderContext {
 	public abstract suspend fun evaluateJs(baseUrl: String, script: String): String?
 
 	/**
+	 * Execute JavaScript with the same request headers as the source's HTTP
+	 * requests. Older hosts may ignore the headers and use their default browser.
+	 */
+	public open suspend fun evaluateJs(
+		baseUrl: String,
+		script: String,
+		headers: Map<String, String>,
+	): String? = evaluateJs(baseUrl, script)
+
+	/**
 	 * Open [url] in browser for some external action (e.g. captcha solving or non cookie-based authorization)
 	 */
 	public open fun requestBrowserAction(parser: MangaParser, url: String): Nothing {
