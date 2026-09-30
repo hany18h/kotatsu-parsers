@@ -327,6 +327,10 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 			"""\.([A-Za-z][\w-]*)\s*\{[^{}]*display\s*:\s*none(?:\s*!important)?[^{}]*\}""",
 			RegexOption.IGNORE_CASE,
 		)
+		private val VISUALLY_HIDDEN_CSS_CLASS = Regex(
+			"""\.([A-Za-z][\w-]*)\s*\{(?=[^{}]*position\s*:\s*absolute)(?=[^{}]*width\s*:\s*1px)(?=[^{}]*height\s*:\s*1px)[^{}]*\}""",
+			RegexOption.IGNORE_CASE,
+		)
 		private const val HTML_LIBRARY_PAGE_SIZE = 10
 		private val CENELE_GENRES = listOf(
 			"أكشن", "استراتجي", "انتقام", "بالغ", "بطل شرير", "بناء مملكة", "بوليسي",
@@ -367,8 +371,14 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		}
 
 		internal fun sanitizeChapterContent(content: Element): Element {
+			// These server-rendered blocks are invisible on Cenele but become
+			// visible when the chapter HTML is displayed without the site's CSS.
+			content.select("[data-nhv-reader-promo], [inert][data-nosnippet]").remove()
+
 			val hiddenClasses = content.select("style").flatMap { style ->
-				HIDDEN_CSS_CLASS.findAll(style.data() + style.html()).map { it.groupValues[1] }.toList()
+				val css = style.data() + style.html()
+				HIDDEN_CSS_CLASS.findAll(css).map { it.groupValues[1] }.toList() +
+					VISUALLY_HIDDEN_CSS_CLASS.findAll(css).map { it.groupValues[1] }.toList()
 			}.distinct()
 			hiddenClasses.forEach { className -> content.getElementsByClass(className).remove() }
 

@@ -245,4 +245,33 @@ internal class CeneleTest {
 		assertTrue(content.text().contains("الفقرة الحقيقية الثانية"))
 		assertFalse(content.text().contains("نص طُعم متغير"))
 	}
+
+	@Test
+	fun removesCurrentSitePromosAndInvisibleWatermarksWithoutLosingStory() {
+		val document = Jsoup.parse(
+			"""
+			<novel-chapter>
+			  <input type="hidden" id="chapter-url-123" value="/cont/example/chapter-1/">
+			  <div class="nhv-reader-promo" data-nhv-reader-promo="start">حمّل تطبيق فضاء الروايات</div>
+			  <style>.reading-content .refd54feb3810b13{position:absolute!important;width:1px!important;height:1px!important;overflow:hidden!important}</style>
+			  <section class="refd54feb3810b13" inert data-nosnippet="true">بقي الأثر واضحًا على السطح. هـٰـذَا اﻟـتـطـبـيـق يـسـرـق 40e209874d</section>
+			  <p>أصبحت أنا وكيريكو أصدقاء مراسلة في الخريف.</p>
+			  <div class="refd54feb3810b13">إعلان مخفي آخر</div>
+			  <p>كان آخر يوم لي في المدرسة.</p>
+			  <p><img src="https://cenele.com/story-image.jpg"></p>
+			  <div class="nhv-reader-promo" data-nhv-reader-promo="end">تطبيق فضاء الروايات الرسمي</div>
+			</novel-chapter>
+			""".trimIndent(),
+		)
+		val content = document.selectFirst("novel-chapter")!!
+
+		Cenele.sanitizeChapterContent(content)
+
+		assertTrue(content.text().contains("أصبحت أنا وكيريكو"))
+		assertTrue(content.text().contains("كان آخر يوم"))
+		assertEquals(1, content.select("img").size)
+		assertFalse(content.text().contains("يسرق"))
+		assertFalse(content.text().contains("إعلان مخفي"))
+		assertFalse(content.text().contains("تطبيق فضاء الروايات"))
+	}
 }
