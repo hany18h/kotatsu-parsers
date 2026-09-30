@@ -280,6 +280,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 				  return document.documentElement ? document.documentElement.outerHTML : null;
 				})()
 				""".trimIndent(),
+				mapOf("User-Agent" to config[userAgentKey], "Referer" to referer),
 			) ?: return@runCatchingCancellable null
 			decodeWebViewString(rawResult)?.let { Jsoup.parse(it, url) }
 		}
