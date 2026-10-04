@@ -3,10 +3,24 @@ package org.koitharu.kotatsu.parsers.site.ar
 import org.jsoup.Jsoup
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 internal class CeneleTest {
+
+	@Test
+	fun readsPublicChapterListParametersFromTheNovelPage() {
+		val document = Jsoup.parse(
+			"""
+			<div data-manga-id="7715"></div>
+			<script>window.nhvChapters = {"postId":"7715","chaptersNonce":"01a510b36c"};</script>
+			""".trimIndent(),
+		)
+
+		assertEquals("7715" to "01a510b36c", Cenele.chapterListRequest(document))
+		assertNull(Cenele.chapterListRequest(Jsoup.parse("<div data-manga-id='7715'></div>")))
+	}
 
 	@Test
 	fun readsOnlyChapterLinksPublishedInPublicHtml() {

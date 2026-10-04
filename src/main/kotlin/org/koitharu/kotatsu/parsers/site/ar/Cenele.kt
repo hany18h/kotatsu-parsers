@@ -1,6 +1,8 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
+import okhttp3.CookieJar
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -10,6 +12,8 @@ import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
+import org.koitharu.kotatsu.parsers.network.OkHttpWebClient
+import org.koitharu.kotatsu.parsers.network.WebClient
 import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
 import java.util.*
@@ -17,6 +21,15 @@ import java.util.*
 @MangaSourceParser("CENELE", "فضاء الروايات", "ar", ContentType.NOVEL)
 internal class Cenele(private val loaderContext: MangaLoaderContext) :
 	PagedMangaParser(loaderContext, MangaParserSource.CENELE, pageSize = HTML_LIBRARY_PAGE_SIZE) {
+	private val publicChapterClient: WebClient by lazy {
+		OkHttpWebClient(
+			loaderContext.httpClient.newBuilder()
+				.cookieJar(CookieJar.NO_COOKIES)
+				.cache(null)
+				.build(),
+			source,
+		)
+	}
 
 	init {
 		setFirstPage(firstPage = 1, firstPageForSearch = 1)
@@ -135,7 +148,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 			state = state ?: manga.state,
 			authors = authors,
 			tags = tags,
-			chapters = loadChapters(doc),
+			chapters = loadChapters(pageUrl, doc),
 		)
 	}
 
@@ -143,10 +156,56 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		doc.selectFirst(".nhv-novel-synopsis, div.summary__content, .manga-excerpt .excerpt-content")
 			?.html()?.trim()?.takeIf(String::isNotEmpty)
 
-	private fun loadChapters(doc: Document): List<MangaChapter> {
-		val mangaId = doc.selectFirst("[data-manga-id]")?.attr("data-manga-id")
-			?.takeIf(String::isNotBlank)
+	private suspend fun loadChapters(pageUrl: String, doc: Document): List<MangaChapter> {
+		val request = chapterListRequest(doc)
+		val mangaId = request?.first
+			?: doc.selectFirst("[data-manga-id]")?.attr("data-manga-id")?.takeIf(String::isNotBlank)
 			?: doc.selectFirst("#manga-chapters-holder")?.attr("data-id")?.takeIf(String::isNotBlank)
+		if (request != null) {
+			val items = org.jsoup.select.Elements()
+			val seen = HashSet<String>()
+			for (page in 1..MAX_CHAPTER_PAGES) {
+				val response = publicChapterClient.httpPost(
+					"https://$domain/wp-admin/admin-ajax.php".toHttpUrl(),
+					mapOf(
+						"action" to "nhv_manga_single_chapters_page",
+						"nonce" to request.second,
+						"manga_id" to request.first,
+						"volume" to "-1",
+						"page" to page.toString(),
+						"per_page" to CHAPTERS_PER_PAGE.toString(),
+						"order" to "desc",
+					),
+					Headers.Builder()
+						.add("Accept", "application/json")
+						.add("Referer", pageUrl)
+						.add("X-Requested-With", "XMLHttpRequest")
+						.add("User-Agent", config[userAgentKey])
+						.build(),
+				).parseJson()
+				check(response.optBoolean("success")) { "Cenele rejected the public chapter list request" }
+				val fragment = Jsoup.parseBodyFragment(response.optString("html"), pageUrl)
+				val pageItems = fragment.select("li.wp-manga-chapter")
+				val countBeforePage = seen.size
+				for (item in pageItems) {
+					val key = item.attr("data-chapter-id").ifBlank {
+						item.selectFirst("a[href]")?.attr("href").orEmpty()
+					}
+					if (key.isNotBlank() && seen.add(key)) items.add(item)
+				}
+				check(pageItems.isEmpty() || seen.size > countBeforePage) {
+					"Cenele chapter list stopped advancing"
+				}
+				if (!response.optBoolean("has_more")) {
+					if (items.isNotEmpty()) return parseChapterElements(items, mangaId)
+					break
+				}
+				check(pageItems.isNotEmpty()) {
+					"Cenele chapter list stopped advancing"
+				}
+			}
+			if (items.isNotEmpty()) error("Cenele chapter list exceeded $MAX_CHAPTER_PAGES pages")
+		}
 		val chapters = parseChapterElements(selectPublicChapterElements(doc), mangaId)
 		val firstChapter = doc.select("a[href]:contains(ابدأ القراءة)")
 			.firstOrNull { "/cont/" in it.attr("href") }
@@ -305,6 +364,19 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		.build()
 
 	internal companion object {
+		private const val CHAPTERS_PER_PAGE = 100
+		private const val MAX_CHAPTER_PAGES = 50
+		private val CHAPTERS_POST_ID = Regex("""["']postId["']\s*:\s*["']?(\d+)""")
+		private val CHAPTERS_NONCE = Regex("""["']chaptersNonce["']\s*:\s*["']([^"']+)""")
+
+		internal fun chapterListRequest(doc: Document): Pair<String, String>? {
+			val scripts = doc.select("script").joinToString("\n") { it.data() + it.html() }
+			val id = CHAPTERS_POST_ID.find(scripts)?.groupValues?.getOrNull(1)
+				?: doc.selectFirst("[data-manga-id]")?.attr("data-manga-id")
+			val nonce = CHAPTERS_NONCE.find(scripts)?.groupValues?.getOrNull(1)
+			return if (id.isNullOrBlank() || nonce.isNullOrBlank()) null else id to nonce
+		}
+
 		internal fun isReadyDocument(document: Document, selector: String): Boolean =
 			!isBlockedDocument(document) && document.selectFirst(selector) != null
 
