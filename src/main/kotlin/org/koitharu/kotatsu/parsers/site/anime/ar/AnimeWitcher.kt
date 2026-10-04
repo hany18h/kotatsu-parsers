@@ -65,6 +65,8 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 	override val authUrl: String = "https://www.animewitcher.com/"
 
 	private val authMutex = Mutex()
+	private val catalogSettingsMutex = Mutex()
+	private var catalogCredentials: Pair<String, String>? = null
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.NEWEST,
@@ -186,11 +188,7 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 			.put("hitsPerPage", PAGE_SIZE)
 			.put("page", page - 1)
 			.put("attributesToRetrieve", ALGOLIA_ATTRIBUTES)
-		val headers = Headers.Builder()
-			.add("X-Algolia-Application-Id", ALGOLIA_APP_ID)
-			.add("X-Algolia-API-Key", ALGOLIA_SEARCH_KEY)
-			.build()
-		val response = queryAlgolia(index, body, headers)
+		val response = queryAlgolia(index, body)
 		val hits = response.optJSONArray("hits") ?: return emptyList()
 		return buildList {
 			for (i in 0 until hits.length()) {
@@ -199,19 +197,36 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 		}.distinctBy(Manga::id)
 	}
 
-	private suspend fun queryAlgolia(index: String, body: JSONObject, headers: Headers): JSONObject {
+	private suspend fun getCatalogCredentials(forceRefresh: Boolean): Pair<String, String> =
+		catalogSettingsMutex.withLock {
+			if (!forceRefresh) catalogCredentials?.let { return@withLock it }
+			val settings = fetchDocument("Settings", "constants")
+			val credentials = extractAlgoliaCatalogCredentials(settings)
+				?: throw IllegalStateException("AnimeWitcher catalog settings are unavailable")
+			catalogCredentials = credentials
+			credentials
+		}
+
+	private suspend fun queryAlgolia(index: String, body: JSONObject): JSONObject {
 		var lastError: Exception? = null
-		for (host in ALGOLIA_READ_HOSTS) {
-			try {
-				return webClient.httpPost(
-					"https://$host/1/indexes/$index/query".toHttpUrl(),
-					body,
-					headers,
-				).parseJson()
-			} catch (error: CancellationException) {
-				throw error
-			} catch (error: Exception) {
-				lastError = error
+		repeat(2) { attempt ->
+			val (appId, searchKey) = getCatalogCredentials(forceRefresh = attempt != 0)
+			val headers = Headers.Builder()
+				.add("X-Algolia-Application-Id", appId)
+				.add("X-Algolia-API-Key", searchKey)
+				.build()
+			for (host in algoliaReadHosts(appId)) {
+				try {
+					return webClient.httpPost(
+						"https://$host/1/indexes/$index/query".toHttpUrl(),
+						body,
+						headers,
+					).parseJson()
+				} catch (error: CancellationException) {
+					throw error
+				} catch (error: Exception) {
+					lastError = error
+				}
 			}
 		}
 		throw lastError ?: IllegalStateException("AnimeWitcher catalog is unavailable")
@@ -881,14 +896,20 @@ internal class AnimeWitcher(context: MangaLoaderContext) : PagedMangaParser(
 		private const val MAX_FIRESTORE_PAGES = 20
 		private const val ANIME_PATH = "/anime/"
 		private const val EPISODE_PATH = "/episode/"
-		private const val ALGOLIA_APP_ID = "D8LH9I7ZL7"
-		private const val ALGOLIA_SEARCH_KEY = "b56c01ef52540ef334bcdbaa00ded9e4"
-		internal val ALGOLIA_READ_HOSTS = listOf(
-			"$ALGOLIA_APP_ID-dsn.algolia.net",
-			"$ALGOLIA_APP_ID-1.algolianet.com",
-			"$ALGOLIA_APP_ID-2.algolianet.com",
-			"$ALGOLIA_APP_ID-3.algolianet.com",
+		internal fun algoliaReadHosts(appId: String) = listOf(
+			"$appId-dsn.algolia.net",
+			"$appId-1.algolianet.com",
+			"$appId-2.algolianet.com",
+			"$appId-3.algolianet.com",
 		)
+
+		internal fun extractAlgoliaCatalogCredentials(document: JSONObject): Pair<String, String>? {
+			val settings = document.optJSONObject("fields")?.firestoreMap("search_settings") ?: return null
+			val appId = settings.firestoreString("app_id_v4") ?: return null
+			val browseKey = settings.firestoreString("browse_api_key") ?: return null
+			if (!appId.matches(Regex("[A-Za-z0-9]+"))) return null
+			return appId to browseKey
+		}
 		private const val FIREBASE_API_KEY = "AIzaSyAcbWRwfFNnCpoydDXlEALWnM_TYVcJOMU"
 		private const val FIRESTORE_DOCUMENTS =
 			"https://firestore.googleapis.com/v1/projects/animewitcher-1c66d/databases/(default)/documents"

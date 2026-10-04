@@ -1,5 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.anime.ar
 
+import org.json.JSONObject
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Test
@@ -7,15 +8,29 @@ import org.junit.jupiter.api.Test
 internal class AnimeWitcherTest {
 
 	@Test
-	fun usesOfficialAlgoliaFallbackHosts() {
+	fun usesCurrentAlgoliaApplicationForFallbackHosts() {
 		assertEquals(
 			listOf(
-				"D8LH9I7ZL7-dsn.algolia.net",
-				"D8LH9I7ZL7-1.algolianet.com",
-				"D8LH9I7ZL7-2.algolianet.com",
-				"D8LH9I7ZL7-3.algolianet.com",
+				"CURRENTID-dsn.algolia.net",
+				"CURRENTID-1.algolianet.com",
+				"CURRENTID-2.algolianet.com",
+				"CURRENTID-3.algolianet.com",
 			),
-			AnimeWitcher.ALGOLIA_READ_HOSTS,
+			AnimeWitcher.algoliaReadHosts("CURRENTID"),
+		)
+	}
+
+	@Test
+	fun readsCatalogSettingsFromOfficialFirestoreDocument() {
+		val document = JSONObject(
+			"""{"fields":{"search_settings":{"mapValue":{"fields":{
+				"app_id_v4":{"stringValue":"CURRENTID"},
+				"browse_api_key":{"stringValue":"current-search-key"}
+			}}}}}""",
+		)
+		assertEquals(
+			"CURRENTID" to "current-search-key",
+			AnimeWitcher.extractAlgoliaCatalogCredentials(document),
 		)
 	}
 
