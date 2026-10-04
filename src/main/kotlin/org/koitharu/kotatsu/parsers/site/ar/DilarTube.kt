@@ -31,6 +31,7 @@ import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
 import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 @MangaSourceParser("DILARTUBE", "Dilar Tube", "ar", ContentType.MANGA)
@@ -345,7 +346,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
             apiHeaders(clientToken)
                 .newBuilder()
                 .add("X-DH-Pub", publicKeyHeader)
-                .add("X-Crypto-Caps", "1,10,11,12")
+                .add("X-Crypto-Caps", "1,10,11,12,13")
                 .apply {
                     freePass?.let { add("X-Unlock-Free-Chapter", it) }
                 }
@@ -361,7 +362,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         clientPublicKey: ByteArray,
     ): JSONObject {
         val version = envelope.getInt("v")
-        require(version == 1 || version == 10 || version == 11 || version == 12) {
+        require(version == 1 || version == 10 || version == 11 || version == 12 || version == 13) {
             "Unsupported Dilar encryption version: $version"
         }
         val serverPublicKeyRaw = decodeBase64Url(envelope.getString("epk"))
@@ -384,7 +385,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         }
         val envelopeIv = decodeBase64Url(envelope.getString("iv"))
         val epoch = envelope.getLong("e")
-        val (aesKey, nonce) = when (version) {
+        val (key, nonce) = when (version) {
             1 -> {
                 val material = hkdf(
                     sharedSecret,
@@ -437,26 +438,35 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
                 material.copyOfRange(0, 32) to material.copyOfRange(32, 44)
             }
 
+            13 -> {
+                // Dilar now uses a derived nonce and ChaCha20-Poly1305, with
+                // the full HMAC-SHA512 output as HKDF salt.
+                val material = deriveV13KeyMaterial(
+                    sharedSecret,
+                    clientPublicKey,
+                    serverPublicKeyRaw,
+                    envelopeIv,
+                    epoch,
+                )
+                material.copyOfRange(0, 32) to material.copyOfRange(32, 44)
+            }
+
             else -> error("Unsupported Dilar encryption version: $version")
         }
         val encryptedPayload = decodeBase64Url(envelope.getString("ct"))
         val cipherText = encryptedPayload + decodeBase64Url(envelope.getString("tag"))
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(
-            Cipher.DECRYPT_MODE,
-            SecretKeySpec(aesKey, "AES"),
-            GCMParameterSpec(128, nonce),
-        )
-        if (version == 12) {
-            cipher.updateAAD(
-                buildV12AdditionalData(
-                    version,
-                    epoch,
-                    serverPublicKeyRaw,
-                    envelopeIv,
-                    encryptedPayload.size,
-                ),
-            )
+        val cipher = if (version == 13) {
+            Cipher.getInstance("ChaCha20-Poly1305").apply {
+                init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "ChaCha20"), IvParameterSpec(nonce))
+                updateAAD(buildV13AdditionalData(epoch, serverPublicKeyRaw, envelopeIv, encryptedPayload.size))
+            }
+        } else {
+            Cipher.getInstance("AES/GCM/NoPadding").apply {
+                init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
+                if (version == 12) {
+                    updateAAD(buildV12AdditionalData(version, epoch, serverPublicKeyRaw, envelopeIv, encryptedPayload.size))
+                }
+            }
         }
         return JSONObject(String(cipher.doFinal(cipherText), StandardCharsets.UTF_8))
     }
@@ -505,6 +515,28 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         return hkdf(sharedSecret, salt, info, 44, "SHA-384")
     }
 
+    internal fun deriveV13KeyMaterial(
+        sharedSecret: ByteArray,
+        clientPublicKey: ByteArray,
+        serverPublicKey: ByteArray,
+        envelopeIv: ByteArray,
+        epoch: Long,
+    ): ByteArray {
+        val salt = hmac(
+            "HmacSHA512",
+            clientPublicKey,
+            lengthPrefixed(serverPublicKey, envelopeIv),
+        )
+        val ivFingerprint = digest("SHA-512", lengthPrefixed(envelopeIv))
+            .toByteString()
+            .base64Url()
+            .trimEnd('=')
+            .take(22)
+        val info = "dilar.response.ecies.v13|$epoch|$ivFingerprint"
+            .toByteArray(StandardCharsets.UTF_8)
+        return hkdf(sharedSecret, salt, info, 44, "SHA-512")
+    }
+
     internal fun buildV12AdditionalData(
         version: Int,
         epoch: Long,
@@ -516,6 +548,23 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         lengthPrefixed(
             "dilar.response.ecies.v12".toByteArray(StandardCharsets.UTF_8),
             version.toString().toByteArray(StandardCharsets.UTF_8),
+            epoch.toString().toByteArray(StandardCharsets.UTF_8),
+            serverPublicKey,
+            envelopeIv,
+            int32BigEndian(cipherTextLength),
+        ),
+    )
+
+    internal fun buildV13AdditionalData(
+        epoch: Long,
+        serverPublicKey: ByteArray,
+        envelopeIv: ByteArray,
+        cipherTextLength: Int,
+    ): ByteArray = digest(
+        "SHA-256",
+        lengthPrefixed(
+            "dilar.response.ecies.v13".toByteArray(StandardCharsets.UTF_8),
+            "13".toByteArray(StandardCharsets.UTF_8),
             epoch.toString().toByteArray(StandardCharsets.UTF_8),
             serverPublicKey,
             envelopeIv,
