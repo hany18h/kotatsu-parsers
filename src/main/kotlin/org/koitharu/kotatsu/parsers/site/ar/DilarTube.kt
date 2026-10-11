@@ -21,6 +21,7 @@ import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
+import java.security.NoSuchAlgorithmException
 import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.ECPoint
@@ -30,6 +31,7 @@ import java.util.*
 import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
 import javax.crypto.Mac
+import javax.crypto.NoSuchPaddingException
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -336,6 +338,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         clientToken: String,
         freePass: String?,
     ): JSONObject {
+        if (useCurrentWebClient) return loadWithCurrentWebClient(url, clientToken, freePass)
         val keyPair = KeyPairGenerator.getInstance("EC").apply {
             initialize(ECGenParameterSpec("secp256r1"))
         }.generateKeyPair()
@@ -346,14 +349,39 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
             apiHeaders(clientToken)
                 .newBuilder()
                 .add("X-DH-Pub", publicKeyHeader)
-                .add("X-Crypto-Caps", "1,10,11,12,13,15")
+                .add("X-Crypto-Caps", NATIVE_CRYPTO_CAPABILITIES)
                 .apply {
                     freePass?.let { add("X-Unlock-Free-Chapter", it) }
                 }
                 .build(),
         ).parseJson()
         if (!envelope.has("epk") || !envelope.has("ct")) return envelope
-        return decryptResponseEnvelope(envelope, keyPair, publicKey)
+        // Never assume a future version uses today's cipher. Let the website's
+        // current authenticated client negotiate and open its own response.
+        if (!supportsNativeVersion(envelope.getInt("v"))) {
+            useCurrentWebClient = true
+            return loadWithCurrentWebClient(url, clientToken, freePass)
+        }
+        return try {
+            decryptResponseEnvelope(envelope, keyPair, publicKey)
+        } catch (_: NoSuchAlgorithmException) {
+            // Older Android providers may not expose ChaCha20-Poly1305.
+            useCurrentWebClient = true
+            loadWithCurrentWebClient(url, clientToken, freePass)
+        } catch (_: NoSuchPaddingException) {
+            useCurrentWebClient = true
+            loadWithCurrentWebClient(url, clientToken, freePass)
+        }
+    }
+
+    private suspend fun loadWithCurrentWebClient(url: String, clientToken: String, freePass: String?): JSONObject {
+        val baseUrl = "https://$domain/"
+        val result = loaderContext.evaluateJs(
+            baseUrl,
+            DilarWebClient.buildScript(baseUrl, url, clientToken, freePass, UUID.randomUUID().toString()),
+            apiHeaders(clientToken).toMap(),
+        )
+        return DilarWebClient.parseResult(result, url)
     }
 
     private fun decryptResponseEnvelope(
@@ -362,7 +390,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         clientPublicKey: ByteArray,
     ): JSONObject {
         val version = envelope.getInt("v")
-        require(version == 1 || version == 10 || version == 11 || version == 12 || version == 13 || version == 15) {
+        require(supportsNativeVersion(version)) {
             "Unsupported Dilar encryption version: $version"
         }
         val serverPublicKeyRaw = decodeBase64Url(envelope.getString("epk"))
@@ -456,6 +484,11 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
                 material.copyOfRange(0, 64) to material.copyOfRange(64, 76)
             }
 
+            16 -> {
+                val material = deriveV16KeyMaterial(sharedSecret, clientPublicKey, serverPublicKeyRaw, envelopeIv, epoch)
+                material.copyOfRange(0, 32) to material.copyOfRange(32, 56)
+            }
+
             else -> error("Unsupported Dilar encryption version: $version")
         }
         val encryptedPayload = decodeBase64Url(envelope.getString("ct"))
@@ -469,6 +502,13 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
             return JSONObject(String(plaintext, StandardCharsets.UTF_8))
         }
         val cipherText = encryptedPayload + decodeBase64Url(envelope.getString("tag"))
+        if (version == 16) {
+            val plaintext = DilarXChaCha20.decrypt(
+                key, nonce, cipherText,
+                buildV16AdditionalData(epoch, serverPublicKeyRaw, envelopeIv, encryptedPayload.size),
+            )
+            return JSONObject(String(plaintext, StandardCharsets.UTF_8))
+        }
         val cipher = if (version == 13) {
             Cipher.getInstance("ChaCha20-Poly1305").apply {
                 init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "ChaCha20"), IvParameterSpec(nonce))
@@ -617,6 +657,37 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         ),
     )
 
+    internal fun deriveV16KeyMaterial(
+        sharedSecret: ByteArray,
+        clientPublicKey: ByteArray,
+        serverPublicKey: ByteArray,
+        envelopeIv: ByteArray,
+        epoch: Long,
+    ): ByteArray {
+        val salt = hmac("HmacSHA384", clientPublicKey + envelopeIv, lengthPrefixed(serverPublicKey))
+        val fingerprint = digest("SHA-384", lengthPrefixed(envelopeIv, serverPublicKey))
+            .toByteString().base64Url().trimEnd('=').take(22)
+        val info = "dilar.response.ecies.v16|$epoch|$fingerprint".toByteArray(StandardCharsets.UTF_8)
+        return hkdf(sharedSecret, salt, info, 56, "SHA-384")
+    }
+
+    internal fun buildV16AdditionalData(
+        epoch: Long,
+        serverPublicKey: ByteArray,
+        envelopeIv: ByteArray,
+        cipherTextLength: Int,
+    ): ByteArray = digest(
+        "SHA-256",
+        lengthPrefixed(
+            "dilar.response.ecies.v16".toByteArray(StandardCharsets.UTF_8),
+            "16".toByteArray(StandardCharsets.UTF_8),
+            epoch.toString().toByteArray(StandardCharsets.UTF_8),
+            serverPublicKey,
+            envelopeIv,
+            int32BigEndian(cipherTextLength),
+        ),
+    )
+
     private suspend fun readClientToken(): String? {
         val result = loaderContext.evaluateJs(
             "https://$domain/",
@@ -740,6 +811,9 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
 
     private var cachedClientToken: String? = null
 
+    @Volatile
+    private var useCurrentWebClient = false
+
     private fun encodeRawPublicKey(publicKey: ECPublicKey): ByteArray {
         val coordinateSize = (publicKey.params.curve.field.fieldSize + 7) / 8
         return byteArrayOf(4) +
@@ -820,6 +894,13 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
     }
 
     internal companion object {
+        const val NATIVE_CRYPTO_CAPABILITIES = "1,10,11,12,13,15,16"
+
+        fun supportsNativeVersion(version: Int): Boolean = when (version) {
+            1, 10, 11, 12, 13, 15, 16 -> true
+            else -> false
+        }
+
         fun requiresClientReenrollment(statusCode: Int): Boolean = statusCode == 403 || statusCode == 428
     }
 }
