@@ -1,6 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -8,10 +9,15 @@ import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.ContentUnavailableException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
+import java.security.MessageDigest
 import java.util.*
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 @MangaSourceParser("MANGATEK", "MangaTek", "ar", ContentType.MANGA)
 internal class MangaTek(private val loaderContext: MangaLoaderContext) :
@@ -281,21 +287,66 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val fullUrl = chapter.url.toAbsoluteUrl(domain)
-        val doc = loadDocument(fullUrl, "div.manga-page img[src], div.manga-page img[data-src]")
+        val doc = loadDocument(fullUrl, "div.manga-page img[src], div.manga-page img[data-src], div.manga-page img[data-url]")
         
-        // تنظيف صفحة القراءة من العناصر المزعجة
-        cleanDocument(doc)
-        
-        return doc.select("div.manga-page img[src], div.manga-page img[data-src]").mapIndexed { index, img ->
-            val imageUrl = img.attr("src").ifEmpty { img.attr("data-src") }.toAbsoluteUrl(domain)
-            
+        val imageUrls = extractReaderImageUrls(doc, domain)
+        if (imageUrls.isEmpty()) throw ContentUnavailableException("MangaTek did not return any reader images")
+        // Do not silently return text-free images if unlocking fails. Such pages
+        // would otherwise be cached/downloaded as successfully completed chapters.
+        val overlayPages = loadOverlayPages(doc, imageUrls.size)
+        return imageUrls.mapIndexed { index, imageUrl ->
             MangaPage(
                 id = generateUid("${chapter.id}-$index"),
-                url = imageUrl,
+                url = overlayPages[index]?.let { buildOverlayPageUrl(imageUrl, it) } ?: imageUrl,
                 preview = null,
                 source = source,
             )
         }
+    }
+
+    override suspend fun getPageUrl(page: MangaPage): String = if (
+        page.url.startsWith(OVERLAY_PAGE_SCHEME, ignoreCase = true)
+    ) page.url else super.getPageUrl(page)
+
+    private suspend fun loadOverlayPages(document: Document, imageCount: Int): Map<Int, JSONObject> {
+        val rawProps = document.selectFirst("astro-island[component-url*='ChapterImageViewer']")?.attr("props")
+            ?.takeIf(String::isNotBlank) ?: return emptyMap()
+        val props = JSONObject(rawProps)
+        if (props.optJSONArray("textMode")?.optString(1) != "overlay") return emptyMap()
+        val token = props.optJSONArray("unlockToken")?.optString(1).orEmpty()
+        val chapterId = props.optJSONArray("chapterId")?.optLong(1) ?: 0L
+        if (token.isEmpty() || chapterId <= 0L) {
+            throw ContentUnavailableException("MangaTek speech text is missing its unlock token; reload the chapter")
+        }
+        val payload = JSONObject().put("chapterId", chapterId).put("token", token)
+            .put("proof", computeUnlockProof(token, chapterId))
+        val headers = siteHeaders("https://$domain/").newBuilder().set("Accept", "application/json").build()
+        val response = webClient.httpPost(OVERLAY_UNLOCK_URL.toHttpUrl(), payload, headers).parseJson()
+        if (!response.optBoolean("success")) {
+            throw ContentUnavailableException("MangaTek could not unlock speech text; retry the chapter")
+        }
+        val encrypted = response.optString("overlay")
+        val key = response.optString("key")
+        if (encrypted.isBlank() || key.isBlank()) {
+            throw ContentUnavailableException("MangaTek returned no speech text; retry the chapter")
+        }
+        val pages = decryptOverlayPages(encrypted, key)
+        if (pages.length() == 0) throw ContentUnavailableException("MangaTek speech overlay is empty")
+        val offset = response.optInt("overlay_page_offset", props.optJSONArray("overlayPageOffset")?.optInt(1) ?: 0)
+        val overlays = buildMap {
+            repeat(pages.length()) { position ->
+                val page = pages.getJSONObject(position)
+                val imageIndex = page.optInt("page_number", position + 1) + offset - 1
+                if ((page.optJSONArray("overlays")?.length() ?: 0) > 0) {
+                    if (imageIndex !in 0 until imageCount) {
+                        throw ContentUnavailableException("MangaTek speech text does not match the reader images")
+                    }
+                    put(imageIndex, page)
+                }
+            }
+        }
+        if (overlays.isEmpty()) throw ContentUnavailableException("MangaTek returned no speech overlays")
+        return overlays
     }
 
     /**
@@ -373,6 +424,41 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     }
 
     internal companion object {
+        private const val OVERLAY_UNLOCK_URL = "https://api.mangatek.com/api/reader/unlock"
+        private const val OVERLAY_PAGE_SCHEME = "mangatek-overlay://render"
+        private const val READER_PROOF_SALT = "80c55d2d1f1432551b82f5304b60e1aced87f823a6ed309d"
+
+        internal fun extractReaderImageUrls(document: Document, domain: String): List<String> = document
+            .select("div.manga-page img[data-url], div.manga-page img[data-src], div.manga-page img[src]")
+            .mapNotNull { image ->
+                sequenceOf("data-url", "data-src", "src").map { image.attr(it).trim() }
+                    .firstOrNull { it.isNotEmpty() && !it.startsWith("data:", ignoreCase = true) }
+                    ?.toAbsoluteUrl(domain)
+            }
+
+        internal fun computeUnlockProof(token: String, chapterId: Long): String = MessageDigest.getInstance("SHA-256")
+            .digest("$READER_PROOF_SALT|$token|$chapterId".toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+        internal fun decryptOverlayPages(encrypted: String, keyHex: String) = encrypted.split(':').let { parts ->
+            require(parts.size == 3) { "Invalid MangaTek overlay payload" }
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyHex.decodeHex(), "AES"), GCMParameterSpec(128, parts[0].decodeHex()))
+            JSONObject(String(cipher.doFinal(parts[1].decodeHex() + parts[2].decodeHex()), Charsets.UTF_8)).getJSONArray("pages")
+        }
+
+        internal fun buildOverlayPageUrl(imageUrl: String, overlay: JSONObject): String {
+            val encoder = Base64.getUrlEncoder().withoutPadding()
+            val image = encoder.encodeToString(imageUrl.toByteArray(Charsets.UTF_8))
+            val text = encoder.encodeToString(overlay.toString().toByteArray(Charsets.UTF_8))
+            return "$OVERLAY_PAGE_SCHEME?image=$image&overlay=$text"
+        }
+
+        private fun String.decodeHex(): ByteArray {
+            require(length % 2 == 0) { "Invalid MangaTek hexadecimal payload" }
+            return ByteArray(length / 2) { substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+        }
+
         internal const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 

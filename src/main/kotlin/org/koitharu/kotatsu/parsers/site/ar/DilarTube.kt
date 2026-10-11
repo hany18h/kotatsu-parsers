@@ -313,8 +313,8 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
 
     /**
      * Dilar encrypts chapter responses with an ephemeral P-256 ECDH key. The
-     * browser sends its raw public key in X-DH-Pub, then opens the returned
-     * AES-GCM envelope using HKDF-SHA256. Keep this local to the parser so no
+     * browser sends its raw public key in X-DH-Pub, then derives the key and
+     * authenticates the negotiated response envelope. Keep this local to the parser so no
      * account, shared secret, or device identifier is involved.
      */
     private suspend fun loadEncryptedJson(
@@ -346,7 +346,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
             apiHeaders(clientToken)
                 .newBuilder()
                 .add("X-DH-Pub", publicKeyHeader)
-                .add("X-Crypto-Caps", "1,10,11,12,13")
+                .add("X-Crypto-Caps", "1,10,11,12,13,15")
                 .apply {
                     freePass?.let { add("X-Unlock-Free-Chapter", it) }
                 }
@@ -362,7 +362,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         clientPublicKey: ByteArray,
     ): JSONObject {
         val version = envelope.getInt("v")
-        require(version == 1 || version == 10 || version == 11 || version == 12 || version == 13) {
+        require(version == 1 || version == 10 || version == 11 || version == 12 || version == 13 || version == 15) {
             "Unsupported Dilar encryption version: $version"
         }
         val serverPublicKeyRaw = decodeBase64Url(envelope.getString("epk"))
@@ -451,9 +451,23 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
                 material.copyOfRange(0, 32) to material.copyOfRange(32, 44)
             }
 
+            15 -> {
+                val material = deriveV15KeyMaterial(sharedSecret, clientPublicKey, serverPublicKeyRaw, envelopeIv, epoch)
+                material.copyOfRange(0, 64) to material.copyOfRange(64, 76)
+            }
+
             else -> error("Unsupported Dilar encryption version: $version")
         }
         val encryptedPayload = decodeBase64Url(envelope.getString("ct"))
+        if (version == 15) {
+            val plaintext = DilarAesSiv.decrypt(
+                key,
+                decodeBase64Url(envelope.getString("tag")),
+                encryptedPayload,
+                listOf(buildV15AdditionalData(epoch, serverPublicKeyRaw, envelopeIv, encryptedPayload.size), nonce),
+            )
+            return JSONObject(String(plaintext, StandardCharsets.UTF_8))
+        }
         val cipherText = encryptedPayload + decodeBase64Url(envelope.getString("tag"))
         val cipher = if (version == 13) {
             Cipher.getInstance("ChaCha20-Poly1305").apply {
@@ -565,6 +579,37 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         lengthPrefixed(
             "dilar.response.ecies.v13".toByteArray(StandardCharsets.UTF_8),
             "13".toByteArray(StandardCharsets.UTF_8),
+            epoch.toString().toByteArray(StandardCharsets.UTF_8),
+            serverPublicKey,
+            envelopeIv,
+            int32BigEndian(cipherTextLength),
+        ),
+    )
+
+    internal fun deriveV15KeyMaterial(
+        sharedSecret: ByteArray,
+        clientPublicKey: ByteArray,
+        serverPublicKey: ByteArray,
+        envelopeIv: ByteArray,
+        epoch: Long,
+    ): ByteArray {
+        val salt = hmac("HmacSHA512", envelopeIv, lengthPrefixed(clientPublicKey, serverPublicKey))
+        val fingerprint = digest("SHA-512", lengthPrefixed(envelopeIv, serverPublicKey))
+            .toByteString().base64Url().trimEnd('=').take(22)
+        val info = "dilar.response.ecies.v15|$epoch|$fingerprint".toByteArray(StandardCharsets.UTF_8)
+        return hkdf(sharedSecret, salt, info, 76, "SHA-512")
+    }
+
+    internal fun buildV15AdditionalData(
+        epoch: Long,
+        serverPublicKey: ByteArray,
+        envelopeIv: ByteArray,
+        cipherTextLength: Int,
+    ): ByteArray = digest(
+        "SHA-256",
+        lengthPrefixed(
+            "dilar.response.ecies.v15".toByteArray(StandardCharsets.UTF_8),
+            "15".toByteArray(StandardCharsets.UTF_8),
             epoch.toString().toByteArray(StandardCharsets.UTF_8),
             serverPublicKey,
             envelopeIv,
