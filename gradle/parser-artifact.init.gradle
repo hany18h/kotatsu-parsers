@@ -1,0 +1,19 @@
+import org.gradle.api.publish.maven.MavenPublication
+
+// The source checkout remains untouched. Only the publication coordinates are
+// adapted to the same commit-pinned coordinates used by JitPack consumers.
+allprojects {
+    afterEvaluate { parserProject ->
+        if (parserProject.plugins.hasPlugin('maven-publish')) {
+            def artifactVersion = System.getenv('PARSER_ARTIFACT_VERSION')
+            if (artifactVersion == null || !(artifactVersion ==~ /[0-9a-f]{10}/)) {
+                throw new GradleException('PARSER_ARTIFACT_VERSION must be a 10-character commit ID')
+            }
+            parserProject.publishing.publications.withType(MavenPublication).configureEach {
+                groupId = 'com.github.hany18h'
+                artifactId = 'kotatsu-parsers'
+                version = artifactVersion
+            }
+        }
+    }
+}

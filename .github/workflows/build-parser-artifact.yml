@@ -1,0 +1,56 @@
+name: Build parser artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Full source commit SHA
+        required: true
+        type: string
+      version:
+        description: First 10 characters of the source commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout build tooling
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: build-tools
+      - name: Checkout requested parser commit
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.ref }}
+          path: parser-source
+      - name: Set up Java
+        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          java-version: '21'
+          distribution: temurin
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+      - name: Verify source revision and build publication
+        working-directory: parser-source
+        env:
+          PARSER_SOURCE_COMMIT: ${{ inputs.ref }}
+          PARSER_ARTIFACT_VERSION: ${{ inputs.version }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$PARSER_SOURCE_COMMIT"
+          test "$(git rev-parse --short=10 HEAD)" = "$PARSER_ARTIFACT_VERSION"
+          ./gradlew jar generatePomFileForMavenJavaPublication --no-daemon --console=plain --init-script ../build-tools/gradle/parser-artifact.init.gradle
+      - name: Upload parser JAR and Maven metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kotatsu-parsers-${{ inputs.version }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            parser-source/build/libs/*.jar
+            parser-source/build/publications/mavenJava/pom-default.xml
