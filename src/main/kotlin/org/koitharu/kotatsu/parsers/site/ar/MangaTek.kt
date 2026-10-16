@@ -1,5 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONObject
@@ -12,10 +13,13 @@ import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.exception.ContentUnavailableException
 import org.koitharu.kotatsu.parsers.model.*
+import org.koitharu.kotatsu.parsers.network.OkHttpWebClient
 import org.koitharu.kotatsu.parsers.util.*
+import java.net.SocketTimeoutException
 import java.text.SimpleDateFormat
 import java.security.MessageDigest
 import java.util.*
+import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -27,6 +31,12 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     override val configKeyDomain = ConfigKey.Domain("mangatek.com")
     // Match the actual host WebView rather than freezing an old Chrome identity.
     override val userAgentKey = ConfigKey.UserAgent(loaderContext.getDefaultUserAgent().ifBlank { USER_AGENT })
+
+    // A read timeout alone is reset by each received chunk. Bound the whole
+    // request (including response-body parsing), without changing other sources.
+    private val boundedWebClient = OkHttpWebClient(
+        loaderContext.httpClient.newBuilder().callTimeout(HTTP_TIMEOUT_MS, TimeUnit.MILLISECONDS).build(), source,
+    )
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
@@ -333,15 +343,16 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
             .set("Origin", "https://$domain")
             .removeAll("Upgrade-Insecure-Requests")
             .build()
-        val httpResponse = try {
-            webClient.httpPost(OVERLAY_UNLOCK_URL.toHttpUrl(), payload, headers)
+        val response = try {
+            withTimeoutOrNull(HTTP_TIMEOUT_MS) {
+                boundedWebClient.httpPost(OVERLAY_UNLOCK_URL.toHttpUrl(), payload, headers).parseJson()
+            } ?: throw SocketTimeoutException(LOAD_TIMEOUT_MESSAGE)
         } catch (error: HttpStatusException) {
             if (error.statusCode != 403) throw error
             // A bare API 403 is not evidence of a solvable CAPTCHA. In
             // particular, opening the same blocked chapter creates a dead end.
             throw ContentUnavailableException(ACCESS_DENIED_MESSAGE)
         }
-        val response = httpResponse.parseJson()
         if (!response.optBoolean("success") && !response.optBoolean("ok")) {
             throw ContentUnavailableException("MangaTek could not unlock speech text; retry the chapter")
         }
@@ -404,28 +415,35 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     private suspend fun loadDocument(url: String, readySelector: String): Document {
         var challenged = false
         val directResult = runCatchingCancellable {
-            val response = webClient.httpGet(url, siteHeaders("https://$domain/"))
-            challenged = response.code == 403
-            response.parseHtml().also { challenged = challenged || isCaptchaPage(it) }
+            withTimeoutOrNull(HTTP_TIMEOUT_MS) {
+                val response = boundedWebClient.httpGet(url, siteHeaders("https://$domain/"))
+                challenged = response.code == 403
+                response.parseHtml().also { challenged = challenged || isCaptchaPage(it) }
+            } ?: throw SocketTimeoutException(LOAD_TIMEOUT_MESSAGE)
         }
         directResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
 
         val quotedSelector = JSONObject.quote(readySelector)
         val webViewResult = runCatchingCancellable {
-            val rawResult = loaderContext.evaluateJs(
-                url,
-                """
-                (function() {
-                  if (document.readyState === 'loading') return null;
-                  var html = document.documentElement ? document.documentElement.outerHTML : '';
-                  if (document.querySelector('#cf-error-details, .cf-error-details, #challenge-form, #challenge-running') ||
-                      /sorry, you have been blocked|you are unable to access/i.test(document.body ? document.body.innerText : '')) return html;
-                  if (!document.querySelector($quotedSelector)) return null;
-                  return html || null;
-                })()
-                """.trimIndent(),
-                siteHeaders("https://$domain/").toMap(),
-            ) ?: return@runCatchingCancellable null
+            // Include waiting for the host's shared browser in this deadline.
+            // Our own timeout must become an ordinary error, not cancellation:
+            // list loaders intentionally ignore cancellation when navigating away.
+            val rawResult = withTimeoutOrNull(BROWSER_TIMEOUT_MS) {
+                loaderContext.evaluateJs(
+                    url,
+                    """
+                    (function() {
+                      if (document.readyState === 'loading') return null;
+                      var html = document.documentElement ? document.documentElement.outerHTML : '';
+                      if (document.querySelector('#cf-error-details, .cf-error-details, #challenge-form, #challenge-running') ||
+                          /sorry, you have been blocked|you are unable to access/i.test(document.body ? document.body.innerText : '')) return html;
+                      if (!document.querySelector($quotedSelector)) return null;
+                      return html || null;
+                    })()
+                    """.trimIndent(),
+                    siteHeaders("https://$domain/").toMap(),
+                )
+            } ?: throw SocketTimeoutException(LOAD_TIMEOUT_MESSAGE)
             decodeWebViewString(rawResult)?.let { Jsoup.parse(it, url) }
         }
         webViewResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
@@ -500,6 +518,9 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     }
 
     internal companion object {
+        internal const val HTTP_TIMEOUT_MS = 12_000L
+        internal const val BROWSER_TIMEOUT_MS = 15_000L
+        private const val LOAD_TIMEOUT_MESSAGE = "لم يستجب مصدر MangaTek في الوقت المحدد. أعد المحاولة لاحقًا أو تحقق من فتح الموقع في المتصفح."
         private const val ACCESS_DENIED_MESSAGE = "يرفض موقع MangaTek الوصول إلى هذا الفصل (403). إذا ظهرت صفحة حظر في المتصفح أيضًا، فلا يمكن إكمال التحقق من التطبيق؛ يلزم رفع الحظر من جهة الموقع."
         private const val OVERLAY_UNLOCK_URL = "https://api.mangatek.com/api/reader/unlock"
         private const val OVERLAY_PAGE_SCHEME = "mangatek-overlay://render"

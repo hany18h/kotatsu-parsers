@@ -1,6 +1,11 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.withTimeout
 import okhttp3.CookieJar
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -17,17 +22,97 @@ import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.bitmap.Bitmap
 import org.koitharu.kotatsu.parsers.model.MangaChapter
+import org.koitharu.kotatsu.parsers.model.MangaListFilter
+import org.koitharu.kotatsu.parsers.model.SortOrder
 import org.koitharu.kotatsu.parsers.model.MangaParserSource
 import org.koitharu.kotatsu.parsers.model.MangaSource
 import org.koitharu.kotatsu.parsers.exception.ContentUnavailableException
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.json.JSONObject
 import java.util.Base64
+import java.net.SocketTimeoutException
+import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 internal class MangaTekTest {
+
+    @Test
+    fun catalogueReturnsImmediatelyWithoutStartingBrowser() = runBlocking {
+        val parser = MangaTek(fixtureContext(JSONObject(), false, documentHtml = catalogueHtml, browserResult = {
+            error("Usable HTTP catalogue must not start the browser")
+        }))
+        assertEquals("Fixture manga", parser.getList(0, SortOrder.UPDATED, MangaListFilter.EMPTY).single().title)
+    }
+
+    @Test
+    fun stalledBrowserBecomesRetryableErrorAndNextAttemptCanSucceed() = runBlocking {
+        val dispatcher = StandardTestDispatcher()
+        var browserCalls = 0
+        var cleanedUp = false
+        val parser = MangaTek(fixtureContext(JSONObject(), false, documentHtml = "<main></main>", browserResult = {
+            browserCalls++
+            if (browserCalls == 1) {
+                try { awaitCancellation() } finally { cleanedUp = true }
+            } else JSONObject.quote(catalogueHtml)
+        }))
+        val first = async(dispatcher) {
+            runCatching { parser.getList(0, SortOrder.UPDATED, MangaListFilter.EMPTY) }
+        }
+        // OkHttp's callback uses a real thread. Drive it onto the virtual test
+        // dispatcher before advancing the browser deadline (no real 15s sleep).
+        withTimeout(5_000) {
+            while (browserCalls == 0) { dispatcher.scheduler.runCurrent(); delay(1) }
+        }
+        dispatcher.scheduler.advanceTimeBy(MangaTek.BROWSER_TIMEOUT_MS)
+        dispatcher.scheduler.runCurrent()
+        val error = first.await().exceptionOrNull()
+        assertTrue(error is SocketTimeoutException)
+        assertTrue(error?.message.orEmpty().contains("MangaTek"))
+        assertTrue(cleanedUp)
+        assertEquals(15_000L, dispatcher.scheduler.currentTime)
+        assertEquals("Fixture manga", parser.getList(0, SortOrder.UPDATED, MangaListFilter.EMPTY).single().title)
+        assertEquals(2, browserCalls)
+    }
+
+    @Test
+    fun navigatingAwayStillCancelsBrowserInsteadOfReportingFailure() = runBlocking {
+        val dispatcher = StandardTestDispatcher()
+        var browserStarted = false
+        var cleanedUp = false
+        val parser = MangaTek(fixtureContext(JSONObject(), false, documentHtml = "<main></main>", browserResult = {
+            browserStarted = true
+            try { awaitCancellation() } finally { cleanedUp = true }
+        }))
+        val load = async(dispatcher) { parser.getList(0, SortOrder.UPDATED, MangaListFilter.EMPTY) }
+        withTimeout(5_000) {
+            while (!browserStarted) { dispatcher.scheduler.runCurrent(); delay(1) }
+        }
+        load.cancel()
+        dispatcher.scheduler.runCurrent()
+        assertTrue(load.isCancelled)
+        assertTrue(cleanedUp)
+        assertEquals(0L, dispatcher.scheduler.currentTime)
+    }
+
+    @Test
+    fun absentBrowserResultIsAnOrdinaryErrorNotCancellation() {
+        val parser = MangaTek(fixtureContext(JSONObject(), false, documentHtml = "<main></main>", browserResult = { null }))
+        assertThrows(SocketTimeoutException::class.java) {
+            runBlocking { parser.getList(0, SortOrder.UPDATED, MangaListFilter.EMPTY) }
+        }
+    }
+
+    @Test
+    fun browserDeadlineDoesNotHideAnAlreadyDetectedForbiddenResponse() {
+        val parser = MangaTek(fixtureContext(JSONObject(), false, documentCode = 403, browserResult = { null }))
+        val error = assertThrows(ContentUnavailableException::class.java) {
+            runBlocking { parser.getPages(fixtureChapter()) }
+        }
+        assertTrue(error.message.orEmpty().contains("403"))
+    }
 
     @Test
     fun preservesAlternateSpeechAcrossUnlockDecryptionPageOffsetAndDescriptors() = runBlocking {
@@ -156,7 +241,9 @@ internal class MangaTekTest {
 
     private class BrowserRequested : RuntimeException()
 
-    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200, browserHtml: String? = null, userAgent: String = MangaTek.USER_AGENT): MangaLoaderContext {
+    private val catalogueHtml = "<main><div class='grid'><a class='manga-card' href='/manga/fixture'><h3>Fixture manga</h3><img src='/cover.webp'></a></div></main>"
+
+    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200, browserHtml: String? = null, userAgent: String = MangaTek.USER_AGENT, documentHtml: String? = null, browserResult: (suspend () -> String?)? = null): MangaLoaderContext {
         val key = ByteArray(32) { it.toByte() }
         val iv = ByteArray(16) { (it + 10).toByte() }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -173,15 +260,17 @@ internal class MangaTekTest {
             override val httpClient = OkHttpClient.Builder().addInterceptor { chain ->
                 val request = chain.request()
                 assertEquals(userAgent, request.header("User-Agent"))
+                assertEquals(TimeUnit.MILLISECONDS.toNanos(MangaTek.HTTP_TIMEOUT_MS), chain.call().timeout().timeoutNanos(),
+                    "Both document and unlock requests need a total call deadline, not only an idle read timeout")
                 val isUnlock = request.url.host == "api.mangatek.com" && request.url.encodedPath == "/api/reader/unlock"
-                check(isUnlock || request.url.encodedPath == "/reader/fixture/1") { "Unexpected fixture request" }
+                check(isUnlock || request.url.encodedPath in listOf("/reader/fixture/1", "/manga-list")) { "Unexpected fixture request" }
                 val body = if (isUnlock) {
                     assertEquals("POST", request.method)
                     assertEquals("https://mangatek.com", request.header("Origin"))
                     assertEquals("https://mangatek.com/reader/fixture/1", request.header("Referer"))
                     JSONObject().put("success", unlockSuccess).put("key", key.hex())
                         .put("overlay", encrypted).put("overlay_page_offset", 1).toString()
-                } else html
+                } else documentHtml ?: html
                 Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (isUnlock) unlockCode else documentCode).message("Offline fixture")
                     .body(body.toResponseBody((if (isUnlock) "application/json" else "text/html").toMediaType())).build()
             }.build()
@@ -190,10 +279,10 @@ internal class MangaTekTest {
             override suspend fun evaluateJs(script: String): String? = error("Unexpected WebView fallback")
             override suspend fun evaluateJs(baseUrl: String, script: String): String? = error("Unexpected WebView fallback")
             override suspend fun evaluateJs(baseUrl: String, script: String, headers: Map<String, String>): String? {
-                assertEquals("https://mangatek.com/reader/fixture/1", baseUrl)
+                assertTrue(baseUrl in listOf("https://mangatek.com/reader/fixture/1", "https://mangatek.com/manga-list?sort=latest"))
                 assertEquals(userAgent, headers["User-Agent"])
                 assertTrue(script.contains("document.readyState"))
-                return JSONObject.quote(browserHtml ?: html)
+                return if (browserResult != null) browserResult() else JSONObject.quote(browserHtml ?: html)
             }
             override fun requestBrowserAction(parser: org.koitharu.kotatsu.parsers.MangaParser, url: String): Nothing {
                 assertEquals("https://mangatek.com/reader/fixture/1", url)
