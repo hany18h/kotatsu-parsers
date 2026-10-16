@@ -25,7 +25,8 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     PagedMangaParser(loaderContext, MangaParserSource.MANGATEK, pageSize = 24) {
 
     override val configKeyDomain = ConfigKey.Domain("mangatek.com")
-    override val userAgentKey = ConfigKey.UserAgent(USER_AGENT)
+    // Match the actual host WebView rather than freezing an old Chrome identity.
+    override val userAgentKey = ConfigKey.UserAgent(loaderContext.getDefaultUserAgent().ifBlank { USER_AGENT })
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
@@ -397,9 +398,8 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     }
 
     /**
-     * The site's current public pages reject the older Chrome 114 identity with
-     * HTTP 403. Try the current browser identity over HTTP first, then let
-     * WebView load the same public page if the HTTP client is still challenged.
+     * Keep HTTP and the host browser on the same current identity. WebView can
+     * load a public page, but a hard denial is not a solvable challenge.
      */
     private suspend fun loadDocument(url: String, readySelector: String): Document {
         var challenged = false

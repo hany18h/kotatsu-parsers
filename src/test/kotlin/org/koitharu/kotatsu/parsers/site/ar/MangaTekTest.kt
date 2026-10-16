@@ -114,10 +114,10 @@ internal class MangaTekTest {
     }
 
     @Test
-    fun usesChromeIdentityAcceptedByPublicPages() {
-        val parser = MangaTek(MangaLoaderContextMock)
-
-        assertEquals(MangaTek.USER_AGENT, parser.getRequestHeaders()["User-Agent"])
+    fun usesTheCurrentHostBrowserIdentityRatherThanAnOldFixedChromeVersion() {
+        val hostIdentity = "Current Android WebView identity fixture"
+        val parser = MangaTek(fixtureContext(JSONObject(), false, userAgent = hostIdentity))
+        assertEquals(hostIdentity, parser.getRequestHeaders()["User-Agent"])
     }
 
     @Test
@@ -156,7 +156,7 @@ internal class MangaTekTest {
 
     private class BrowserRequested : RuntimeException()
 
-    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200, browserHtml: String? = null): MangaLoaderContext {
+    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200, browserHtml: String? = null, userAgent: String = MangaTek.USER_AGENT): MangaLoaderContext {
         val key = ByteArray(32) { it.toByte() }
         val iv = ByteArray(16) { (it + 10).toByte() }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -172,6 +172,7 @@ internal class MangaTekTest {
             override val cookieJar = CookieJar.NO_COOKIES
             override val httpClient = OkHttpClient.Builder().addInterceptor { chain ->
                 val request = chain.request()
+                assertEquals(userAgent, request.header("User-Agent"))
                 val isUnlock = request.url.host == "api.mangatek.com" && request.url.encodedPath == "/api/reader/unlock"
                 check(isUnlock || request.url.encodedPath == "/reader/fixture/1") { "Unexpected fixture request" }
                 val body = if (isUnlock) {
@@ -185,12 +186,12 @@ internal class MangaTekTest {
                     .body(body.toResponseBody((if (isUnlock) "application/json" else "text/html").toMediaType())).build()
             }.build()
             override fun getConfig(source: MangaSource) = MangaLoaderContextMock.getConfig(source)
-            override fun getDefaultUserAgent() = MangaTek.USER_AGENT
+            override fun getDefaultUserAgent() = userAgent
             override suspend fun evaluateJs(script: String): String? = error("Unexpected WebView fallback")
             override suspend fun evaluateJs(baseUrl: String, script: String): String? = error("Unexpected WebView fallback")
             override suspend fun evaluateJs(baseUrl: String, script: String, headers: Map<String, String>): String? {
                 assertEquals("https://mangatek.com/reader/fixture/1", baseUrl)
-                assertEquals(MangaTek.USER_AGENT, headers["User-Agent"])
+                assertEquals(userAgent, headers["User-Agent"])
                 assertTrue(script.contains("document.readyState"))
                 return JSONObject.quote(browserHtml ?: html)
             }
