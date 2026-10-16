@@ -354,9 +354,9 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         return overlays
     }
 
-    private fun overlayItems(page: JSONObject) = page.optJSONArray("overlays")
-        ?: page.optJSONArray("speech_overlays")
-        ?: page.optJSONArray("texts")
+    private fun overlayItems(page: JSONObject) = sequenceOf("overlays", "speech_overlays", "texts")
+        .mapNotNull(page::optJSONArray)
+        .firstOrNull { it.length() > 0 }
 
     private fun JSONObject.astroValue(name: String): Any? {
         val value = opt(name)
