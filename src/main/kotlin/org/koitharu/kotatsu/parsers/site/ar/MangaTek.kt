@@ -4,6 +4,7 @@ import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONObject
 import org.jsoup.Jsoup
+import org.jsoup.HttpStatusException
 import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
@@ -293,7 +294,7 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         if (imageUrls.isEmpty()) throw ContentUnavailableException("MangaTek did not return any reader images")
         // Do not silently return text-free images if unlocking fails. Such pages
         // would otherwise be cached/downloaded as successfully completed chapters.
-        val overlayPages = loadOverlayPages(doc, imageUrls.size)
+        val overlayPages = loadOverlayPages(doc, imageUrls.size, fullUrl)
         return imageUrls.mapIndexed { index, imageUrl ->
             MangaPage(
                 id = generateUid("${chapter.id}-$index"),
@@ -308,7 +309,7 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         page.url.startsWith(OVERLAY_PAGE_SCHEME, ignoreCase = true)
     ) page.url else super.getPageUrl(page)
 
-    private suspend fun loadOverlayPages(document: Document, imageCount: Int): Map<Int, JSONObject> {
+    private suspend fun loadOverlayPages(document: Document, imageCount: Int, chapterUrl: String): Map<Int, JSONObject> {
         val rawProps = document.selectFirst("astro-island[component-url*='ChapterImageViewer']")?.attr("props")
             ?.takeIf(String::isNotBlank) ?: return emptyMap()
         val props = JSONObject(rawProps)
@@ -324,8 +325,22 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         }
         val payload = JSONObject().put("chapterId", chapterId).put("token", token)
             .put("proof", computeUnlockProof(token, chapterId))
-        val headers = siteHeaders("https://$domain/").newBuilder().set("Accept", "application/json").build()
-        val response = webClient.httpPost(OVERLAY_UNLOCK_URL.toHttpUrl(), payload, headers).parseJson()
+        // Match the public reader's cross-origin POST, including its origin and
+        // exact chapter referrer. Omitting Origin can fail the API's CSRF check.
+        val headers = siteHeaders(chapterUrl).newBuilder()
+            .set("Accept", "application/json")
+            .set("Origin", "https://$domain")
+            .removeAll("Upgrade-Insecure-Requests")
+            .build()
+        val httpResponse = try {
+            webClient.httpPost(OVERLAY_UNLOCK_URL.toHttpUrl(), payload, headers)
+        } catch (error: HttpStatusException) {
+            if (error.statusCode != 403) throw error
+            // A genuine site challenge requires the user's browser session, not
+            // retries or silently accepting images with their speech missing.
+            loaderContext.requestBrowserAction(this, chapterUrl)
+        }
+        val response = httpResponse.parseJson()
         if (!response.optBoolean("success") && !response.optBoolean("ok")) {
             throw ContentUnavailableException("MangaTek could not unlock speech text; retry the chapter")
         }
@@ -387,8 +402,11 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
      * WebView load the same public page if the HTTP client is still challenged.
      */
     private suspend fun loadDocument(url: String, readySelector: String): Document {
+        var challenged = false
         val directResult = runCatchingCancellable {
-            webClient.httpGet(url, siteHeaders("https://$domain/")).parseHtml()
+            val response = webClient.httpGet(url, siteHeaders("https://$domain/"))
+            challenged = response.code == 403
+            response.parseHtml().also { challenged = challenged || isCaptchaPage(it) }
         }
         directResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
 
@@ -403,11 +421,16 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
                   return document.documentElement ? document.documentElement.outerHTML : null;
                 })()
                 """.trimIndent(),
+                siteHeaders("https://$domain/").toMap(),
             ) ?: return@runCatchingCancellable null
             decodeWebViewString(rawResult)?.let { Jsoup.parse(it, url) }
         }
         webViewResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
 
+        if (challenged || (directResult.exceptionOrNull() as? HttpStatusException)?.statusCode == 403 ||
+            webViewResult.getOrNull()?.let(::isCaptchaPage) == true) {
+            loaderContext.requestBrowserAction(this, url)
+        }
         webViewResult.exceptionOrNull()?.let { throw it }
         directResult.exceptionOrNull()?.let { throw it }
         error("MangaTek returned an incomplete page or a CAPTCHA instead of public content")

@@ -50,6 +50,18 @@ internal class MangaTekTest {
     }
 
     @Test
+    fun forbiddenUnlockRequestsTheChapterBrowserInsteadOfCachingBlankSpeech() {
+        val parser = MangaTek(fixtureContext(JSONObject(), unlockSuccess = true, unlockCode = 403))
+        assertThrows(BrowserRequested::class.java) { runBlocking { parser.getPages(fixtureChapter()) } }
+    }
+
+    @Test
+    fun browserFallbackUsesTheSameIdentityAndWaitsForCurrentChapter() {
+        val parser = MangaTek(fixtureContext(JSONObject(), unlockSuccess = false, documentCode = 403))
+        assertThrows(ContentUnavailableException::class.java) { runBlocking { parser.getPages(fixtureChapter()) } }
+    }
+
+    @Test
     fun keepsSpeechOverlayAndImageInPageDescriptor() {
         val image = "https://mangatek.com/page.webp"
         val overlay = JSONObject().put("page_number", 1).put("overlays", listOf(JSONObject().put("text", "نص الفقاعة")))
@@ -124,7 +136,9 @@ internal class MangaTekTest {
         scanlator = null, branch = null,
     )
 
-    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean): MangaLoaderContext {
+    private class BrowserRequested : RuntimeException()
+
+    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200): MangaLoaderContext {
         val key = ByteArray(32) { it.toByte() }
         val iv = ByteArray(16) { (it + 10).toByte() }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -144,16 +158,28 @@ internal class MangaTekTest {
                 check(isUnlock || request.url.encodedPath == "/reader/fixture/1") { "Unexpected fixture request" }
                 val body = if (isUnlock) {
                     assertEquals("POST", request.method)
+                    assertEquals("https://mangatek.com", request.header("Origin"))
+                    assertEquals("https://mangatek.com/reader/fixture/1", request.header("Referer"))
                     JSONObject().put("success", unlockSuccess).put("key", key.hex())
                         .put("overlay", encrypted).put("overlay_page_offset", 1).toString()
                 } else html
-                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("Offline fixture")
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (isUnlock) unlockCode else documentCode).message("Offline fixture")
                     .body(body.toResponseBody((if (isUnlock) "application/json" else "text/html").toMediaType())).build()
             }.build()
             override fun getConfig(source: MangaSource) = MangaLoaderContextMock.getConfig(source)
             override fun getDefaultUserAgent() = MangaTek.USER_AGENT
             override suspend fun evaluateJs(script: String): String? = error("Unexpected WebView fallback")
             override suspend fun evaluateJs(baseUrl: String, script: String): String? = error("Unexpected WebView fallback")
+            override suspend fun evaluateJs(baseUrl: String, script: String, headers: Map<String, String>): String? {
+                assertEquals("https://mangatek.com/reader/fixture/1", baseUrl)
+                assertEquals(MangaTek.USER_AGENT, headers["User-Agent"])
+                assertTrue(script.contains("document.readyState"))
+                return JSONObject.quote(html)
+            }
+            override fun requestBrowserAction(parser: org.koitharu.kotatsu.parsers.MangaParser, url: String): Nothing {
+                assertEquals("https://mangatek.com/reader/fixture/1", url)
+                throw BrowserRequested()
+            }
             override fun redrawImageResponse(response: Response, redraw: (Bitmap) -> Bitmap): Response = error("Unused fixture operation")
             override fun createBitmap(width: Int, height: Int): Bitmap = error("Unused fixture operation")
         }
