@@ -50,8 +50,26 @@ internal class MangaTekTest {
     }
 
     @Test
-    fun forbiddenUnlockRequestsTheChapterBrowserInsteadOfCachingBlankSpeech() {
+    fun forbiddenUnlockDoesNotSendUsersToAnUnsolvableBrowserPage() {
         val parser = MangaTek(fixtureContext(JSONObject(), unlockSuccess = true, unlockCode = 403))
+        val error = assertThrows(ContentUnavailableException::class.java) { runBlocking { parser.getPages(fixtureChapter()) } }
+        assertTrue(error.message.orEmpty().contains("403"))
+    }
+
+    @Test
+    fun blockedBrowserPageIsRejectedWithoutOfferingContinue() {
+        val blocked = "<html><title>Attention Required! | Cloudflare</title><body><div id='cf-error-details'>Sorry, you have been blocked</div></body></html>"
+        val parser = MangaTek(fixtureContext(JSONObject(), unlockSuccess = true, documentCode = 403, browserHtml = blocked))
+        val error = assertThrows(ContentUnavailableException::class.java) { runBlocking { parser.getPages(fixtureChapter()) } }
+        assertTrue(error.message.orEmpty().contains("رفع الحظر"))
+        assertTrue(parser.isAccessBlocked(Jsoup.parse(blocked)))
+        assertFalse(parser.isUsablePage(Jsoup.parse(blocked + "<div class='manga-page'><img src='/1.webp'></div>"), "div.manga-page img[src]"))
+    }
+
+    @Test
+    fun realInteractiveChallengeStillOffersVerification() {
+        val challenge = "<title>CAPTCHA</title><form id='challenge-form'><input name='cf-turnstile-response'></form>"
+        val parser = MangaTek(fixtureContext(JSONObject(), unlockSuccess = true, documentCode = 403, browserHtml = challenge))
         assertThrows(BrowserRequested::class.java) { runBlocking { parser.getPages(fixtureChapter()) } }
     }
 
@@ -138,7 +156,7 @@ internal class MangaTekTest {
 
     private class BrowserRequested : RuntimeException()
 
-    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200): MangaLoaderContext {
+    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200, browserHtml: String? = null): MangaLoaderContext {
         val key = ByteArray(32) { it.toByte() }
         val iv = ByteArray(16) { (it + 10).toByte() }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -174,7 +192,7 @@ internal class MangaTekTest {
                 assertEquals("https://mangatek.com/reader/fixture/1", baseUrl)
                 assertEquals(MangaTek.USER_AGENT, headers["User-Agent"])
                 assertTrue(script.contains("document.readyState"))
-                return JSONObject.quote(html)
+                return JSONObject.quote(browserHtml ?: html)
             }
             override fun requestBrowserAction(parser: org.koitharu.kotatsu.parsers.MangaParser, url: String): Nothing {
                 assertEquals("https://mangatek.com/reader/fixture/1", url)

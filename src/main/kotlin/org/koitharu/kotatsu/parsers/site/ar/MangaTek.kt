@@ -336,9 +336,9 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
             webClient.httpPost(OVERLAY_UNLOCK_URL.toHttpUrl(), payload, headers)
         } catch (error: HttpStatusException) {
             if (error.statusCode != 403) throw error
-            // A genuine site challenge requires the user's browser session, not
-            // retries or silently accepting images with their speech missing.
-            loaderContext.requestBrowserAction(this, chapterUrl)
+            // A bare API 403 is not evidence of a solvable CAPTCHA. In
+            // particular, opening the same blocked chapter creates a dead end.
+            throw ContentUnavailableException(ACCESS_DENIED_MESSAGE)
         }
         val response = httpResponse.parseJson()
         if (!response.optBoolean("success") && !response.optBoolean("ok")) {
@@ -417,8 +417,11 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
                 """
                 (function() {
                   if (document.readyState === 'loading') return null;
+                  var html = document.documentElement ? document.documentElement.outerHTML : '';
+                  if (document.querySelector('#cf-error-details, .cf-error-details, #challenge-form, #challenge-running') ||
+                      /sorry, you have been blocked|you are unable to access/i.test(document.body ? document.body.innerText : '')) return html;
                   if (!document.querySelector($quotedSelector)) return null;
-                  return document.documentElement ? document.documentElement.outerHTML : null;
+                  return html || null;
                 })()
                 """.trimIndent(),
                 siteHeaders("https://$domain/").toMap(),
@@ -427,9 +430,17 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         }
         webViewResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
 
-        if (challenged || (directResult.exceptionOrNull() as? HttpStatusException)?.statusCode == 403 ||
-            webViewResult.getOrNull()?.let(::isCaptchaPage) == true) {
+        val browserDocument = webViewResult.getOrNull()
+        if (browserDocument?.let(::isAccessBlocked) == true) {
+            throw ContentUnavailableException(ACCESS_DENIED_MESSAGE)
+        }
+        // Only an actual challenge offers Continue. Never label every HTTP 403
+        // as interactive verification (the former behaviour opened a hard ban).
+        if (browserDocument?.let(::isCaptchaPage) == true && browserDocument.let(::hasInteractiveChallenge)) {
             loaderContext.requestBrowserAction(this, url)
+        }
+        if (challenged || (directResult.exceptionOrNull() as? HttpStatusException)?.statusCode == 403) {
+            throw ContentUnavailableException(ACCESS_DENIED_MESSAGE)
         }
         webViewResult.exceptionOrNull()?.let { throw it }
         directResult.exceptionOrNull()?.let { throw it }
@@ -437,7 +448,17 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     }
 
     internal fun isUsablePage(document: Document, readySelector: String): Boolean =
-        !isCaptchaPage(document) && document.selectFirst(readySelector) != null
+        !isAccessBlocked(document) && !isCaptchaPage(document) && document.selectFirst(readySelector) != null
+
+    internal fun isAccessBlocked(document: Document): Boolean {
+        val text = document.text().lowercase(Locale.ROOT)
+        return document.selectFirst("#cf-error-details, .cf-error-details, [data-translate='blocked_why_headline']") != null ||
+            "sorry, you have been blocked" in text || "you are unable to access" in text || "error 1020" in text
+    }
+
+    private fun hasInteractiveChallenge(document: Document): Boolean = document.selectFirst(
+        "#challenge-form, #challenge-running, .cf-turnstile, input[name='cf-turnstile-response']",
+    ) != null
 
     internal fun decodeWebViewString(rawResult: String): String? = runCatching {
         JSONObject("{\"value\":$rawResult}").optString("value").trim().takeIf(String::isNotEmpty)
@@ -479,6 +500,7 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
     }
 
     internal companion object {
+        private const val ACCESS_DENIED_MESSAGE = "يرفض موقع MangaTek الوصول إلى هذا الفصل (403). إذا ظهرت صفحة حظر في المتصفح أيضًا، فلا يمكن إكمال التحقق من التطبيق؛ يلزم رفع الحظر من جهة الموقع."
         private const val OVERLAY_UNLOCK_URL = "https://api.mangatek.com/api/reader/unlock"
         private const val OVERLAY_PAGE_SCHEME = "mangatek-overlay://render"
         private const val READER_PROOF_SALT = "80c55d2d1f1432551b82f5304b60e1aced87f823a6ed309d"
