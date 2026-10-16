@@ -312,9 +312,13 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         val rawProps = document.selectFirst("astro-island[component-url*='ChapterImageViewer']")?.attr("props")
             ?.takeIf(String::isNotBlank) ?: return emptyMap()
         val props = JSONObject(rawProps)
-        if (props.optJSONArray("textMode")?.optString(1) != "overlay") return emptyMap()
-        val token = props.optJSONArray("unlockToken")?.optString(1).orEmpty()
-        val chapterId = props.optJSONArray("chapterId")?.optLong(1) ?: 0L
+        val textMode = props.astroString("textMode")
+        val token = props.astroString("unlockToken")
+        val chapterId = props.astroLong("chapterId")
+        // Astro serializes props as [type, value], but preserve support for the
+        // site's plain values too. A token is also a reliable indicator that
+        // the chapter has a separate speech-text payload when mode names change.
+        if (textMode != "overlay" && token.isBlank()) return emptyMap()
         if (token.isEmpty() || chapterId <= 0L) {
             throw ContentUnavailableException("MangaTek speech text is missing its unlock token; reload the chapter")
         }
@@ -322,22 +326,23 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
             .put("proof", computeUnlockProof(token, chapterId))
         val headers = siteHeaders("https://$domain/").newBuilder().set("Accept", "application/json").build()
         val response = webClient.httpPost(OVERLAY_UNLOCK_URL.toHttpUrl(), payload, headers).parseJson()
-        if (!response.optBoolean("success")) {
+        if (!response.optBoolean("success") && !response.optBoolean("ok")) {
             throw ContentUnavailableException("MangaTek could not unlock speech text; retry the chapter")
         }
-        val encrypted = response.optString("overlay")
-        val key = response.optString("key")
+        val encrypted = response.optString("overlay").ifBlank { response.optString("overlay_blob") }
+        val key = response.optString("key").ifBlank { response.optString("encryption_key") }
         if (encrypted.isBlank() || key.isBlank()) {
             throw ContentUnavailableException("MangaTek returned no speech text; retry the chapter")
         }
         val pages = decryptOverlayPages(encrypted, key)
         if (pages.length() == 0) throw ContentUnavailableException("MangaTek speech overlay is empty")
-        val offset = response.optInt("overlay_page_offset", props.optJSONArray("overlayPageOffset")?.optInt(1) ?: 0)
+        val offset = response.optInt("overlay_page_offset", props.astroInt("overlayPageOffset"))
         val overlays = buildMap {
             repeat(pages.length()) { position ->
                 val page = pages.getJSONObject(position)
-                val imageIndex = page.optInt("page_number", position + 1) + offset - 1
-                if ((page.optJSONArray("overlays")?.length() ?: 0) > 0) {
+                val pageNumber = page.optInt("page_number", page.optInt("pageNumber", position + 1))
+                val imageIndex = pageNumber + offset - 1
+                if ((overlayItems(page)?.length() ?: 0) > 0) {
                     if (imageIndex !in 0 until imageCount) {
                         throw ContentUnavailableException("MangaTek speech text does not match the reader images")
                     }
@@ -347,6 +352,33 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         }
         if (overlays.isEmpty()) throw ContentUnavailableException("MangaTek returned no speech overlays")
         return overlays
+    }
+
+    private fun overlayItems(page: JSONObject) = page.optJSONArray("overlays")
+        ?: page.optJSONArray("speech_overlays")
+        ?: page.optJSONArray("texts")
+
+    private fun JSONObject.astroValue(name: String): Any? {
+        val value = opt(name)
+        return if (value is org.json.JSONArray && value.length() > 1 && value.opt(0) is Number) {
+            value.opt(1)
+        } else {
+            value
+        }
+    }
+
+    private fun JSONObject.astroString(name: String): String = astroValue(name) as? String ?: ""
+
+    private fun JSONObject.astroLong(name: String): Long = when (val value = astroValue(name)) {
+        is Number -> value.toLong()
+        is String -> value.toLongOrNull() ?: 0L
+        else -> 0L
+    }
+
+    private fun JSONObject.astroInt(name: String): Int = when (val value = astroValue(name)) {
+        is Number -> value.toInt()
+        is String -> value.toIntOrNull() ?: 0
+        else -> 0
     }
 
     /**

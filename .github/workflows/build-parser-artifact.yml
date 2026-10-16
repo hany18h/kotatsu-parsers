@@ -1,6 +1,11 @@
 name: Build parser artifact
 
 on:
+  push:
+    branches:
+      - agent/mangatek-overlay-compat-20261016
+    paths:
+      - src/main/kotlin/org/koitharu/kotatsu/parsers/site/ar/MangaTek.kt
   workflow_dispatch:
     inputs:
       ref:
@@ -27,7 +32,7 @@ jobs:
       - name: Checkout requested parser commit
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           path: parser-source
       - name: Set up Java
         uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
@@ -36,11 +41,17 @@ jobs:
           distribution: temurin
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+      - name: Resolve artifact revision
+        id: source
+        working-directory: parser-source
+        run: |
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$(git rev-parse --short=10 HEAD)" >> "$GITHUB_OUTPUT"
       - name: Verify source revision and build publication
         working-directory: parser-source
         env:
-          PARSER_SOURCE_COMMIT: ${{ inputs.ref }}
-          PARSER_ARTIFACT_VERSION: ${{ inputs.version }}
+          PARSER_SOURCE_COMMIT: ${{ inputs.ref || github.sha }}
+          PARSER_ARTIFACT_VERSION: ${{ inputs.version || steps.source.outputs.version }}
         run: |
           test "$(git rev-parse HEAD)" = "$PARSER_SOURCE_COMMIT"
           test "$(git rev-parse --short=10 HEAD)" = "$PARSER_ARTIFACT_VERSION"
@@ -48,7 +59,7 @@ jobs:
       - name: Upload parser JAR and Maven metadata
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: kotatsu-parsers-${{ inputs.version }}
+          name: kotatsu-parsers-${{ inputs.version || steps.source.outputs.version }}
           retention-days: 14
           if-no-files-found: error
           path: |
