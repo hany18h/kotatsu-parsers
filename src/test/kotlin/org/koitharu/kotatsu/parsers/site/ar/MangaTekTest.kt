@@ -40,6 +40,66 @@ import javax.crypto.spec.SecretKeySpec
 internal class MangaTekTest {
 
     @Test
+    fun proofMatchesTheOfficialReaderClientFromOctober18() {
+        assertEquals("90505f61b137206022bf71d832cc74ca921e3ee8e2157685c89486572014aca6",
+            MangaTek.computeUnlockProof("fixture-token", 123))
+    }
+
+    @Test
+    fun cryptoBridgeStripsOnlyLeadingImportsAndDoesNotExecuteNetworkHelpers() {
+        val module = "import{a}from'./react.js';import'./fingerprint.js';async function renamed(a,b,c,d){return 'importKey;';}export{renamed as default};"
+        val script = MangaTekWebCrypto.buildScript(module, JSONObject().put("mode", "pages"), "fixture")
+        assertFalse(script.contains("from'./react.js'"))
+        assertFalse(script.contains("import'./fingerprint.js'"))
+        assertFalse(script.contains("export{renamed"))
+        assertTrue(script.contains("return 'importKey;';"))
+        assertTrue(script.contains("return [renamed]"))
+        assertTrue(script.contains("Network disabled in crypto bridge"))
+    }
+
+    @Test
+    fun ev3SpeechUsesCurrentClientAndRetainsImageOffsetAndArabicText() = runBlocking {
+        val page = JSONObject().put("page_number", 1).put("image_width", 800).put("image_height", 1600)
+            .put("overlays", JSONArray().put(JSONObject().put("text", "نص الفصل الجديد").put("x", 20).put("y", 30).put("w", 200).put("h", 100)))
+        var cryptoCalls = 0
+        val parser = MangaTek(fixtureContext(page, unlockSuccess = true, overlayVersion = 3, browserResult = {
+            cryptoCalls++
+            JSONObject.quote(JSONObject().put("pages", JSONArray().put(page)).toString())
+        }))
+        val pages = parser.getPages(fixtureChapter())
+        assertEquals(2, pages.size)
+        assertFalse(pages.first().url.startsWith("mangatek-overlay://"))
+        val overlay = String(Base64.getUrlDecoder().decode(pages[1].url.substringAfter("&overlay=")), Charsets.UTF_8)
+        assertEquals("نص الفصل الجديد", JSONObject(overlay).getJSONArray("overlays").getJSONObject(0).getString("text"))
+        assertEquals(1, cryptoCalls)
+    }
+
+    @Test
+    fun failedEv3CryptoNeverReturnsTextFreeDownloadPages() {
+        val parser = MangaTek(fixtureContext(JSONObject(), unlockSuccess = true, overlayVersion = 3, browserResult = {
+            JSONObject.quote("{\"error\":\"client could not decrypt\"}")
+        }))
+        val error = assertThrows(ContentUnavailableException::class.java) { runBlocking { parser.getPages(fixtureChapter()) } }
+        assertTrue(error.message.orEmpty().contains("could not decrypt"))
+    }
+
+    @Test
+    fun navigatingAwayDuringEv3CryptoPreservesCancellation() = runBlocking {
+        var entered = false
+        var cleaned = false
+        val parser = MangaTek(fixtureContext(JSONObject(), unlockSuccess = true, overlayVersion = 3, browserResult = {
+            entered = true
+            try { awaitCancellation() } finally { cleaned = true }
+        }))
+        val job = async { parser.getPages(fixtureChapter()) }
+        withTimeout(5_000) { while (!entered) delay(1) }
+        job.cancel()
+        job.join()
+        assertTrue(job.isCancelled)
+        assertTrue(cleaned)
+    }
+
+    @Test
     fun catalogueReturnsImmediatelyWithoutStartingBrowser() = runBlocking {
         val parser = MangaTek(fixtureContext(JSONObject(), false, documentHtml = catalogueHtml, browserResult = {
             error("Usable HTTP catalogue must not start the browser")
@@ -243,7 +303,7 @@ internal class MangaTekTest {
 
     private val catalogueHtml = "<main><div class='grid'><a class='manga-card' href='/manga/fixture'><h3>Fixture manga</h3><img src='/cover.webp'></a></div></main>"
 
-    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200, browserHtml: String? = null, userAgent: String = MangaTek.USER_AGENT, documentHtml: String? = null, browserResult: (suspend () -> String?)? = null): MangaLoaderContext {
+    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200, browserHtml: String? = null, userAgent: String = MangaTek.USER_AGENT, documentHtml: String? = null, overlayVersion: Int = 0, browserResult: (suspend () -> String?)? = null): MangaLoaderContext {
         val key = ByteArray(32) { it.toByte() }
         val iv = ByteArray(16) { (it + 10).toByte() }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -252,7 +312,7 @@ internal class MangaTekTest {
         fun ByteArray.hex() = joinToString("") { "%02x".format(it.toInt() and 0xff) }
         val encrypted = listOf(iv, sealed.copyOfRange(0, sealed.size - 16), sealed.copyOfRange(sealed.size - 16, sealed.size))
             .joinToString(":") { it.hex() }
-        val html = """<astro-island component-url="/ChapterImageViewer.js" props='{"textMode":[0,"overlay"],"unlockToken":[0,"fixture-token"],"chapterId":[0,123]}'></astro-island>
+        val html = """<astro-island component-url="/_astro/ChapterImageViewer.fixture.js" props='{"textMode":[0,"overlay"],"unlockToken":[0,"fixture-token"],"chapterId":[0,123]}'></astro-island>
             <div class="manga-page"><img data-url="/cover.webp"></div>
             <div class="manga-page"><img data-url="/page.webp"></div>"""
         return object : MangaLoaderContext() {
@@ -263,15 +323,18 @@ internal class MangaTekTest {
                 assertEquals(TimeUnit.MILLISECONDS.toNanos(MangaTek.HTTP_TIMEOUT_MS), chain.call().timeout().timeoutNanos(),
                     "Both document and unlock requests need a total call deadline, not only an idle read timeout")
                 val isUnlock = request.url.host == "api.mangatek.com" && request.url.encodedPath == "/api/reader/unlock"
-                check(isUnlock || request.url.encodedPath in listOf("/reader/fixture/1", "/manga-list")) { "Unexpected fixture request" }
+                val isModule = request.url.encodedPath == "/_astro/ChapterImageViewer.fixture.js"
+                check(isUnlock || isModule || request.url.encodedPath in listOf("/reader/fixture/1", "/manga-list")) { "Unexpected fixture request" }
                 val body = if (isUnlock) {
                     assertEquals("POST", request.method)
                     assertEquals("https://mangatek.com", request.header("Origin"))
                     assertEquals("https://mangatek.com/reader/fixture/1", request.header("Referer"))
-                    JSONObject().put("success", unlockSuccess).put("key", key.hex())
+                    JSONObject().put("success", unlockSuccess).put("key", if (overlayVersion >= 3) "" else key.hex())
+                        .put("ks", if (overlayVersion >= 3) "fixture-seed" else "").put("ev", overlayVersion)
                         .put("overlay", encrypted).put("overlay_page_offset", 1).toString()
-                } else documentHtml ?: html
-                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (isUnlock) unlockCode else documentCode).message("Offline fixture")
+                } else if (isModule) "async function fixtureCrypto(a,b,c,d){return crypto.subtle && new TextDecoder();}export{fixtureCrypto as default};"
+                else documentHtml ?: html
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (isUnlock) unlockCode else if (isModule) 200 else documentCode).message("Offline fixture")
                     .body(body.toResponseBody((if (isUnlock) "application/json" else "text/html").toMediaType())).build()
             }.build()
             override fun getConfig(source: MangaSource) = MangaLoaderContextMock.getConfig(source)
@@ -281,7 +344,7 @@ internal class MangaTekTest {
             override suspend fun evaluateJs(baseUrl: String, script: String, headers: Map<String, String>): String? {
                 assertTrue(baseUrl in listOf("https://mangatek.com/reader/fixture/1", "https://mangatek.com/manga-list?sort=latest"))
                 assertEquals(userAgent, headers["User-Agent"])
-                assertTrue(script.contains("document.readyState"))
+                assertTrue(script.contains("document.readyState") || script.contains("Network disabled in crypto bridge"))
                 return if (browserResult != null) browserResult() else JSONObject.quote(browserHtml ?: html)
             }
             override fun requestBrowserAction(parser: org.koitharu.kotatsu.parsers.MangaParser, url: String): Nothing {

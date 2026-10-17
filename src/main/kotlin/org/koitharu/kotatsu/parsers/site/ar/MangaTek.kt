@@ -343,25 +343,46 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
             .set("Origin", "https://$domain")
             .removeAll("Upgrade-Insecure-Requests")
             .build()
-        val response = try {
+        suspend fun unlock() =
             withTimeoutOrNull(HTTP_TIMEOUT_MS) {
                 boundedWebClient.httpPost(OVERLAY_UNLOCK_URL.toHttpUrl(), payload, headers).parseJson()
             } ?: throw SocketTimeoutException(LOAD_TIMEOUT_MESSAGE)
+        var clientModule: String? = null
+        suspend fun module(): String = clientModule ?: loadReaderModule(document, chapterUrl).also { clientModule = it }
+        val response = try {
+            unlock()
         } catch (error: HttpStatusException) {
             if (error.statusCode != 403) throw error
-            // A bare API 403 is not evidence of a solvable CAPTCHA. In
-            // particular, opening the same blocked chapter creates a dead end.
-            throw ContentUnavailableException(ACCESS_DENIED_MESSAGE)
+            // A JSON rejection from the reader API is not a blocked chapter page.
+            // If its public client changed, ask that client's local proof helper
+            // once; never loop, forge a browser session or solve a CAPTCHA here.
+            val currentProof = runCatchingCancellable {
+                evaluateReaderCrypto(module(), JSONObject().put("mode", "proof")
+                    .put("token", token).put("chapterId", chapterId), chapterUrl).optString("proof")
+            }.getOrNull()
+            if (currentProof.isNullOrBlank() || currentProof == payload.optString("proof")) {
+                throw ContentUnavailableException(UNLOCK_DENIED_MESSAGE)
+            }
+            payload.put("proof", currentProof)
+            try { unlock() } catch (retryError: HttpStatusException) {
+                if (retryError.statusCode != 403) throw retryError
+                throw ContentUnavailableException(UNLOCK_DENIED_MESSAGE)
+            }
         }
         if (!response.optBoolean("success") && !response.optBoolean("ok")) {
             throw ContentUnavailableException("MangaTek could not unlock speech text; retry the chapter")
         }
         val encrypted = response.optString("overlay").ifBlank { response.optString("overlay_blob") }
         val key = response.optString("key").ifBlank { response.optString("encryption_key") }
-        if (encrypted.isBlank() || key.isBlank()) {
+        val keySeed = response.optString("ks")
+        if (encrypted.isBlank() || (key.isBlank() && keySeed.isBlank())) {
             throw ContentUnavailableException("MangaTek returned no speech text; retry the chapter")
         }
-        val pages = decryptOverlayPages(encrypted, key)
+        val pages = if (response.optInt("ev") >= 3 && keySeed.isNotBlank()) {
+            evaluateReaderCrypto(module(), JSONObject().put("mode", "pages").put("overlay", encrypted)
+                .put("ks", keySeed).put("token", token).put("chapterId", chapterId), chapterUrl)
+                .optJSONArray("pages") ?: throw ContentUnavailableException("MangaTek returned no decrypted speech text")
+        } else decryptOverlayPages(encrypted, key)
         if (pages.length() == 0) throw ContentUnavailableException("MangaTek speech overlay is empty")
         val offset = response.optInt("overlay_page_offset", props.astroInt("overlayPageOffset"))
         val overlays = buildMap {
@@ -379,6 +400,34 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         }
         if (overlays.isEmpty()) throw ContentUnavailableException("MangaTek returned no speech overlays")
         return overlays
+    }
+
+    private suspend fun loadReaderModule(document: Document, chapterUrl: String): String {
+        val asset = document.selectFirst("astro-island[component-url*='ChapterImageViewer']")
+            ?.attr("component-url")?.takeIf(String::isNotBlank)
+            ?: throw ContentUnavailableException("MangaTek current reader module is missing")
+        val chapter = chapterUrl.toHttpUrl()
+        val url = chapter.resolve(asset)?.takeIf {
+            it.scheme == "https" && it.host == chapter.host && it.port == chapter.port &&
+                it.encodedPath.startsWith("/_astro/ChapterImageViewer.") && it.encodedPath.endsWith(".js") &&
+                it.username.isEmpty() && it.password.isEmpty() && it.encodedQuery == null && it.fragment == null
+        } ?: throw ContentUnavailableException("Unexpected MangaTek reader module URL")
+        return withTimeoutOrNull(HTTP_TIMEOUT_MS) {
+            boundedWebClient.httpGet(url, siteHeaders(chapterUrl)).parseRaw()
+        }?.takeIf { it.length in 1..300_000 }
+            ?: throw ContentUnavailableException("MangaTek current reader module did not load")
+    }
+
+    private suspend fun evaluateReaderCrypto(module: String, input: JSONObject, chapterUrl: String): JSONObject {
+        val script = MangaTekWebCrypto.buildScript(module, input, UUID.randomUUID().toString())
+        val raw = withTimeoutOrNull(BROWSER_TIMEOUT_MS) {
+            loaderContext.evaluateJs(chapterUrl, script, siteHeaders(chapterUrl).toMap())
+        }
+        val result = decodeWebViewString(raw.orEmpty())?.let(::JSONObject)
+        if (result == null || result.has("error")) {
+            throw ContentUnavailableException("MangaTek current client could not decrypt speech text; update Android System WebView or retry")
+        }
+        return result
     }
 
     private fun overlayItems(page: JSONObject) = sequenceOf("overlays", "speech_overlays", "texts")
@@ -522,9 +571,10 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         internal const val BROWSER_TIMEOUT_MS = 15_000L
         private const val LOAD_TIMEOUT_MESSAGE = "لم يستجب مصدر MangaTek في الوقت المحدد. أعد المحاولة لاحقًا أو تحقق من فتح الموقع في المتصفح."
         private const val ACCESS_DENIED_MESSAGE = "يرفض موقع MangaTek الوصول إلى هذا الفصل (403). إذا ظهرت صفحة حظر في المتصفح أيضًا، فلا يمكن إكمال التحقق من التطبيق؛ يلزم رفع الحظر من جهة الموقع."
+        private const val UNLOCK_DENIED_MESSAGE = "تعذر الحصول على نصوص الفصل من خادم MangaTek (403)، رغم تحميل صفحة الفصل. حدّث المصدر وأعد المحاولة؛ هذا لا يعني أن صفحة الفصل محظورة."
         private const val OVERLAY_UNLOCK_URL = "https://api.mangatek.com/api/reader/unlock"
         private const val OVERLAY_PAGE_SCHEME = "mangatek-overlay://render"
-        private const val READER_PROOF_SALT = "80c55d2d1f1432551b82f5304b60e1aced87f823a6ed309d"
+        private const val READER_PROOF_SALT = "69e44f7fbc755230d61d205ab9cdb0a6fff5f7bf9209ce25"
 
         internal fun extractReaderImageUrls(document: Document, domain: String): List<String> = document
             .select("div.manga-page img[data-url], div.manga-page img[data-src], div.manga-page img[src]")
