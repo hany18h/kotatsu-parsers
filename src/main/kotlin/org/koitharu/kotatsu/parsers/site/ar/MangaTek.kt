@@ -16,6 +16,7 @@ import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.network.OkHttpWebClient
 import org.koitharu.kotatsu.parsers.util.*
 import java.net.SocketTimeoutException
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.security.MessageDigest
 import java.util.*
@@ -471,6 +472,15 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
             } ?: throw SocketTimeoutException(LOAD_TIMEOUT_MESSAGE)
         }
         directResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
+
+        // The host can report a CAPTCHA, hard block or transport failure as an
+        // IOException. Do not hide that actionable error behind a second,
+        // invisible browser request and finally replace it with a timeout.
+        // Plain HTTP status errors may still need the existing browser fallback
+        // (some pages load normally in the user's verified browser session).
+        directResult.exceptionOrNull()?.let { error ->
+            if (error is IOException && error !is HttpStatusException) throw error
+        }
 
         val quotedSelector = JSONObject.quote(readySelector)
         val webViewResult = runCatchingCancellable {

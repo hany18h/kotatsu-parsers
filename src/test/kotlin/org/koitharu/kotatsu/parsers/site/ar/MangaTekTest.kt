@@ -28,9 +28,11 @@ import org.koitharu.kotatsu.parsers.model.MangaParserSource
 import org.koitharu.kotatsu.parsers.model.MangaSource
 import org.koitharu.kotatsu.parsers.exception.ContentUnavailableException
 import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertSame
 import org.json.JSONObject
 import java.util.Base64
 import java.net.SocketTimeoutException
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -105,6 +107,46 @@ internal class MangaTekTest {
             error("Usable HTTP catalogue must not start the browser")
         }))
         assertEquals("Fixture manga", parser.getList(0, SortOrder.UPDATED, MangaListFilter.EMPTY).single().title)
+    }
+
+    @Test
+    fun hostVerificationOrBlockErrorsReachTheUiWithoutStartingAnInvisibleBrowser() {
+        // Host exceptions need not be dependencies of this parser library:
+        // CloudFlareProtectedException/CloudFlareBlockedException are IOExceptions.
+        for (failure in listOf(IOException("manual verification fixture"), IOException("hard block fixture"))) {
+            var browserCalls = 0
+            val parser = MangaTek(fixtureContext(JSONObject(), false, transportError = failure, browserResult = {
+                browserCalls++
+                error("A host protection error must be shown immediately")
+            }))
+            val actual = assertThrows(IOException::class.java) {
+                runBlocking { parser.getList(0, SortOrder.UPDATED, MangaListFilter.EMPTY) }
+            }
+            assertSame(failure, actual)
+            assertEquals(0, browserCalls)
+        }
+    }
+
+    @Test
+    fun transportTimeoutDoesNotStartAnotherFifteenSecondBrowserAttempt() {
+        val failure = SocketTimeoutException("HTTP fixture timeout")
+        val parser = MangaTek(fixtureContext(JSONObject(), false, transportError = failure, browserResult = {
+            error("A failed connection must not be retried through the hidden browser")
+        }))
+        assertSame(failure, assertThrows(SocketTimeoutException::class.java) {
+            runBlocking { parser.getList(0, SortOrder.UPDATED, MangaListFilter.EMPTY) }
+        })
+    }
+
+    @Test
+    fun successfulIncompleteHtmlStillUsesTheBrowserToHydrateTheCatalogue() = runBlocking {
+        var calls = 0
+        val parser = MangaTek(fixtureContext(JSONObject(), false, documentHtml = "<main></main>", browserResult = {
+            calls++
+            JSONObject.quote(catalogueHtml)
+        }))
+        assertEquals("Fixture manga", parser.getList(0, SortOrder.UPDATED, MangaListFilter.EMPTY).single().title)
+        assertEquals(1, calls)
     }
 
     @Test
@@ -303,7 +345,7 @@ internal class MangaTekTest {
 
     private val catalogueHtml = "<main><div class='grid'><a class='manga-card' href='/manga/fixture'><h3>Fixture manga</h3><img src='/cover.webp'></a></div></main>"
 
-    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200, browserHtml: String? = null, userAgent: String = MangaTek.USER_AGENT, documentHtml: String? = null, overlayVersion: Int = 0, browserResult: (suspend () -> String?)? = null): MangaLoaderContext {
+    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200, browserHtml: String? = null, userAgent: String = MangaTek.USER_AGENT, documentHtml: String? = null, overlayVersion: Int = 0, browserResult: (suspend () -> String?)? = null, transportError: IOException? = null): MangaLoaderContext {
         val key = ByteArray(32) { it.toByte() }
         val iv = ByteArray(16) { (it + 10).toByte() }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -324,6 +366,7 @@ internal class MangaTekTest {
                     "Both document and unlock requests need a total call deadline, not only an idle read timeout")
                 val isUnlock = request.url.host == "api.mangatek.com" && request.url.encodedPath == "/api/reader/unlock"
                 val isModule = request.url.encodedPath == "/_astro/ChapterImageViewer.fixture.js"
+                if (!isUnlock && !isModule) transportError?.let { throw it }
                 check(isUnlock || isModule || request.url.encodedPath in listOf("/reader/fixture/1", "/manga-list")) { "Unexpected fixture request" }
                 val body = if (isUnlock) {
                     assertEquals("POST", request.method)
