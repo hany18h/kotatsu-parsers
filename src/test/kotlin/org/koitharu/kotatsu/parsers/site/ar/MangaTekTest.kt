@@ -122,7 +122,9 @@ internal class MangaTekTest {
             val actual = assertThrows(IOException::class.java) {
                 runBlocking { parser.getList(0, SortOrder.UPDATED, MangaListFilter.EMPTY) }
             }
-            assertSame(failure, actual)
+            // Coroutine debug stacktrace recovery can copy a plain IOException;
+            // the original actionable failure must still be retained as its cause.
+            assertTrue(generateSequence<Throwable>(actual) { it.cause }.any { it === failure })
             assertEquals(0, browserCalls)
         }
     }
