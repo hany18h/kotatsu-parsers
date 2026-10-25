@@ -345,11 +345,15 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 	}
 
 	private suspend fun loadPageDocumentInWebView(pageUrl: String, readySelector: String): Document? {
+		val emptySelector = if (readySelector == CATALOG_CARD_SELECTOR)
+			".wor-library-empty, .wor-empty-state, .no-results" else ""
 		val rawResult = loaderContext.evaluateJs(
 			pageUrl,
 			"""
 			(function() {
-			  if (document.readyState === 'loading' || !document.querySelector('$readySelector')) return null;
+			  if (document.readyState === 'loading') return null;
+			  if (!document.querySelector(${JSONObject.quote(readySelector)}) &&
+			      !(${JSONObject.quote(emptySelector)} && document.querySelector(${JSONObject.quote(emptySelector)}))) return null;
 			  var root = document.documentElement;
 			  return root ? root.outerHTML : null;
 			})()

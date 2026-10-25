@@ -331,12 +331,15 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 
 		val webViewResult = runCatchingCancellable {
 			val quotedSelector = JSONObject.quote(readySelector)
+			val emptySelector = if (readySelector.contains("nhv-library-card"))
+				".no-posts, .search-no-results, .nhv-library-empty" else ""
 			val rawResult = loaderContext.evaluateJs(
 				url,
 				"""
 				(function() {
 				  if (document.readyState === 'loading') return null;
-				  if (!document.querySelector($quotedSelector)) return null;
+				  if (!document.querySelector($quotedSelector) &&
+				      !(${JSONObject.quote(emptySelector)} && document.querySelector(${JSONObject.quote(emptySelector)}))) return null;
 				  return document.documentElement ? document.documentElement.outerHTML : null;
 				})()
 				""".trimIndent(),

@@ -143,7 +143,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		val englishTitle = details.optString("anime_english_title").takeIf(String::isNotBlank)
 
 		return manga.copy(
-			title = details.optString("anime_name").takeIf(String::isNotBlank) ?: manga.title,
+			title = details.optString("anime_name").takeIf(::isValidTitle) ?: manga.title,
 			altTitles = setOfNotNull(englishTitle).ifEmpty { manga.altTitles },
 			publicUrl = "https://anslayer.com/",
 			coverUrl = cover,
