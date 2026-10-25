@@ -150,18 +150,20 @@ internal class AnimePhoenix(private val loaderContext: MangaLoaderContext) : Pag
 		val home = "https://$domain/"
 		val direct = runCatchingCancellable { webClient.httpGet(home).parseHtml() }
 		direct.getOrNull()?.takeIf { extractSearchConfig(it) != null }?.let { return it }
-		val browser = loaderContext.evaluateJs(home, """
+		val browser = runCatchingCancellable { loaderContext.evaluateJs(home, """
 			(function() {
 			  if (typeof PhoenixSearch === 'undefined' && typeof fjSearchPageData === 'undefined') return null;
 			  return document.documentElement.outerHTML;
 			})()
-		""".trimIndent(), mapOf("User-Agent" to config[userAgentKey]))
-		if (browser != null) {
-			val html = JSONObject("{\"value\":$browser}").optString("value")
+		""".trimIndent(), mapOf("User-Agent" to config[userAgentKey])) }
+		val raw = browser.getOrNull()
+		if (raw != null) {
+			val html = JSONObject("{\"value\":$raw}").optString("value")
 			val document = Jsoup.parse(html, home)
 			if (extractSearchConfig(document) != null) return document
 		}
 		direct.exceptionOrNull()?.let { throw it }
+		browser.exceptionOrNull()?.let { throw it }
 		error("Anime Phoenix did not return public search settings")
 	}
 
@@ -179,7 +181,7 @@ internal class AnimePhoenix(private val loaderContext: MangaLoaderContext) : Pag
 		// Use the site's normal same-origin browser request if its HTTP edge
 		// requires the browser session. Each URL is fetched only once per page.
 		val requestHeaders = JSONObject().apply { headers.forEach { (name, value) -> put(name, value) } }
-		val raw = loaderContext.evaluateJs("https://$domain/", """
+		val browser = runCatchingCancellable { loaderContext.evaluateJs("https://$domain/", """
 			(function() {
 			  var key = ${JSONObject.quote(url.toString())};
 			  var state = window.__kotatsuPhoenixSearch;
@@ -192,9 +194,15 @@ internal class AnimePhoenix(private val loaderContext: MangaLoaderContext) : Pag
 			  }
 			  return state.result;
 			})()
-		""".trimIndent(), mapOf("User-Agent" to config[userAgentKey]))
-		if (raw != null) return JSONObject(JSONObject("{\"value\":$raw}").getString("value"))
-		throw checkNotNull(direct.exceptionOrNull())
+		""".trimIndent(), mapOf("User-Agent" to config[userAgentKey]))?.let { raw ->
+			JSONObject(JSONObject("{\"value\":$raw}").getString("value"))
+		} }
+		browser.getOrNull()?.takeIf { it.optBoolean("success") }?.let { return it }
+		// Keep the host's original interactive-verification action when the
+		// browser fallback also fails, rather than replacing it with a timeout.
+		direct.exceptionOrNull()?.let { throw it }
+		browser.exceptionOrNull()?.let { throw it }
+		error("Anime Phoenix did not return a valid search response")
 	}
 
 	private fun parseSearchResult(item: JSONObject?): Manga? {
