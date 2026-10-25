@@ -8,6 +8,26 @@ import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
 import org.koitharu.kotatsu.parsers.network.UserAgents
 
 internal class GalaxyNovelsTest {
+	@Test
+	fun followsTheCurrentPaginationParametersForEachCatalogue() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+		val empty = org.koitharu.kotatsu.parsers.model.MangaListFilter()
+		val order = org.koitharu.kotatsu.parsers.model.SortOrder.UPDATED
+		assertEquals("https://galaxynovels.com/recent/?recent_page=2", parser.catalogueUrl(2, order, empty))
+		assertEquals("https://galaxynovels.com/library/?sort=name&library_page=3",
+			parser.catalogueUrl(3, org.koitharu.kotatsu.parsers.model.SortOrder.ALPHABETICAL, empty))
+		assertEquals("https://galaxynovels.com/novels/page/2/?sort=popular&period=all",
+			parser.catalogueUrl(2, org.koitharu.kotatsu.parsers.model.SortOrder.POPULARITY, empty))
+		assertEquals("https://galaxynovels.com/library/?library_page=2&q=shadow&sort=",
+			parser.catalogueUrl(2, order, empty.copy(query = "shadow")))
+	}
+
+	@Test fun rejectsSuccessfulChallengeHtmlAndAcceptsARealEmptySearch() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+		assertEquals(true, parser.isBlockedDocument(Jsoup.parse("<title>Just a moment...</title><main>Please wait</main>")))
+		assertEquals(false, parser.isReadyDocument(Jsoup.parse("<main>Loading</main>"), GalaxyNovels.CATALOG_CARD_SELECTOR))
+		assertEquals(true, parser.isReadyDocument(Jsoup.parse("<main class='wor-library-empty'>No results</main>"), GalaxyNovels.CATALOG_CARD_SELECTOR))
+	}
 
 	@Test
 	fun resolvesChapterIdFromLegacyProtectedApiUrl() {

@@ -33,6 +33,7 @@ import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.parseRaw
 import org.koitharu.kotatsu.parsers.util.urlEncoded
+import org.koitharu.kotatsu.parsers.util.runCatchingCancellable
 import java.net.URI
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
@@ -178,7 +179,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		var firstFailure: Throwable? = null
 		for (index in 0 until servers.length()) {
 			val server = servers.optJSONObject(index) ?: continue
-			runCatching { resolveServer(server) }
+			runCatchingCancellable { resolveServer(server) }
 				.onSuccess(result::addAll)
 				.onFailure { error -> if (firstFailure == null) firstFailure = error }
 		}
@@ -206,7 +207,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 
 	private fun parseAnime(item: JSONObject): Manga? {
 		val animeId = item.optString("anime_id").takeIf(String::isNotBlank) ?: return null
-		val title = item.optString("anime_name").takeIf(String::isNotBlank) ?: return null
+		val title = item.optString("anime_name").takeIf(::isValidTitle) ?: return null
 		val tags = parseTags(item.optString("anime_genres"))
 		return Manga(
 			id = generateUid(animeId),
@@ -231,13 +232,13 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			MangaTag(title = title, key = title, source = source)
 		}
 
-	private fun parseEpisodes(animeId: String, episodes: JSONArray?): List<MangaChapter> {
+	internal fun parseEpisodes(animeId: String, episodes: JSONArray?): List<MangaChapter> {
 		if (episodes == null) return emptyList()
 		return buildList {
 			for (index in 0 until episodes.length()) {
 				val item = episodes.optJSONObject(index) ?: continue
 				val episodeId = item.optString("episode_id").takeIf(String::isNotBlank) ?: continue
-				val number = item.optString("episode_number").toFloatOrNull()
+				val number = episodeNumber(item)
 					?: (index + 1).toFloat()
 				val title = item.optString("episode_name").trim().ifEmpty {
 					"الحلقة ${formatNumber(number)}"
@@ -256,7 +257,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 					),
 				)
 			}
-		}.distinctBy(MangaChapter::id).sortedBy(MangaChapter::number)
+		}.distinctBy(MangaChapter::id).distinctBy { it.number to it.title }.sortedBy(MangaChapter::number)
 	}
 
 	private suspend fun resolveServer(server: JSONObject): List<AnimeStream> {
@@ -290,7 +291,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 				// One blocked provider must not discard all remaining servers.
 				// MediaFire, in particular, can be unavailable on one network while
 				// StreamTape from the same response is still playable.
-				runCatching {
+				runCatchingCancellable {
 						when {
 							candidate.contains("mediafire.com", ignoreCase = true) -> {
 								listOfNotNull(resolveMediaFire(candidate, serverName))
@@ -322,7 +323,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		var firstFailure: Throwable? = null
 		var receivedResponse = false
 		for (requestUrl in alternativeEndpointCandidates(serverUrl)) {
-			val raw = runCatching {
+			val raw = runCatchingCancellable {
 				statelessWebClient.httpGet(
 					requestUrl,
 					pageHeaders("https://anslayer.com/"),
@@ -354,7 +355,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	private suspend fun extractPageLinks(url: String, referer: String): List<String> {
-		val raw = runCatching {
+		val raw = runCatchingCancellable {
 			statelessWebClient.httpGet(url, pageHeaders(referer)).parseRaw()
 		}.getOrNull() ?: return emptyList()
 		return buildList {
@@ -450,6 +451,15 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		const val ANIME_PATH = "/anime/"
 		const val EPISODE_PATH = "/episode/"
 		const val EPISODE_NUMBER_EPSILON = 0.001f
+		private val NAMED_EPISODE_NUMBER = Regex("""(?:الحلقة|حلقه|episode)\s*[:#-]?\s*([\p{Nd}]+(?:[.,][\p{Nd}]+)?)""", RegexOption.IGNORE_CASE)
+
+		internal fun isValidTitle(value: String): Boolean = value.isNotBlank() &&
+			value.trim().lowercase(Locale.ROOT) !in setOf("access denied", "acess denied", "forbidden", "just a moment...")
+
+		internal fun episodeNumber(item: JSONObject): Float? =
+			NAMED_EPISODE_NUMBER.find(item.optString("episode_name"))?.groupValues?.getOrNull(1)
+				?.map { if (it.isDigit()) Character.getNumericValue(it).digitToChar() else if (it == ',') '.' else it }
+				?.joinToString("")?.toFloatOrNull() ?: item.optString("episode_number").toFloatOrNull()
 
 		val QUALITY_NUMBER = Regex("""(?:^|[_\-.])(\d{3,4})p?(?:[_\-.]|$)""", RegexOption.IGNORE_CASE)
 		val DIRECT_MEDIA_URL = Regex(
@@ -493,7 +503,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 				.toList()
 			return availableEpisodes.firstOrNull { it.optString("episode_id") == episodeId }
 				?: availableEpisodes.firstOrNull {
-					val freshNumber = it.optString("episode_number").toFloatOrNull()
+					val freshNumber = episodeNumber(it)
 					freshNumber != null && abs(freshNumber - episodeNumber) <= EPISODE_NUMBER_EPSILON
 				}
 		}
@@ -511,7 +521,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		 * as a fallback instead of losing the whole server list.
 		 */
 		fun alternativeUrlFromCdn(serverUrl: String): String? {
-			val uri = runCatching { URI(serverUrl) }.getOrNull() ?: return null
+			val uri = runCatching { URI(serverUrl.replace("|", "%7C")) }.getOrNull() ?: return null
 			if (!uri.path.orEmpty().endsWith("/vq.php", ignoreCase = true)) return null
 			val query = uri.rawQuery.orEmpty()
 				.split('&')

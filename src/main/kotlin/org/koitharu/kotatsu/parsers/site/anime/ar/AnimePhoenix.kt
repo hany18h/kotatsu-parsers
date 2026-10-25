@@ -6,6 +6,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import org.jsoup.Jsoup
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -28,6 +29,7 @@ import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.oneOrThrowIfMany
 import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.parseJson
+import org.koitharu.kotatsu.parsers.util.runCatchingCancellable
 import org.koitharu.kotatsu.parsers.util.src
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
 import org.koitharu.kotatsu.parsers.util.toRelativeUrl
@@ -36,10 +38,12 @@ import java.nio.charset.StandardCharsets
 import java.util.Base64
 import java.util.EnumSet
 import java.util.Locale
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 @MangaSourceParser("ANIME_PHOENIX", "Anime Phoenix", "ar", ContentType.ANIME)
-internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
-	context = context,
+internal class AnimePhoenix(private val loaderContext: MangaLoaderContext) : PagedMangaParser(
+	context = loaderContext,
 	source = MangaParserSource.ANIME_PHOENIX,
 	pageSize = PAGE_SIZE,
 	searchPageSize = PAGE_SIZE,
@@ -69,7 +73,7 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 	}
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions {
-		val doc = webClient.httpGet("https://$domain/search/").parseHtml()
+		val doc = loadSearchDocument()
 		val tags = doc.select(".custom-select[data-filter=genre] .select-option[data-value]")
 			.mapNotNullTo(LinkedHashSet()) { option ->
 				val key = option.attr("data-value").trim().takeIf(String::isNotEmpty)
@@ -95,15 +99,11 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 		order: SortOrder,
 		filter: MangaListFilter,
 	): List<Manga> {
-		val configDoc = webClient.httpGet("https://$domain/search/").parseHtml()
-		val searchConfig = extractSearchConfig(configDoc) ?: return emptyList()
-		val nonce = searchConfig.optString("nonce").takeIf(String::isNotBlank) ?: return emptyList()
-		val ajaxUrl = searchConfig.optString("ajax_url")
-			.takeIf(String::isNotBlank)
-			?: "https://$domain/wp-admin/admin-ajax.php"
+		val searchConfig = checkNotNull(extractSearchConfig(loadSearchDocument())) {
+			"Anime Phoenix search configuration is unavailable"
+		}
 		val payload = mapOf(
 			"action" to "phoenix_search",
-			"nonce" to nonce,
 			"q" to filter.query?.trim().orEmpty(),
 			"type" to "tvshow",
 			"genre" to filter.tags.oneOrThrowIfMany()?.key.orEmpty(),
@@ -125,18 +125,76 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 			"per_page" to PAGE_SIZE.toString(),
 			"dropdown" to "0",
 		)
-		val response = webClient.httpPost(
-			ajaxUrl.toHttpUrl(),
-			payload,
-			ajaxHeaders("https://$domain/search/"),
-		).parseJson()
-		if (!response.optBoolean("success")) return emptyList()
-		val results = response.optJSONObject("data")?.optJSONArray("results") ?: return emptyList()
+		val response = if (searchConfig.optString("api_url").isNotBlank()) {
+			loadPublicSearch(searchConfig, payload)
+		} else {
+			val nonce = searchConfig.optString("nonce").takeIf(String::isNotBlank)
+				?: error("Anime Phoenix did not publish a search nonce")
+			val ajaxUrl = searchConfig.optString("ajax_url").ifBlank { "https://$domain/wp-admin/admin-ajax.php" }
+			webClient.httpPost(ajaxUrl.toHttpUrl(), payload + ("nonce" to nonce), ajaxHeaders("https://$domain/search/")).parseJson()
+		}
+		check(response.optBoolean("success")) { "Anime Phoenix rejected the search request" }
+		val results = checkNotNull(response.optJSONObject("data")?.optJSONArray("results")) {
+			"Anime Phoenix returned an invalid search response"
+		}
 		return buildList {
 			for (i in 0 until results.length()) {
 				parseSearchResult(results.optJSONObject(i))?.let(::add)
 			}
 		}.distinctBy(Manga::url)
+	}
+
+	private suspend fun loadSearchDocument(): Document {
+		// Current public search settings are published on every page. The old
+		// /search/ nonce endpoint is no longer needed and is often challenged.
+		val home = "https://$domain/"
+		val direct = runCatchingCancellable { webClient.httpGet(home).parseHtml() }
+		direct.getOrNull()?.takeIf { extractSearchConfig(it) != null }?.let { return it }
+		val browser = loaderContext.evaluateJs(home, """
+			(function() {
+			  if (typeof PhoenixSearch === 'undefined' && typeof fjSearchPageData === 'undefined') return null;
+			  return document.documentElement.outerHTML;
+			})()
+		""".trimIndent(), mapOf("User-Agent" to config[userAgentKey]))
+		if (browser != null) {
+			val html = JSONObject("{\"value\":$browser}").optString("value")
+			val document = Jsoup.parse(html, home)
+			if (extractSearchConfig(document) != null) return document
+		}
+		direct.exceptionOrNull()?.let { throw it }
+		error("Anime Phoenix did not return public search settings")
+	}
+
+	private suspend fun loadPublicSearch(settings: JSONObject, payload: Map<String, String>): JSONObject {
+		val params = payload - setOf("action", "nonce", "status") + ("release_status" to payload["status"].orEmpty())
+		val url = settings.getString("api_url").toAbsoluteUrl(domain).toHttpUrl().newBuilder()
+			.apply { params.forEach { (key, value) -> addQueryParameter(key, value) } }.build()
+		val timestamp = (System.currentTimeMillis() / 1000).toString()
+		val headers = ajaxHeaders("https://$domain/").newBuilder()
+			.add("X-PX-Timestamp", timestamp)
+			.add("X-PX-Signature", signSearch(params, timestamp, settings.getString("public_key")))
+			.build()
+		val direct = runCatchingCancellable { webClient.httpGet(url.toString(), headers).parseJson() }
+		direct.getOrNull()?.let { return it }
+		// Use the site's normal same-origin browser request if its HTTP edge
+		// requires the browser session. Each URL is fetched only once per page.
+		val requestHeaders = JSONObject().apply { headers.forEach { (name, value) -> put(name, value) } }
+		val raw = loaderContext.evaluateJs("https://$domain/", """
+			(function() {
+			  var key = ${JSONObject.quote(url.toString())};
+			  var state = window.__kotatsuPhoenixSearch;
+			  if (!state || state.key !== key) {
+			    state = window.__kotatsuPhoenixSearch = {key: key, result: null};
+			    fetch(key, {credentials: 'same-origin', headers: $requestHeaders})
+			      .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+			      .then(function(r) { state.result = JSON.stringify(r); })
+			      .catch(function() { state.result = JSON.stringify({success: false}); });
+			  }
+			  return state.result;
+			})()
+		""".trimIndent(), mapOf("User-Agent" to config[userAgentKey]))
+		if (raw != null) return JSONObject(JSONObject("{\"value\":$raw}").getString("value"))
+		throw checkNotNull(direct.exceptionOrNull())
 	}
 
 	private fun parseSearchResult(item: JSONObject?): Manga? {
@@ -308,13 +366,24 @@ internal class AnimePhoenix(context: MangaLoaderContext) : PagedMangaParser(
 		private const val SEARCH_CONFIG_VARIABLE = "fjSearchPageData"
 
 		internal fun extractSearchConfig(document: Document): JSONObject? {
-			val script = document.select("script")
-				.asSequence()
-				.map { it.data() }
-				.firstOrNull { SEARCH_CONFIG_VARIABLE in it }
-				?: return null
-			val raw = extractAssignedJsonObject(script, SEARCH_CONFIG_VARIABLE) ?: return null
-			return runCatching { JSONObject(raw) }.getOrNull()
+			for (variable in listOf("PhoenixSearch", SEARCH_CONFIG_VARIABLE)) {
+				for (script in document.select("script")) {
+					val raw = extractAssignedJsonObject(script.data(), variable) ?: continue
+					val settings = runCatching { JSONObject(raw) }.getOrNull() ?: continue
+					if (settings.optString("api_url").isNotBlank() || settings.optString("nonce").isNotBlank()) return settings
+				}
+			}
+			return null
+		}
+
+		internal fun signSearch(params: Map<String, String>, timestamp: String, publicKey: String): String {
+			val canonical = listOf(timestamp, params["q"].orEmpty(), params["type"].orEmpty().ifEmpty { "all" },
+				params["genre"].orEmpty(), params["release_status"] ?: params["status"].orEmpty(),
+				params["year"].orEmpty(), params["season"].orEmpty(), params["page"].orEmpty().ifEmpty { "1" },
+				params["sort"].orEmpty().ifEmpty { "relevance" }).joinToString(":")
+			val mac = Mac.getInstance("HmacSHA256")
+			mac.init(SecretKeySpec(publicKey.toByteArray(StandardCharsets.UTF_8), "HmacSHA256"))
+			return mac.doFinal(canonical.toByteArray(StandardCharsets.UTF_8)).joinToString("") { "%02x".format(it) }
 		}
 
 		/**

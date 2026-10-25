@@ -1,6 +1,5 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
-import okhttp3.CookieJar
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONObject
@@ -24,7 +23,8 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 	private val publicChapterClient: WebClient by lazy {
 		OkHttpWebClient(
 			loaderContext.httpClient.newBuilder()
-				.cookieJar(CookieJar.NO_COOKIES)
+				// Keep the browser's source session after a successful challenge.
+				// Dropping its cookies makes the chapter-list AJAX request fail again.
 				.cache(null)
 				.build(),
 			source,
@@ -71,7 +71,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 			else -> "latest"
 		}
 		val url = if (query.isNotEmpty()) {
-			"https://$domain/?s=${query.urlEncoded()}&post_type=wp-manga&page=$page"
+			"https://$domain/?s=${query.urlEncoded()}&post_type=wp-manga&paged=${page.coerceAtLeast(1)}"
 		} else {
 			val tag = filter.tags.oneOrThrowIfMany()?.key
 			val root = if (tag == null) "/cont/" else "/cont-genre/${tag.urlEncoded()}/"
@@ -120,6 +120,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 			pageUrl,
 			"https://$domain/cont/",
 			"h1.nhv-novel-title, div.post-title h1",
+			noCache = true,
 		)
 		val state = parseState(
 			doc.selectFirst(".nhv-novel-status, .post-status .summary-content")?.text().orEmpty(),
@@ -326,7 +327,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		val directResult = runCatchingCancellable {
 			webClient.httpGet(url, siteHeaders(referer, noCache)).parseHtml()
 		}
-		directResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
+		directResult.getOrNull()?.takeIf { isReadyDocument(it, readySelector) }?.let { return it }
 
 		val webViewResult = runCatchingCancellable {
 			val quotedSelector = JSONObject.quote(readySelector)
@@ -378,7 +379,8 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		}
 
 		internal fun isReadyDocument(document: Document, selector: String): Boolean =
-			!isBlockedDocument(document) && document.selectFirst(selector) != null
+			!isBlockedDocument(document) && (document.selectFirst(selector) != null ||
+				(selector.contains("nhv-library-card") && document.selectFirst(".no-posts, .search-no-results, .nhv-library-empty") != null))
 
 		internal fun selectPublicChapterElements(doc: Document): org.jsoup.select.Elements =
 			doc.select(".nhv-novel-recent__list li.wp-manga-chapter, ul.main li.wp-manga-chapter")
@@ -389,7 +391,7 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 
 		internal fun isBlockedDocument(document: Document): Boolean {
 			val text = (document.title() + " " + document.text()).lowercase(Locale.ROOT)
-			return BLOCK_PAGE_MARKERS.any(text::contains)
+			return BLOCK_PAGE_MARKERS.any(text::contains) || document.selectFirst("#challenge-form, script[src*=/cdn-cgi/challenge-platform/]") != null
 		}
 
 		private val ZERO_WIDTH_MARKS = Regex("[\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\uFEFF]")
@@ -411,6 +413,8 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 			"قوى خارقة", "كوميديا", "للكبار", "لعبة", "مأساة", "مدرسي", "مغامرة", "نظام", "نفسي",
 		)
 		private val BLOCK_PAGE_MARKERS = listOf(
+			"just a moment",
+			"checking your browser",
 			"تم حظرك من قبل الخادم",
 			"حاول استخدام شبكة اتصال مختلفة",
 			"you have been blocked",

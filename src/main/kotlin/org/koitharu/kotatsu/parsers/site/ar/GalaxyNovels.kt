@@ -86,19 +86,26 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		order: SortOrder,
 		filter: MangaListFilter,
 	): List<Manga> {
+		val url = catalogueUrl(page, order, filter)
+		val document = loadPublicDocument(url, "https://$domain/", CATALOG_CARD_SELECTOR)
+		return parseNovelList(document)
+	}
+
+	internal fun catalogueUrl(page: Int, order: SortOrder, filter: MangaListFilter): String {
+		val currentPage = page.coerceAtLeast(1)
 		val query = filter.query?.trim().orEmpty()
-		val url = if (query.isEmpty() && filter.tags.isEmpty() && filter.states.isEmpty()) {
+		return if (query.isEmpty() && filter.tags.isEmpty() && filter.states.isEmpty()) {
 			when (order) {
-				SortOrder.UPDATED -> "https://$domain/recent/?page=$page"
-				SortOrder.ALPHABETICAL -> "https://$domain/library/?sort=name&page=$page"
-				else -> "https://$domain/novels/?sort=popular&period=all&page=$page"
+				SortOrder.UPDATED -> "https://$domain/recent/?recent_page=$currentPage"
+				SortOrder.ALPHABETICAL -> "https://$domain/library/?sort=name&library_page=$currentPage"
+				else -> "https://$domain/novels/" + (if (currentPage > 1) "page/$currentPage/" else "") + "?sort=popular&period=all"
 			}
 		} else {
 			buildString {
 				append("https://")
 				append(domain)
-				append("/library/?page=")
-				append(page)
+				append("/library/?library_page=")
+				append(currentPage)
 				if (query.isNotEmpty()) {
 					append("&q=")
 					append(query.urlEncoded())
@@ -115,8 +122,6 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 				append(if (order == SortOrder.ALPHABETICAL) "name" else "")
 			}
 		}
-		val document = loadPublicDocument(url, "https://$domain/", CATALOG_CARD_SELECTOR)
-		return parseNovelList(document)
 	}
 
 	internal fun parseNovelList(document: Document): List<Manga> =
@@ -189,14 +194,14 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			?.trim()
 			?.takeIf(String::isNotEmpty)
 			?.toAbsoluteUrl(domain)
-		val packedChapters = manifestUrl?.let { url ->
-			runCatching {
-				val manifest = webClient.httpGet(url, siteHeaders(mangaUrl)).parseRaw()
-				val packUrl = parseManifestPackUrl(manifest) ?: return@runCatching emptyList()
-				parseCachedChapters(webClient.httpGet(packUrl, siteHeaders(mangaUrl)).parseRaw())
-			}.getOrNull()
-		}.orEmpty()
-		val chapters = packedChapters.ifEmpty { parseHtmlChapters(document) }
+		val chapters = if (manifestUrl != null) {
+			val manifest = webClient.httpGet(manifestUrl, siteHeaders(mangaUrl)).parseRaw()
+			val packUrl = checkNotNull(parseManifestPackUrl(manifest)) { "Galaxy chapter manifest is invalid" }
+			parseCachedChapters(webClient.httpGet(packUrl.toAbsoluteUrl(domain), siteHeaders(mangaUrl)).parseRaw())
+				.also { check(it.isNotEmpty()) { "Galaxy returned an empty chapter pack" } }
+		} else {
+			parseHtmlChapters(document)
+		}
 		return chapters
 			.distinctBy(MangaChapter::id)
 			.sortedBy(MangaChapter::number)
@@ -259,14 +264,14 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		val directResult = runCatchingCancellable {
 			webClient.httpGet(url, siteHeaders(referer)).parseHtml()
 		}
-		directResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
+		directResult.getOrNull()?.takeIf { isReadyDocument(it, readySelector) }?.let { return it }
 
 		// Some networks are still challenged at the HTTP edge. In that case use a
 		// real WebView, but keep polling until the page's useful content exists.
 		val webViewResult = runCatchingCancellable {
 			loadPageDocumentInWebView(url, readySelector)
 		}
-		webViewResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { return it }
+		webViewResult.getOrNull()?.takeIf { isReadyDocument(it, readySelector) }?.let { return it }
 
 		directResult.exceptionOrNull()?.let { throw it }
 		webViewResult.exceptionOrNull()?.let { throw it }
@@ -274,9 +279,13 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 	}
 
 	internal fun isBlockedDocument(document: Document): Boolean {
-		val text = document.text().lowercase(Locale.ROOT)
-		return BLOCK_PAGE_MARKERS.any(text::contains)
+		val text = (document.title() + " " + document.text()).lowercase(Locale.ROOT)
+		return BLOCK_PAGE_MARKERS.any(text::contains) || document.selectFirst("#challenge-form, script[src*=/cdn-cgi/challenge-platform/]") != null
 	}
+
+	internal fun isReadyDocument(document: Document, selector: String): Boolean =
+		!isBlockedDocument(document) && (document.selectFirst(selector) != null ||
+			(selector == CATALOG_CARD_SELECTOR && document.selectFirst(".wor-library-empty, .wor-empty-state, .no-results") != null))
 
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
@@ -329,6 +338,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			  return content ? content.outerHTML : null;
 			})()
 			""".trimIndent(),
+			mapOf("User-Agent" to config[userAgentKey], "Referer" to "https://$domain/"),
 		) ?: return null
 		val html = decodeWebViewString(rawResult) ?: return null
 		return Jsoup.parse(html, chapterUrl)
@@ -344,6 +354,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			  return root ? root.outerHTML : null;
 			})()
 			""".trimIndent(),
+			mapOf("User-Agent" to config[userAgentKey], "Referer" to "https://$domain/"),
 		) ?: return null
 		val html = decodeWebViewString(rawResult) ?: return null
 		return Jsoup.parse(html, pageUrl)
@@ -455,6 +466,8 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		private const val DETAILS_READY_SELECTOR =
 			"[data-wor-chapters-container][data-manifest-url], article.wor-novel-chapter-item"
 		private val BLOCK_PAGE_MARKERS = listOf(
+			"just a moment",
+			"checking your browser",
 			"تم حظرك من قبل الخادم",
 			"حاول استخدام شبكة اتصال مختلفة",
 			"you have been blocked",

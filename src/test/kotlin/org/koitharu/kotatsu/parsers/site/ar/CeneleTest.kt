@@ -8,6 +8,11 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 internal class CeneleTest {
+	@Test fun neverAcceptsAChallengeAsAnEmptyCatalogue() {
+		assertTrue(Cenele.isBlockedDocument(Jsoup.parse("<title>Just a moment...</title>")))
+		assertFalse(Cenele.isReadyDocument(Jsoup.parse("<main>Loading</main>"), "article.nhv-library-card"))
+		assertTrue(Cenele.isReadyDocument(Jsoup.parse("<div class='nhv-library-empty'>No results</div>"), "article.nhv-library-card"))
+	}
 
 	@Test
 	fun readsPublicChapterListParametersFromTheNovelPage() {

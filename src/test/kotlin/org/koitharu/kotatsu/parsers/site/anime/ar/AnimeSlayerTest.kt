@@ -9,6 +9,27 @@ import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.network.UserAgents
 
 internal class AnimeSlayerTest {
+	@Test fun repairsShiftedAndDuplicatedEpisodeNumbersFromVisibleNames() {
+		val episodes = JSONArray("""[
+			{"episode_id":"one","episode_name":"الحلقة : 1","episode_number":"1"},
+			{"episode_id":"duplicate","episode_name":"الحلقة : 1","episode_number":"2"},
+			{"episode_id":"two","episode_name":"الحلقة : ٢","episode_number":"3"}
+		]""")
+		val chapters = AnimeSlayer(MangaLoaderContextMock).parseEpisodes("14509", episodes)
+		assertEquals(listOf(1f, 2f), chapters.map { it.number })
+		assertEquals("two", AnimeSlayer.findEpisode(episodes, "old-id", 2f)?.optString("episode_id"))
+	}
+
+	@Test fun recoversAlternativeServerFromRawPipeInCurrentCdnUrl() {
+		assertEquals("https://a-reslayer.com/la/public/api/f?n=ao_no_hako_season_2%5C1",
+			AnimeSlayer.alternativeUrlFromCdn("https://anslayer.com/anime/public/vq.php?f=ao_no_hako_season_2&e=1|cbm"))
+	}
+
+	@Test fun excludesServerBlockMessagesFromAnimeTitles() {
+		assertEquals(false, AnimeSlayer.isValidTitle("Access Denied"))
+		assertEquals(false, AnimeSlayer.isValidTitle("Acess Denied"))
+		assertEquals(true, AnimeSlayer.isValidTitle("Ao no Hako Season 2"))
+	}
 
 	@Test
 	fun ignoresPersistedUserAgentAndUsesTheSameIdentityInDebugAndRelease() {
