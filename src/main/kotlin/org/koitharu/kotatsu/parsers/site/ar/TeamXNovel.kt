@@ -4,6 +4,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import org.jsoup.nodes.Element
+import org.jsoup.nodes.Document
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import java.io.IOException
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -83,7 +86,7 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 						}
 
 						filter.states.oneOrThrowIfMany()?.let {
-							append("status=")
+							append("&status=")
 							append(
 								when (it) {
 									MangaState.ONGOING -> "مستمرة"
@@ -98,6 +101,7 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 			}
 		}
 		val doc = webClient.httpGet(url).parseHtml()
+		validateDocument(doc, domain, "div.listupd, div.post-body, #select_genre")
 		return doc.select("div.listupd .bs .bsx").ifEmpty {
 			doc.select("div.post-body .box")
 		}.map { div ->
@@ -126,6 +130,7 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> {
 		val doc = webClient.httpGet("https://$domain/series").parseHtml()
+		validateDocument(doc, domain, "#select_genre")
 		return doc.requireElementById("select_genre").select("option").mapToSet {
 			MangaTag(
 				key = it.attr("value"),
@@ -137,6 +142,7 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
+		validateDocument(doc, domain, ".full-list-info")
 		val mangaUrl = manga.url.toAbsoluteUrl(domain)
 		val maxPageChapterSelect = doc.select(".pagination .page-item a")
 		var maxPageChapter = 1
@@ -184,7 +190,9 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 	}
 
 	private suspend fun loadChapters(baseUrl: String, page: Int): List<MangaChapter> {
-		return parseChapters(webClient.httpGet("$baseUrl?page=$page").parseHtml().body())
+		val doc = webClient.httpGet("$baseUrl?page=$page").parseHtml()
+		validateDocument(doc, domain, ".enhanced-chapters-grid, .chapter-card, .eplister")
+		return parseChapters(doc.body())
 	}
 
 	private val dateFormat = SimpleDateFormat("yyyy-MM-dd hh:mm:ss", Locale.getDefault())
@@ -254,6 +262,7 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val fullUrl = chapter.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(fullUrl).parseHtml()
+		validateDocument(doc, domain, ".image_list img, .image_list canvas")
 		return doc.select(".image_list img, .image_list canvas").map { img ->
 			val url = when {
 				img.hasAttr("src") -> img.requireSrc().toRelativeUrl(domain)
@@ -266,6 +275,18 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 				preview = null,
 				source = source,
 			)
+		}
+	}
+
+	internal companion object {
+		internal fun validateDocument(doc: Document, domain: String, selector: String) {
+			val host = doc.location().toHttpUrlOrNull()?.host?.removePrefix("www.")
+			val expectedHost = domain.removePrefix("www.")
+			val challenge = doc.title().contains("just a moment", ignoreCase = true) ||
+				doc.selectFirst("#challenge-form, .cf-error-details") != null
+			if (host != expectedHost || challenge || doc.selectFirst(selector) == null) {
+				throw IOException("مصدر Team X غير متاح حاليًا أو أعاد صفحة غير صالحة. حاول لاحقًا أو اختر مصدرًا بديلًا لنفس العمل.")
+			}
 		}
 	}
 }
