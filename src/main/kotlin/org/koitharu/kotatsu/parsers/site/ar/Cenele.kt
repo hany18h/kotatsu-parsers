@@ -398,8 +398,8 @@ internal class Cenele(private val loaderContext: MangaLoaderContext) :
 		}
 
 		private val ZERO_WIDTH_MARKS = Regex("[\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\uFEFF]")
-		private const val CENELE_BROWSER_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) " +
-			"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+		private const val CENELE_BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+			"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 		private val HIDDEN_CSS_CLASS = Regex(
 			"""\.([A-Za-z][\w-]*)\s*\{[^{}]*display\s*:\s*none(?:\s*!important)?[^{}]*\}""",
 			RegexOption.IGNORE_CASE,

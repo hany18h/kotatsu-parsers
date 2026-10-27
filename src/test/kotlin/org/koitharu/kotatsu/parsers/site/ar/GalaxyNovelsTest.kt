@@ -5,7 +5,8 @@ import org.junit.jupiter.api.Test
 import org.jsoup.Jsoup
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
-import org.koitharu.kotatsu.parsers.network.UserAgents
+import org.koitharu.kotatsu.parsers.util.getCookies
+import org.koitharu.kotatsu.parsers.util.insertCookies
 
 internal class GalaxyNovelsTest {
 	@Test
@@ -44,7 +45,29 @@ internal class GalaxyNovelsTest {
 	fun usesBrowserUserAgentAcceptedByReaderPages() {
 		val parser = GalaxyNovels(MangaLoaderContextMock)
 
-		assertEquals(UserAgents.CHROME_MOBILE, parser.getRequestHeaders()["User-Agent"])
+		val userAgent = parser.getRequestHeaders()["User-Agent"].orEmpty()
+		assertEquals(true, userAgent.contains("Windows NT 10.0"))
+		assertEquals(false, userAgent.contains("Mobile"))
+	}
+
+	@Test fun avoidsTheNavigationHeaderCombinationRejectedByTheSite() {
+		val parser = GalaxyNovels(MangaLoaderContextMock)
+		for (chapter in listOf(false, true)) {
+			val headers = parser.siteHeaders("https://galaxynovels.com/", isChapterRequest = chapter)
+			assertEquals(null, headers["Sec-Fetch-Dest"])
+			assertEquals(null, headers["Sec-Fetch-Mode"])
+			assertEquals(null, headers["Sec-Fetch-Site"])
+			assertEquals(null, headers["Upgrade-Insecure-Requests"])
+		}
+	}
+
+	@Test fun readerPreferenceCoexistsWithTheExistingSiteSession() {
+		val jar = MangaLoaderContextMock.cookieJar
+		jar.insertCookies("galaxynovels.com", "novel_test_session=kept; Path=/; Secure")
+		GalaxyNovels(MangaLoaderContextMock).prepareReaderSession()
+		val cookies = jar.getCookies("galaxynovels.com").associate { it.name to it.value }
+		assertEquals("1", cookies["wor_reader_js"])
+		assertEquals("kept", cookies["novel_test_session"])
 	}
 
 	@Test

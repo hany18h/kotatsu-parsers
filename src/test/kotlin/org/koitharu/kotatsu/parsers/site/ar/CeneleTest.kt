@@ -8,6 +8,13 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 internal class CeneleTest {
+	@Test fun usesTheDesktopProfileAcceptedByThePublicCatalogue() {
+		val parser = Cenele(org.koitharu.kotatsu.parsers.MangaLoaderContextMock)
+		val userAgent = parser.getRequestHeaders()["User-Agent"].orEmpty()
+		assertTrue(userAgent.contains("Windows NT 10.0"))
+		assertFalse(userAgent.contains("Mobile"))
+	}
+
 	@Test fun neverAcceptsAChallengeAsAnEmptyCatalogue() {
 		assertTrue(Cenele.isBlockedDocument(Jsoup.parse("<title>Just a moment...</title>")))
 		assertFalse(Cenele.isReadyDocument(Jsoup.parse("<main>Loading</main>"), "article.nhv-library-card"))

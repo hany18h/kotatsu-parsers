@@ -32,9 +32,9 @@ import org.koitharu.kotatsu.parsers.model.NovelChapterContent
 import org.koitharu.kotatsu.parsers.model.NovelImage
 import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
 import org.koitharu.kotatsu.parsers.model.SortOrder
-import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.util.attrAsRelativeUrlOrNull
 import org.koitharu.kotatsu.parsers.util.generateUid
+import org.koitharu.kotatsu.parsers.util.insertCookies
 import org.koitharu.kotatsu.parsers.util.mapNotNullToSet
 import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.parseRaw
@@ -55,9 +55,8 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 
 	override val configKeyDomain = ConfigKey.Domain("galaxynovels.com")
 
-	// Galaxy protects chapter pages more strictly than its catalogue. Those
-	// pages reject Android WebView identities while accepting normal Chrome.
-	override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_MOBILE)
+	// Keep the plain desktop browser profile accepted by the public HTTP reader.
+	override val userAgentKey = ConfigKey.UserAgent(GALAXY_BROWSER_USER_AGENT)
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,
@@ -288,6 +287,7 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			(selector == CATALOG_CARD_SELECTOR && document.selectFirst(".wor-library-empty, .wor-empty-state, .no-results") != null))
 
 	override suspend fun getChapterContent(chapter: MangaChapter): NovelChapterContent? {
+		prepareReaderSession()
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
 		val requestUrl = findLegacyChapterPostId(chapter.url)?.let { postId ->
 			// Older versions stored wor-reader-app REST URLs. That endpoint is now
@@ -297,20 +297,8 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			"https://$domain/?p=$postId"
 		} ?: chapterUrl
 
-		// Galaxy rejects OkHttp's TLS/browser fingerprint on chapter paths while
-		// serving the same public page to a real browser. Start with WebView so a
-		// successful chapter is not delayed by the known-to-fail HTTP attempt.
-		val webViewResult = runCatchingCancellable {
-			loadChapterDocumentInWebView(requestUrl)
-		}
-		webViewResult.getOrNull()?.let { document ->
-			extractChapterContent(document)?.let { content ->
-				return sanitizeChapterContent(content, requestUrl)
-			}
-		}
-
-		// Keep the normal HTTP reader as a fallback for environments where WebView
-		// is unavailable or when Galaxy relaxes its chapter-page WAF.
+		// The site rejects browser navigation's Sec-Fetch header combination.
+		// Prefer the plain HTTP reader; loading a WebView first repeats that denial.
 		val directResult = runCatchingCancellable {
 			val response = webClient.httpGet(
 				requestUrl,
@@ -320,13 +308,28 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 			response.parseHtml() to resolvedChapterUrl
 		}
 		directResult.getOrNull()?.let { (document, resolvedChapterUrl) ->
+			if (isBlockedDocument(document)) return@let
 			extractChapterContent(document)?.let { content ->
 				return sanitizeChapterContent(content, resolvedChapterUrl)
+			}
+		}
+		val webViewResult = runCatchingCancellable {
+			loadChapterDocumentInWebView(requestUrl)
+		}
+		webViewResult.getOrNull()?.takeUnless(::isBlockedDocument)?.let { document ->
+			extractChapterContent(document)?.let { content ->
+				return sanitizeChapterContent(content, requestUrl)
 			}
 		}
 		directResult.exceptionOrNull()?.let { throw it }
 		webViewResult.exceptionOrNull()?.let { throw it }
 		return null
+	}
+
+	internal fun prepareReaderSession() {
+		// OkHttp replaces an explicit Cookie header whenever the jar has cookies.
+		// Store this public reader preference alongside the existing site session.
+		loaderContext.cookieJar.insertCookies(domain, "wor_reader_js=1; Path=/; Secure; SameSite=Lax")
 	}
 
 	private suspend fun loadChapterDocumentInWebView(chapterUrl: String): Document? {
@@ -412,10 +415,6 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		.add("Referer", referer)
 		.add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 		.add("Accept-Language", "ar,en-US;q=0.7,en;q=0.3")
-		.add("Sec-Fetch-Dest", "document")
-		.add("Sec-Fetch-Mode", "navigate")
-		.add("Sec-Fetch-Site", "same-origin")
-		.add("Upgrade-Insecure-Requests", "1")
 		.add("User-Agent", config[userAgentKey])
 		.apply {
 			if (isChapterRequest) {
@@ -465,6 +464,8 @@ internal class GalaxyNovels(private val loaderContext: MangaLoaderContext) : Pag
 		if (number % 1f == 0f) number.toInt().toString() else number.toString()
 
 	internal companion object {
+		private const val GALAXY_BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+			"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 		private const val PAGE_SIZE = 20
 		internal const val CATALOG_CARD_SELECTOR = "article.wor-novel-card, article.wor-library-card"
 		private const val DETAILS_READY_SELECTOR =
