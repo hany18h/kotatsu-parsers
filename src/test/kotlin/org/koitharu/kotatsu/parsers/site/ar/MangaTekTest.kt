@@ -30,6 +30,7 @@ import org.koitharu.kotatsu.parsers.exception.ContentUnavailableException
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertSame
 import org.json.JSONObject
+import com.koushikdutta.quack.QuackContext
 import java.util.Base64
 import java.net.SocketTimeoutException
 import java.io.IOException
@@ -57,6 +58,33 @@ internal class MangaTekTest {
         assertTrue(script.contains("return 'importKey;';"))
         assertTrue(script.contains("return [renamed]"))
         assertTrue(script.contains("Network disabled in crypto bridge"))
+    }
+
+    @Test
+    fun proofBridgeExecutesCurrentWebCryptoHelpersWithoutCallingNetworkFunctions() {
+        val module = """
+            async function networkHelper(a,b) { return await fetch('/must-not-run'); }
+            async function browserProof(token, chapterId) {
+              const bytes = await crypto.subtle.digest('SHA-256', new Uint8Array([token.length,chapterId]));
+              return Array.from(new Uint8Array(bytes), n => n.toString(16).padStart(2,'0')).join('');
+            }
+            export{browserProof as default};
+        """.trimIndent()
+        val script = MangaTekWebCrypto.buildScript(module, JSONObject().put("mode", "proof")
+            .put("token", "fixture-token").put("chapterId", 123), "webcrypto-proof")
+        QuackContext.create().use { engine ->
+            engine.evaluate("""
+                globalThis.window=globalThis;
+                globalThis.WebAssembly={};
+                globalThis.fetch=function(){throw new Error('Unexpected network');};
+                globalThis.crypto={subtle:{digest:async function(algorithm,input){
+                  return new Uint8Array(32).fill((input[0]+input[1])&255).buffer;
+                }}};
+            """.trimIndent())
+            var result: String? = null
+            repeat(20) { if (result == null) result = engine.evaluate(script) as? String }
+            assertEquals("88".repeat(32), JSONObject(requireNotNull(result)).getString("proof"))
+        }
     }
 
     @Test

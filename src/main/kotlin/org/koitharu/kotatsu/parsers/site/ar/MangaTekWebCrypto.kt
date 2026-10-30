@@ -39,10 +39,12 @@ internal object MangaTekWebCrypto {
                   const functions = factory({setInterval:noop,setTimeout:noop,clearTimeout:noop},noop,noop,noop,noNetwork);
                   if (input.mode === 'proof') {
                     // Identify a pure two-argument proof helper by its result, not
-                    // a rotating minified name. Exclude loops/crypto-decrypt helpers.
+                    // a rotating minified name. Current clients can compute the
+                    // proof directly with WebCrypto. Exclude loops, decoders and
+                    // network helpers; only a 64-hex result qualifies as a proof.
                     for (const fn of functions) {
                       const body = Function.prototype.toString.call(fn);
-                      if (fn.length !== 2 || /\b(?:for|while)\s*\(|\bcrypto\b|TextDecoder|\bfetch\b/.test(body)) continue;
+                      if (fn.length !== 2 || /\b(?:for|while)\s*\(|TextDecoder|\bfetch\b/.test(body)) continue;
                       const sample = await fn('mangapeak-probe',1);
                       if (typeof sample === 'string' && /^[a-f0-9]{64}$/i.test(sample)) {
                         const proof = await fn(input.token,input.chapterId);
