@@ -300,7 +300,7 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val fullUrl = chapter.url.toAbsoluteUrl(domain)
-        val doc = loadDocument(fullUrl, "div.manga-page img[src], div.manga-page img[data-src], div.manga-page img[data-url]")
+        val doc = loadDocument(fullUrl, "div.manga-page img[src], div.manga-page img[data-src], div.manga-page img[data-url]", completeReader = true)
         
         val imageUrls = extractReaderImageUrls(doc, domain)
         if (imageUrls.isEmpty()) throw ContentUnavailableException("MangaTek did not return any reader images")
@@ -462,7 +462,9 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
      * Keep HTTP and the host browser on the same current identity. WebView can
      * load a public page, but a hard denial is not a solvable challenge.
      */
-    private suspend fun loadDocument(url: String, readySelector: String): Document {
+    private suspend fun loadDocument(url: String, readySelector: String, completeReader: Boolean = false): Document {
+        fun usable(document: Document) = isUsablePage(document, readySelector) &&
+            (!completeReader || hasCompleteReaderImages(document))
         var challenged = false
         val directResult = runCatchingCancellable {
             withTimeoutOrNull(HTTP_TIMEOUT_MS) {
@@ -471,7 +473,7 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
                 response.parseHtml().also { challenged = challenged || isCaptchaPage(it) }
             } ?: throw SocketTimeoutException(LOAD_TIMEOUT_MESSAGE)
         }
-        directResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
+        directResult.getOrNull()?.takeIf(::usable)?.let { return it }
 
         // The host can report a CAPTCHA, hard block or transport failure as an
         // IOException. Do not hide that actionable error behind a second,
@@ -497,6 +499,22 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
                       if (document.querySelector('#cf-error-details, .cf-error-details, #challenge-form, #challenge-running') ||
                           /sorry, you have been blocked|you are unable to access/i.test(document.body ? document.body.innerText : '')) return html;
                       if (!document.querySelector($quotedSelector)) return null;
+                      if ($completeReader) {
+                        // The site's normal reader resolves pending image URLs
+                        // after hydration. Never compress a 29-page chapter into
+                        // its two server-rendered images and shift speech boxes.
+                        var pages = Array.from(document.querySelectorAll('div.manga-page'));
+                        var pending = pages.find(function(page) {
+                          var image = page.querySelector('img');
+                          return !image || !['data-url','data-src','src'].some(function(attr) {
+                            return /^(https?:\/\/|\/[^\/])/.test((image.getAttribute(attr) || '').trim());
+                          });
+                        });
+                        if (pending) {
+                          pending.scrollIntoView({block:'center'});
+                          return null;
+                        }
+                      }
                       return html || null;
                     })()
                     """.trimIndent(),
@@ -505,7 +523,7 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
             } ?: throw SocketTimeoutException(LOAD_TIMEOUT_MESSAGE)
             decodeWebViewString(rawResult)?.let { Jsoup.parse(it, url) }
         }
-        webViewResult.getOrNull()?.takeIf { isUsablePage(it, readySelector) }?.let { return it }
+        webViewResult.getOrNull()?.takeIf(::usable)?.let { return it }
 
         val browserDocument = webViewResult.getOrNull()
         if (browserDocument?.let(::isAccessBlocked) == true) {
@@ -521,7 +539,16 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         }
         webViewResult.exceptionOrNull()?.let { throw it }
         directResult.exceptionOrNull()?.let { throw it }
+        if (completeReader) throw ContentUnavailableException("لم يكتمل تحميل صور الفصل من مانجاتك. أعد المحاولة؛ لم يتم حفظ فصل ناقص.")
         error("MangaTek returned an incomplete page or a CAPTCHA instead of public content")
+    }
+
+    internal fun hasCompleteReaderImages(document: Document): Boolean {
+        val containers = document.select("div.manga-page")
+        if (containers.isEmpty() || containers.any { extractReaderImageUrls(Jsoup.parse(it.outerHtml()), domain).size != 1 }) return false
+        val raw = document.selectFirst("astro-island[component-url*='ChapterImageViewer']")?.attr("props")
+        val expected = raw?.takeIf(String::isNotBlank)?.let { JSONObject(it).astroValue("imageUrls") as? org.json.JSONArray }?.length()
+        return expected == null || expected == containers.size
     }
 
     internal fun isUsablePage(document: Document, readySelector: String): Boolean =
@@ -590,7 +617,7 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
             .select("div.manga-page img[data-url], div.manga-page img[data-src], div.manga-page img[src]")
             .mapNotNull { image ->
                 sequenceOf("data-url", "data-src", "src").map { image.attr(it).trim() }
-                    .firstOrNull { it.isNotEmpty() && !it.startsWith("data:", ignoreCase = true) }
+                    .firstOrNull { it.startsWith("https://") || it.startsWith("http://") || it.startsWith('/') }
                     ?.toAbsoluteUrl(domain)
             }
 

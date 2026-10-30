@@ -55,7 +55,7 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$PARSER_SOURCE_COMMIT"
           test "$(git rev-parse --short=10 HEAD)" = "$PARSER_ARTIFACT_VERSION"
-          ./gradlew test --tests '*MangaTekTest' --tests '*DilarTubeTest' --tests '*CeneleTest' --tests '*CeneleChapterLocatorTest' --tests '*GalaxyNovelsTest' jar generatePomFileForMavenJavaPublication --no-daemon --console=plain --init-script ../build-tools/gradle/parser-artifact.init.gradle
+          ./gradlew test --tests '*MangaTekTest' --tests '*LekMangaTest' --tests '*DilarTubeTest' --tests '*CeneleTest' --tests '*CeneleChapterLocatorTest' --tests '*GalaxyNovelsTest' jar generatePomFileForMavenJavaPublication --no-daemon --console=plain --init-script ../build-tools/gradle/parser-artifact.init.gradle
       - name: Upload parser JAR and Maven metadata
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

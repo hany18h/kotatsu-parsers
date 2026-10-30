@@ -239,6 +239,42 @@ internal class MangaTekTest {
     }
 
     @Test
+    fun pendingImagesWaitForTheRealReaderBeforeMappingLaterSpeechPages() = runBlocking {
+        val overlay = JSONObject().put("page_number", 26).put("overlays", JSONArray().put(JSONObject().put("text", "نص الصفحة الأخيرة")))
+        val parser = MangaTek(fixtureContext(overlay, true, documentHtml = readerHtml(29, 2), browserHtml = readerHtml(29, 29)))
+        val pages = parser.getPages(fixtureChapter())
+        assertEquals(29, pages.size)
+        assertTrue(pages[26].url.startsWith("mangatek-overlay://"))
+        assertEquals("https://mangatek.com/28.webp", pages[28].url)
+    }
+
+    @Test
+    fun incompleteBrowserImagesCannotBecomeASuccessfulPartialDownload() {
+        val parser = MangaTek(fixtureContext(JSONObject(), true, documentHtml = readerHtml(29, 2), browserHtml = readerHtml(29, 2)))
+        val error = assertThrows(ContentUnavailableException::class.java) { runBlocking { parser.getPages(fixtureChapter()) } }
+        assertTrue(error.message.orEmpty().contains("لم يكتمل"))
+    }
+
+    @Test
+    fun completenessIncludesPendingAstroSlotsAndRejectsInlinePlaceholders() {
+        val parser = MangaTek(MangaLoaderContextMock)
+        assertFalse(parser.hasCompleteReaderImages(Jsoup.parse(readerHtml(29, 2))))
+        assertTrue(parser.hasCompleteReaderImages(Jsoup.parse(readerHtml(29, 29))))
+        assertFalse(parser.hasCompleteReaderImages(Jsoup.parse(readerHtml(29, 29).replace("/28.webp", "data:image/gif;base64,AA"))))
+        val truncated = Jsoup.parse(readerHtml(29, 29)).apply { select("div.manga-page").last()!!.remove() }
+        assertFalse(parser.hasCompleteReaderImages(truncated))
+    }
+
+    private fun readerHtml(count: Int, ready: Int): String {
+        val slots = JSONArray().apply { repeat(count) { put(JSONArray().put(0).put("/$it.webp")) } }
+        val props = JSONObject().put("textMode", JSONArray().put(0).put("overlay"))
+            .put("unlockToken", JSONArray().put(0).put("fixture-token")).put("chapterId", JSONArray().put(0).put(123))
+            .put("imageUrls", JSONArray().put(1).put(slots))
+        return "<astro-island component-url='/_astro/ChapterImageViewer.fixture.js' props='$props'></astro-island>" +
+            (0 until count).joinToString("") { "<div class='manga-page' data-page='${it+1}'><img src='${if (it < ready) "/$it.webp" else ""}'></div>" }
+    }
+
+    @Test
     fun forbiddenUnlockDoesNotSendUsersToAnUnsolvableBrowserPage() {
         val parser = MangaTek(fixtureContext(JSONObject(), unlockSuccess = true, unlockCode = 403))
         val error = assertThrows(ContentUnavailableException::class.java) { runBlocking { parser.getPages(fixtureChapter()) } }

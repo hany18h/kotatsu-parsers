@@ -565,6 +565,7 @@ internal abstract class MadaraParser(
 	override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
 		val fullUrl = manga.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(fullUrl).parseHtml()
+		val title = parseMangaTitle(manga, doc)
 
 		val href = doc.selectFirst("head meta[property='og:url']")?.attr("content")?.toRelativeUrl(domain) ?: manga.url
 		val testCheckAsync = doc.select(selectTestAsync)
@@ -591,7 +592,7 @@ internal abstract class MadaraParser(
 		val alt = doc.body().select(selectAlt).firstOrNull()?.tableValue()?.textOrNull()
 
 		manga.copy(
-			title = doc.selectFirst("h1")?.textOrNull() ?: manga.title,
+			title = title,
 			url = href,
 			publicUrl = href.toAbsoluteUrl(domain),
 			tags = doc.body().select(selectGenre).mapToSet { a -> createMangaTag(a) }.filterNotNull().toSet(),
@@ -607,6 +608,8 @@ internal abstract class MadaraParser(
 		)
 	}
 
+	protected open fun parseMangaTitle(manga: Manga, document: Document): String =
+		document.selectFirst("h1")?.textOrNull() ?: manga.title
 
 	protected open val selectDate = "span.chapter-release-date i"
 	protected open val selectChapter = "li.wp-manga-chapter"
