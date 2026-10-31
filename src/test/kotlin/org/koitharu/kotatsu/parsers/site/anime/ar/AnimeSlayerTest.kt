@@ -7,8 +7,39 @@ import org.junit.jupiter.api.Test
 import org.koitharu.kotatsu.parsers.MangaLoaderContextMock
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.network.UserAgents
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.test.runTest
+import org.koitharu.kotatsu.parsers.model.AnimeStream
+import java.io.IOException
+import org.junit.jupiter.api.Assertions.assertTrue
 
 internal class AnimeSlayerTest {
+	@Test fun returnsWorkingProviderWhenAnotherProviderNeverFinishes() = runTest {
+		val stream = AnimeStream(name = "Working", url = "https://cdn.example/episode.mp4", headers = emptyMap(), quality = null)
+		val result = AnimeSlayer.resolveAvailable(listOf("stuck", "broken", "working"), 1_000) {
+			when (it) {
+				"stuck" -> awaitCancellation()
+				"broken" -> throw IOException("Provider unavailable")
+				else -> { delay(10); listOf(stream) }
+			}
+		}
+		assertEquals(listOf(stream), result)
+	}
+	@Test fun leavingThePlayerCancelsEveryPendingProvider() = runTest {
+		var cancelled = false
+		val job = launch {
+			AnimeSlayer.resolveAvailable(listOf(Unit), 10_000) {
+				try { awaitCancellation() } finally { cancelled = true }
+			}
+			error("Cancellation must propagate")
+		}
+		delay(1)
+		job.cancelAndJoin()
+		assertTrue(cancelled)
+	}
 	@Test fun repairsShiftedAndDuplicatedEpisodeNumbersFromVisibleNames() {
 		val episodes = JSONArray("""[
 			{"episode_id":"one","episode_name":"الحلقة : 1","episode_number":"1"},

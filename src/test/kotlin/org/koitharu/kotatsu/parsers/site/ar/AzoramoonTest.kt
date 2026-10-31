@@ -38,6 +38,17 @@ internal class AzoramoonTest {
 	}
 
 	@Test
+	fun distinguishesPaidChaptersFromFreeAndPurchasedChapters() {
+		val chapters = parser.parseApiChapters(manga, JSONArray("""[
+			{"slug":"chapter-4","number":4,"isLocked":true,"isAccessible":false},
+			{"slug":"chapter-3","number":3,"isLocked":true,"isAccessible":true,"isPurchased":true},
+			{"slug":"chapter-2","number":2,"isLocked":false,"isAccessible":true},
+			{"slug":"chapter-1","number":1}
+		]"""))
+		assertEquals(mapOf(1f to false, 2f to false, 3f to false, 4f to true), chapters.associate { it.number to it.isLocked })
+	}
+
+	@Test
 	fun parsesNewSiteLinksWhenAstroPropertiesAreAbsent() {
 		val doc = Jsoup.parse(
 			"""

@@ -197,9 +197,9 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 
 	private val dateFormat = SimpleDateFormat("yyyy-MM-dd hh:mm:ss", Locale.getDefault())
 
-	private fun parseChapters(root: Element): List<MangaChapter> {
+	internal fun parseChapters(root: Element): List<MangaChapter> {
 		// Try current website structure first (enhanced-chapters-grid)
-		val chapters = root.select("div.enhanced-chapters-grid a.chapter-link").ifEmpty {
+		val chapters = root.select("div.enhanced-chapters-grid div.chapter-card").ifEmpty {
 			// Fallback to potential alternative structures
 			root.select("div.chapter-card a").ifEmpty {
 				root.select("div.eplister ul a").ifEmpty {
@@ -208,8 +208,11 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 			}
 		}
 
-		return chapters.map { element ->
-			val url = element.attrAsRelativeUrl("href")
+		return chapters.mapNotNull { element ->
+			val card = element.closest(".chapter-card") ?: element
+			val locked = card.selectFirst(".status-badge.locked, .fa-lock, [data-locked=true]") != null ||
+				card.attr("data-locked") == "true"
+			val link = if (element.tagName() == "a") element else element.selectFirst("a.chapter-link, a[href]")
 
 			// Extract chapter number and title from current structure
 			val chpNum = element.select(".chapter-number").text()
@@ -240,10 +243,16 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 			}.replace(Regex("^\\s*\\S+\\s+"), "") // Remove icon text if present
 
 			// Try to extract chapter number from data attribute or URL
-			val chapterNumber = element.select("div.chapter-card").attr("data-number").toFloatOrNull()
+			val chapterNumber = card.attr("data-number").toFloatOrNull()
 				?: finalChpNum.filter { it.isDigit() || it == '.' }.toFloatOrNull()
-				?: url.substringAfterLast('/').toFloatOrNull()
+				?: link?.attr("href")?.substringAfterLast('/')?.toFloatOrNull()
 				?: 0f
+			val url = link?.attrAsRelativeUrl("href") ?: if (locked && chapterNumber > 0) {
+				val base = root.baseUri().substringBefore('?').trimEnd('/')
+				if (!base.contains("/series/")) return@mapNotNull null
+				val number = if (chapterNumber % 1f == 0f) chapterNumber.toInt().toString() else chapterNumber.toString()
+				"$base/$number".toRelativeUrl(domain)
+			} else return@mapNotNull null
 
 			MangaChapter(
 				id = generateUid(url),
@@ -255,11 +264,13 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 				uploadDate = dateFormat.parseSafe(dateText),
 				branch = null,
 				source = source,
+				isLocked = locked,
 			)
 		}
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+		if (chapter.isLocked) throw org.koitharu.kotatsu.parsers.exception.ContentUnavailableException("هذا الفصل مقفل في Team X. افتحه من الموقع أو حدّث قائمة الفصول بعد فتحه هناك.")
 		val fullUrl = chapter.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(fullUrl).parseHtml()
 		validateDocument(doc, domain, ".image_list img, .image_list canvas")

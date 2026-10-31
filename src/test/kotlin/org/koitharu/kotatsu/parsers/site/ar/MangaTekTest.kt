@@ -267,6 +267,44 @@ internal class MangaTekTest {
     }
 
     @Test
+    fun pendingImagesUseThePagesApiAndPreserveTheLastSpeechPage() = runBlocking {
+        val overlay = JSONObject().put("page_number", 26).put("overlays", JSONArray().put(JSONObject().put("text", "آخر صفحة")))
+        val parser = MangaTek(fixtureContext(overlay, true, documentHtml = apiReaderHtml(), apiImageCount = 29,
+            browserResult = { error("The pages API must not wait for DOM hydration") }))
+        val pages = parser.getPages(fixtureChapter())
+        assertEquals(29, pages.size)
+        assertTrue(pages[26].url.startsWith("mangatek-overlay://"))
+        assertEquals("https://mangatek.com/28.webp", pages.last().url)
+    }
+
+    @Test
+    fun bakedChaptersUseEveryImageWithoutRequestingSeparateSpeechText() = runBlocking {
+        val parser = MangaTek(fixtureContext(JSONObject(), true, documentHtml = apiReaderHtml().replace("overlay", "baked"),
+            apiImageCount = 29, forbidUnlock = true, browserResult = { error("No speech decryption for baked images") }))
+        val pages = parser.getPages(fixtureChapter())
+        assertEquals(29, pages.size)
+        assertTrue(pages.all { it.url.startsWith("https://") })
+    }
+
+    @Test
+    fun pagesApiRetriesWithTheCurrentClientProofAfter403() = runBlocking {
+        val overlay = JSONObject().put("page_number", 0).put("overlays", JSONArray().put(JSONObject().put("text", "نص الفصل")))
+        val parser = MangaTek(fixtureContext(overlay, true, documentHtml = apiReaderHtml(), apiImageCount = 29,
+            apiFirstForbidden = true, browserResult = { JSONObject.quote("{\"proof\":\"current-client-proof\"}") }))
+        assertEquals(29, parser.getPages(fixtureChapter()).size)
+    }
+
+    @Test
+    fun truncatedPagesApiCannotBeSavedAsACompleteChapter() {
+        val parser = MangaTek(fixtureContext(JSONObject(), true, documentHtml = apiReaderHtml(), apiImageCount = 2))
+        assertThrows(ContentUnavailableException::class.java) { runBlocking { parser.getPages(fixtureChapter()) } }
+    }
+
+    private fun apiReaderHtml(): String = readerHtml(29, 2).replace(
+        "\"textMode\":", "\"mangaSlug\":[0,\"fixture\"],\"chapterNumber\":[0,\"1\"],\"textMode\":",
+    )
+
+    @Test
     fun pendingImagesWaitForTheRealReaderBeforeMappingLaterSpeechPages() = runBlocking {
         val overlay = JSONObject().put("page_number", 26).put("overlays", JSONArray().put(JSONObject().put("text", "نص الصفحة الأخيرة")))
         val parser = MangaTek(fixtureContext(overlay, true, documentHtml = readerHtml(29, 2), browserHtml = readerHtml(29, 29)))
@@ -411,7 +449,8 @@ internal class MangaTekTest {
 
     private val catalogueHtml = "<main><div class='grid'><a class='manga-card' href='/manga/fixture'><h3>Fixture manga</h3><img src='/cover.webp'></a></div></main>"
 
-    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200, browserHtml: String? = null, userAgent: String = MangaTek.USER_AGENT, documentHtml: String? = null, overlayVersion: Int = 0, browserResult: (suspend () -> String?)? = null, transportError: IOException? = null): MangaLoaderContext {
+    private fun fixtureContext(page: JSONObject, unlockSuccess: Boolean, unlockCode: Int = 200, documentCode: Int = 200, browserHtml: String? = null, userAgent: String = MangaTek.USER_AGENT, documentHtml: String? = null, overlayVersion: Int = 0, browserResult: (suspend () -> String?)? = null, transportError: IOException? = null, apiImageCount: Int? = null, apiFirstForbidden: Boolean = false, forbidUnlock: Boolean = false): MangaLoaderContext {
+        var pagesRequests = 0
         val key = ByteArray(32) { it.toByte() }
         val iv = ByteArray(16) { (it + 10).toByte() }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -431,10 +470,24 @@ internal class MangaTekTest {
                 assertEquals(TimeUnit.MILLISECONDS.toNanos(MangaTek.HTTP_TIMEOUT_MS), chain.call().timeout().timeoutNanos(),
                     "Both document and unlock requests need a total call deadline, not only an idle read timeout")
                 val isUnlock = request.url.host == "api.mangatek.com" && request.url.encodedPath == "/api/reader/unlock"
+                if (forbidUnlock) check(!isUnlock) { "Baked chapter must not request a speech overlay" }
                 val isModule = request.url.encodedPath == "/_astro/ChapterImageViewer.fixture.js"
+                val isPages = request.url.host == "api.mangatek.com" && request.url.encodedPath == "/api/reader/pages"
+                val pagesCode = if (isPages && ++pagesRequests == 1 && apiFirstForbidden) 403 else 200
                 if (!isUnlock && !isModule) transportError?.let { throw it }
-                check(isUnlock || isModule || request.url.encodedPath in listOf("/reader/fixture/1", "/manga-list")) { "Unexpected fixture request" }
-                val body = if (isUnlock) {
+                check(isUnlock || isModule || isPages || request.url.encodedPath in listOf("/reader/fixture/1", "/manga-list")) { "Unexpected fixture request" }
+                val body = if (isPages) {
+                    assertEquals("POST", request.method)
+                    assertEquals("https://mangatek.com", request.header("Origin"))
+                    val buffer = okio.Buffer().also { request.body!!.writeTo(it) }
+                    val payload = JSONObject(buffer.readUtf8())
+                    assertEquals("fixture", payload.getString("mangaSlug"))
+                    assertEquals("1", payload.getString("chapterNumber"))
+                    if (pagesRequests > 1 && apiFirstForbidden) assertEquals("current-client-proof", payload.getString("proof"))
+                    JSONObject().put("success", true).put("data", JSONArray().apply {
+                        repeat(requireNotNull(apiImageCount)) { put("https://mangatek.com/$it.webp") }
+                    }).toString()
+                } else if (isUnlock) {
                     assertEquals("POST", request.method)
                     assertEquals("https://mangatek.com", request.header("Origin"))
                     assertEquals("https://mangatek.com/reader/fixture/1", request.header("Referer"))
@@ -443,7 +496,7 @@ internal class MangaTekTest {
                         .put("overlay", encrypted).put("overlay_page_offset", 1).toString()
                 } else if (isModule) "async function fixtureCrypto(a,b,c,d){return crypto.subtle && new TextDecoder();}export{fixtureCrypto as default};"
                 else documentHtml ?: html
-                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (isUnlock) unlockCode else if (isModule) 200 else documentCode).message("Offline fixture")
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (isPages) pagesCode else if (isUnlock) unlockCode else if (isModule) 200 else documentCode).message("Offline fixture")
                     .body(body.toResponseBody((if (isUnlock) "application/json" else "text/html").toMediaType())).build()
             }.build()
             override fun getConfig(source: MangaSource) = MangaLoaderContextMock.getConfig(source)

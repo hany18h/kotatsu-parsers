@@ -300,9 +300,16 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val fullUrl = chapter.url.toAbsoluteUrl(domain)
-        val doc = loadDocument(fullUrl, "div.manga-page img[src], div.manga-page img[data-src], div.manga-page img[data-url]", completeReader = true)
-        
-        val imageUrls = extractReaderImageUrls(doc, domain)
+        var doc = loadDocument(fullUrl, "div.manga-page img[src], div.manga-page img[data-src], div.manga-page img[data-url]")
+        // The public reader now sends only two image URLs in its HTML. Fetch
+        // the same complete pages response as the reader, without depending on
+        // every hidden WebView image node having finished React hydration.
+        val imageUrls = if (hasCompleteReaderImages(doc)) extractReaderImageUrls(doc, domain) else {
+            loadReaderImageUrls(doc, fullUrl) ?: run {
+                doc = loadDocument(fullUrl, "div.manga-page img[src], div.manga-page img[data-src], div.manga-page img[data-url]", completeReader = true)
+                extractReaderImageUrls(doc, domain)
+            }
+        }
         if (imageUrls.isEmpty()) throw ContentUnavailableException("MangaTek did not return any reader images")
         // Do not silently return text-free images if unlocking fails. Such pages
         // would otherwise be cached/downloaded as successfully completed chapters.
@@ -321,6 +328,41 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         page.url.startsWith(OVERLAY_PAGE_SCHEME, ignoreCase = true)
     ) page.url else super.getPageUrl(page)
 
+    private suspend fun loadReaderImageUrls(document: Document, chapterUrl: String): List<String>? {
+        val raw = document.selectFirst("astro-island[component-url*='ChapterImageViewer']")?.attr("props")
+            ?.takeIf(String::isNotBlank) ?: return null
+        val props = JSONObject(raw)
+        val token = props.astroString("unlockToken")
+        val chapterId = props.astroLong("chapterId")
+        val slug = props.astroString("mangaSlug")
+        val number = props.astroValue("chapterNumber")?.toString().orEmpty()
+        if (token.isBlank() || chapterId <= 0 || slug.isBlank() || number.isBlank()) return null
+        val payload = JSONObject().put("chapterId", chapterId).put("mangaSlug", slug)
+            .put("chapterNumber", number).put("token", token).put("proof", computeUnlockProof(token, chapterId))
+        val headers = siteHeaders(chapterUrl).newBuilder().set("Accept", "application/json")
+            .set("Origin", "https://$domain").removeAll("Upgrade-Insecure-Requests").build()
+        suspend fun fetchPages() = withTimeoutOrNull(HTTP_TIMEOUT_MS) {
+            boundedWebClient.httpPost(READER_PAGES_URL.toHttpUrl(), payload, headers).parseJson()
+        } ?: throw SocketTimeoutException(LOAD_TIMEOUT_MESSAGE)
+        val response = try { fetchPages() } catch (error: HttpStatusException) {
+            if (error.statusCode != 403) throw error
+            val proof = evaluateReaderCrypto(loadReaderModule(document, chapterUrl),
+                JSONObject().put("mode", "proof").put("token", token).put("chapterId", chapterId), chapterUrl)
+                .optString("proof")
+            if (proof.isBlank() || proof == payload.optString("proof")) throw ContentUnavailableException(INCOMPLETE_READER_MESSAGE)
+            payload.put("proof", proof)
+            fetchPages()
+        }
+        val urls = response.optJSONArray("data") ?: throw ContentUnavailableException(INCOMPLETE_READER_MESSAGE)
+        val result = (0 until urls.length()).mapNotNull { index ->
+            (urls.opt(index) as? String)?.trim()?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
+        }
+        val expected = expectedReaderImageCount(document)
+        if (!response.optBoolean("success") || result.isEmpty() || result.size != urls.length() ||
+            expected != null && result.size != expected) throw ContentUnavailableException(INCOMPLETE_READER_MESSAGE)
+        return result
+    }
+
     private suspend fun loadOverlayPages(document: Document, imageCount: Int, chapterUrl: String): Map<Int, JSONObject> {
         val rawProps = document.selectFirst("astro-island[component-url*='ChapterImageViewer']")?.attr("props")
             ?.takeIf(String::isNotBlank) ?: return emptyMap()
@@ -328,9 +370,11 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         val textMode = props.astroString("textMode")
         val token = props.astroString("unlockToken")
         val chapterId = props.astroLong("chapterId")
-        // Astro serializes props as [type, value], but preserve support for the
-        // site's plain values too. A token is also a reliable indicator that
-        // the chapter has a separate speech-text payload when mode names change.
+        // Baked chapters already contain their translated text in the images.
+        // Their token unlocks the image list only, not a separate speech layer.
+        if (textMode == "baked") return emptyMap()
+        // Keep unknown modes with an unlock token strict, so a future mode
+        // change cannot silently save a translated chapter without its text.
         if (textMode != "overlay" && token.isBlank()) return emptyMap()
         if (token.isEmpty() || chapterId <= 0L) {
             throw ContentUnavailableException("MangaTek speech text is missing its unlock token; reload the chapter")
@@ -539,17 +583,20 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         }
         webViewResult.exceptionOrNull()?.let { throw it }
         directResult.exceptionOrNull()?.let { throw it }
-        if (completeReader) throw ContentUnavailableException("لم يكتمل تحميل صور الفصل من مانجاتك. أعد المحاولة؛ لم يتم حفظ فصل ناقص.")
+        if (completeReader) throw ContentUnavailableException(INCOMPLETE_READER_MESSAGE)
         error("MangaTek returned an incomplete page or a CAPTCHA instead of public content")
     }
 
     internal fun hasCompleteReaderImages(document: Document): Boolean {
         val containers = document.select("div.manga-page")
         if (containers.isEmpty() || containers.any { extractReaderImageUrls(Jsoup.parse(it.outerHtml()), domain).size != 1 }) return false
-        val raw = document.selectFirst("astro-island[component-url*='ChapterImageViewer']")?.attr("props")
-        val expected = raw?.takeIf(String::isNotBlank)?.let { JSONObject(it).astroValue("imageUrls") as? org.json.JSONArray }?.length()
+        val expected = expectedReaderImageCount(document)
         return expected == null || expected == containers.size
     }
+
+    private fun expectedReaderImageCount(document: Document): Int? = document
+        .selectFirst("astro-island[component-url*='ChapterImageViewer']")?.attr("props")
+        ?.takeIf(String::isNotBlank)?.let { JSONObject(it).astroValue("imageUrls") as? org.json.JSONArray }?.length()
 
     internal fun isUsablePage(document: Document, readySelector: String): Boolean =
         !isAccessBlocked(document) && !isCaptchaPage(document) && document.selectFirst(readySelector) != null
@@ -610,6 +657,8 @@ internal class MangaTek(private val loaderContext: MangaLoaderContext) :
         private const val ACCESS_DENIED_MESSAGE = "يرفض موقع MangaTek الوصول إلى هذا الفصل (403). إذا ظهرت صفحة حظر في المتصفح أيضًا، فلا يمكن إكمال التحقق من التطبيق؛ يلزم رفع الحظر من جهة الموقع."
         private const val UNLOCK_DENIED_MESSAGE = "تعذر الحصول على نصوص الفصل من خادم MangaTek (403)، رغم تحميل صفحة الفصل. حدّث المصدر وأعد المحاولة؛ هذا لا يعني أن صفحة الفصل محظورة."
         private const val OVERLAY_UNLOCK_URL = "https://api.mangatek.com/api/reader/unlock"
+        private const val READER_PAGES_URL = "https://api.mangatek.com/api/reader/pages"
+        private const val INCOMPLETE_READER_MESSAGE = "لم يكتمل تحميل صور الفصل من مانجاتك. أعد المحاولة؛ لم يتم حفظ فصل ناقص."
         private const val OVERLAY_PAGE_SCHEME = "mangatek-overlay://render"
         private const val READER_PROOF_SALT = "69e44f7fbc755230d61d205ab9cdb0a6fff5f7bf9209ce25"
 

@@ -3,7 +3,7 @@ package org.koitharu.kotatsu.parsers.model
 import org.koitharu.kotatsu.parsers.util.formatSimple
 import org.koitharu.kotatsu.parsers.util.ifNullOrEmpty
 
-public data class MangaChapter(
+public data class MangaChapter @JvmOverloads constructor(
 	/**
 	 * An unique id of chapter
 	 */
@@ -40,6 +40,8 @@ public data class MangaChapter(
 	 */
 	@JvmField public val branch: String?,
 	@JvmField public val source: MangaSource,
+	/** Whether the source currently requires payment/access before opening this chapter. */
+	@JvmField public val isLocked: Boolean = false,
 ) {
 
 	@Deprecated("Use title instead", ReplaceWith("title"))

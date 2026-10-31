@@ -1,5 +1,10 @@
 package org.koitharu.kotatsu.parsers.site.anime.ar
 
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.CookieJar
 import okhttp3.Headers
 import org.json.JSONArray
@@ -35,10 +40,14 @@ import org.koitharu.kotatsu.parsers.util.parseRaw
 import org.koitharu.kotatsu.parsers.util.urlEncoded
 import org.koitharu.kotatsu.parsers.util.runCatchingCancellable
 import java.net.URI
+import java.io.IOException
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.EnumSet
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 
 /**
@@ -63,6 +72,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			context.httpClient.newBuilder()
 				.cookieJar(CookieJar.NO_COOKIES)
 				.cache(null)
+				.callTimeout(10, TimeUnit.SECONDS)
 				.build(),
 			source,
 		)
@@ -175,16 +185,7 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			?: return emptyList()
 		val servers = episode.optJSONArray("episode_urls") ?: return emptyList()
 
-		val result = ArrayList<AnimeStream>()
-		var firstFailure: Throwable? = null
-		for (index in 0 until servers.length()) {
-			val server = servers.optJSONObject(index) ?: continue
-			runCatchingCancellable { resolveServer(server) }
-				.onSuccess(result::addAll)
-				.onFailure { error -> if (firstFailure == null) firstFailure = error }
-		}
-		if (result.isEmpty()) firstFailure?.let { throw it }
-		return result.distinctBy(AnimeStream::url)
+		return resolveAvailable((0 until servers.length()).mapNotNull(servers::optJSONObject), 25_000, ::resolveServer)
 	}
 
 	private suspend fun loadDetails(animeId: String): JSONObject? {
@@ -285,38 +286,29 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 			}.distinct()
 		}
 
-		var firstFailure: Throwable? = null
-		val streams = buildList {
-			for (candidate in candidates) {
-				// One blocked provider must not discard all remaining servers.
-				// MediaFire, in particular, can be unavailable on one network while
-				// StreamTape from the same response is still playable.
-				runCatchingCancellable {
-						when {
-							candidate.contains("mediafire.com", ignoreCase = true) -> {
-								listOfNotNull(resolveMediaFire(candidate, serverName))
-							}
-							candidate.contains("streamtape.", ignoreCase = true) -> {
-								listOfNotNull(resolveStreamTape(candidate, serverName))
-							}
-							isOkRuUrl(candidate) -> resolveOkRu(candidate, serverName)
-							isDirectMediaUrl(candidate) ||
-								candidate.contains("/get_video?", ignoreCase = true) -> {
-								listOf(createStream(serverName, candidate, serverUrl))
-							}
-							else -> {
-								extractPageLinks(candidate, serverUrl).map { direct ->
-									createStream(serverName, direct, candidate)
-								}
-							}
-						}
+		return resolveAvailable(candidates, 12_000) { candidate ->
+			// One blocked provider must not discard all remaining servers.
+			// MediaFire, in particular, can be unavailable on one network while
+			// StreamTape from the same response is still playable.
+			when {
+				candidate.contains("mediafire.com", ignoreCase = true) -> {
+					listOfNotNull(resolveMediaFire(candidate, serverName))
+				}
+				candidate.contains("streamtape.", ignoreCase = true) -> {
+					listOfNotNull(resolveStreamTape(candidate, serverName))
+				}
+				isOkRuUrl(candidate) -> resolveOkRu(candidate, serverName)
+				isDirectMediaUrl(candidate) ||
+					candidate.contains("/get_video?", ignoreCase = true) -> {
+					listOf(createStream(serverName, candidate, serverUrl))
+				}
+				else -> {
+					extractPageLinks(candidate, serverUrl).map { direct ->
+						createStream(serverName, direct, candidate)
 					}
-					.onSuccess(::addAll)
-					.onFailure { error -> if (firstFailure == null) firstFailure = error }
+				}
 			}
 		}
-		if (streams.isEmpty()) firstFailure?.let { throw it }
-		return streams
 	}
 
 	private suspend fun loadAlternativeLinks(serverUrl: String): List<String> {
@@ -444,6 +436,38 @@ internal class AnimeSlayer(context: MangaLoaderContext) : PagedMangaParser(
 		if (number % 1f == 0f) number.toInt().toString() else number.toString()
 
 	internal companion object {
+		/** Return completed providers even if another provider stalls. Preserve source order. */
+		internal suspend fun <T> resolveAvailable(
+			items: List<T>,
+			timeoutMillis: Long,
+			resolve: suspend (T) -> List<AnimeStream>,
+		): List<AnimeStream> {
+			if (items.isEmpty()) return emptyList()
+			val completed = ConcurrentHashMap<Int, List<AnimeStream>>()
+			val failure = AtomicReference<Throwable?>()
+			val permits = Semaphore(3)
+			val finished = withTimeoutOrNull(timeoutMillis) {
+				coroutineScope {
+					items.forEachIndexed { index, item ->
+						launch {
+							permits.withPermit {
+								runCatchingCancellable { resolve(item) }
+									.onSuccess { completed[index] = it }
+									.onFailure { failure.compareAndSet(null, it) }
+							}
+						}
+					}
+				}
+				true
+			}
+			val result = completed.toSortedMap().values.flatten().distinctBy(AnimeStream::url)
+			if (result.isEmpty()) {
+				failure.get()?.let { throw it }
+				if (finished == null) throw IOException("تعذر الاتصال بسيرفرات أنمي سلاير. أعد المحاولة.")
+			}
+			return result
+		}
+
 		const val PAGE_SIZE = 30
 		const val API_BASE = "https://anslayer.com/anime/public"
 		const val CLIENT_ID = "android-app2"

@@ -395,6 +395,11 @@ internal class Azoramoon(context: MangaLoaderContext) :
 				uploadDate = parseChapterDate(createdAt),
 				branch = null,
 				source = source,
+				isLocked = unboxSerializedValue(chapter.opt("isAccessible")) == false ||
+					(unboxSerializedValue(chapter.opt("isLocked")) == true &&
+						unboxSerializedValue(chapter.opt("isAccessible")) != true &&
+						unboxSerializedValue(chapter.opt("isPurchased")) != true &&
+						unboxSerializedValue(chapter.opt("hasPurchased")) != true),
 			)
 		}
 		return chapters.sortedBy { it.number }
@@ -417,6 +422,7 @@ internal class Azoramoon(context: MangaLoaderContext) :
 					uploadDate = 0L,
 					branch = null,
 					source = source,
+					isLocked = link.selectFirst(".fa-lock, .lucide-lock, [data-lucide=lock], [data-locked=true]") != null,
 				)
 			}
 			.distinctBy { it.url }
@@ -468,6 +474,7 @@ internal class Azoramoon(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+		if (chapter.isLocked) throw org.koitharu.kotatsu.parsers.exception.ContentUnavailableException("هذا الفصل مقفل في المصدر الأصلي. افتحه من الموقع أو حدّث قائمة الفصول بعد فتحه هناك.")
 		val fullUrl = chapter.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(fullUrl).parseHtml()
 
