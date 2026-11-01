@@ -2,13 +2,8 @@ package org.koitharu.kotatsu.parsers.site.ar
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
-import okhttp3.Interceptor
-import okhttp3.Response
 import org.json.JSONObject
-import org.jsoup.Jsoup
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -26,10 +21,6 @@ internal class MangaSwat(context: MangaLoaderContext) :
 
     private val apiBaseUrl = "https://appswat.com/v2/api/v2"
 
-    // CSRF token cache
-    private var csrfToken: String? = null
-    private val csrfMutex = Mutex()
-
     // ─── Headers ───────────────────────────────────────────────────────────────
 
     private val apiHeaders: Headers
@@ -40,50 +31,12 @@ internal class MangaSwat(context: MangaLoaderContext) :
             .add("User-Agent", "ktor-client")
             .build()
 
-    // ─── CSRF Token ────────────────────────────────────────────────────────────
-
-    private suspend fun getCsrfToken(): String = csrfMutex.withLock {
-        val cached = csrfToken
-        if (!cached.isNullOrEmpty()) return@withLock cached
-
-        val response = webClient.httpGet("https://meshmanga.com/", apiHeaders)
-        val html = response.body?.string() ?: ""
-        val token = Jsoup.parse(html)
-            .selectFirst("head meta[name*=csrf-token]")
-            ?.attr("content")
-            .orEmpty()
-
-        csrfToken = token
-        token
+    private suspend fun apiText(url: String): String = requestGate.get(url) {
+        webClient.httpGet(url, apiHeaders).parseRaw()
     }
 
-    private suspend fun buildPostHeaders(): Headers {
-        val token = getCsrfToken()
-        return Headers.Builder()
-            .add("Accept", "application/json, text/plain, */*")
-            .add("Origin", "https://meshmanga.com")
-            .add("Referer", "https://meshmanga.com/")
-            .add("User-Agent", "ktor-client")
-            .add("X-CSRF-TOKEN", token)
-            .build()
-    }
-
-    // ─── Intercept ─────────────────────────────────────────────────────────────
-
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val response = chain.proceed(chain.request())
-
-        if (response.header("Content-Type")?.contains("text/html") == true) {
-            val html = response.peekBody(Long.MAX_VALUE).string()
-            val token = Jsoup.parse(html)
-                .selectFirst("head meta[name*=csrf-token]")
-                ?.attr("content")
-            if (!token.isNullOrEmpty()) {
-                csrfToken = token
-            }
-        }
-
-        return response
+    private companion object {
+        val requestGate = SwatRequestGate()
     }
 
     // ─── Filter ────────────────────────────────────────────────────────────────
@@ -112,7 +65,7 @@ internal class MangaSwat(context: MangaLoaderContext) :
     )
 
     private suspend fun fetchAvailableTags(): Set<MangaTag> {
-        val response = webClient.httpGet("$apiBaseUrl/genres/", apiHeaders).parseJsonArray()
+        val response = org.json.JSONArray(apiText("$apiBaseUrl/genres/"))
         val tags = mutableSetOf<MangaTag>()
         for (i in 0 until response.length()) {
             val genreObj = response.getJSONObject(i)
@@ -130,7 +83,7 @@ internal class MangaSwat(context: MangaLoaderContext) :
     // ─── List ──────────────────────────────────────────────────────────────────
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        if (order == SortOrder.UPDATED) return getUpdatedListPage(page, filter)
+        if (order == SortOrder.UPDATED && filter.query.isNullOrBlank() && filter.tags.isEmpty()) return getUpdatedListPage(page, filter)
         val url = buildString {
             append("$apiBaseUrl/series/?page=$page")
             if (!filter.query.isNullOrEmpty()) {
@@ -146,7 +99,7 @@ internal class MangaSwat(context: MangaLoaderContext) :
             }
         }
 
-        val response = webClient.httpGet(url, apiHeaders).parseJson()
+        val response = JSONObject(apiText(url))
         val results = response.getJSONArray("results")
         return (0 until results.length()).map { i ->
             parseMangaFromJson(results.getJSONObject(i))
@@ -161,10 +114,7 @@ internal class MangaSwat(context: MangaLoaderContext) :
         var chapterPage = 1
 
         while (series.size < targetSize) {
-            val response = webClient.httpGet(
-                "$apiBaseUrl/chapters/?page=$chapterPage&page_size=200&order_by=-created_at",
-                apiHeaders,
-            ).parseJson()
+            val response = JSONObject(apiText("$apiBaseUrl/chapters/?page=$chapterPage&page_size=200&order_by=-created_at"))
             val chapters = response.getJSONArray("results")
             if (chapters.length() == 0) break
             for (i in 0 until chapters.length()) {
@@ -248,10 +198,7 @@ internal class MangaSwat(context: MangaLoaderContext) :
         val seriesId = manga.url.substringAfter("/series/")
         val chaptersDeferred = async { getChapters(seriesId) }
 
-        val response = webClient.httpGet(
-            "$apiBaseUrl/series/$seriesId/",
-            apiHeaders,
-        ).parseJson()
+        val response = JSONObject(apiText("$apiBaseUrl/series/$seriesId/"))
 
         val updatedManga = parseMangaFromJson(response)
         updatedManga.copy(chapters = chaptersDeferred.await())
@@ -261,10 +208,7 @@ internal class MangaSwat(context: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterId = chapter.url.substringAfter("/chapters/").trimEnd('/')
-        val response = webClient.httpGet(
-            "$apiBaseUrl/chapters/$chapterId/",
-            apiHeaders,
-        ).parseJson()
+        val response = JSONObject(apiText("$apiBaseUrl/chapters/$chapterId/"))
         val images = response.getJSONArray("images")
 
         return (0 until images.length()).map { i ->
@@ -287,7 +231,7 @@ internal class MangaSwat(context: MangaLoaderContext) :
         while (true) {
             // ✅ FIX: جلب تصاعدي (order) بدل تنازلي (-order) وحذف .reversed() اللي كان يعكسه مرتين
             val url = "$apiBaseUrl/chapters/?serie=$seriesId&order_by=order&page_size=200&page=$page"
-            val response = webClient.httpGet(url, apiHeaders).parseJson()
+            val response = JSONObject(apiText(url))
             val results = response.getJSONArray("results")
 
             if (results.length() == 0) break
