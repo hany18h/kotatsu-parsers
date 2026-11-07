@@ -1,6 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.ar
 
 import org.json.JSONArray
+import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
@@ -147,11 +148,16 @@ internal class MangaDar(context: MangaLoaderContext) : PagedMangaParser(
 		}
 	}
 
-	private fun parseChapters(doc: Document): List<MangaChapter> {
-		val data = doc.select("[x-data]").firstNotNullOfOrNull { element ->
+	internal fun parseChapters(doc: Document): List<MangaChapter> {
+		val scriptRows = doc.selectFirst("script#mdg-manga-chapters-json[type=application/json]")
+			?.data()
+			?.trim()
+			?.takeIf(String::isNotEmpty)
+			?.let { data -> runCatching { JSONObject(data).optJSONArray("rows") }.getOrNull() }
+		val legacyRows = doc.select("[x-data]").firstNotNullOfOrNull { element ->
 			ROWS_PATTERN.find(element.attr("x-data"))?.groupValues?.get(1)
-		} ?: return emptyList()
-		val rows = runCatching { JSONArray(data) }.getOrElse { return emptyList() }
+		}?.let { data -> runCatching { JSONArray(data) }.getOrNull() }
+		val rows = scriptRows ?: legacyRows ?: return emptyList()
 		return List(rows.length()) { index -> rows.optJSONArray(index) }.mapNotNull { row ->
 			row ?: return@mapNotNull null
 			val absoluteUrl = row.optString(2)

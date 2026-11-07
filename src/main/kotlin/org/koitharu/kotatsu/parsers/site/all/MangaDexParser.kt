@@ -33,6 +33,28 @@ private const val LOCALE_FALLBACK = "en"
 private const val SERVER_DATA = "data"
 private const val SERVER_DATA_SAVER = "data-saver"
 
+internal fun parseMangaDexApiResponse(body: String, url: String): JSONObject {
+	val responseStart = body.trimStart()
+	if (responseStart.startsWith("<!doctype html", ignoreCase = true) ||
+		responseStart.startsWith("<html", ignoreCase = true)
+	) {
+		throw ParseException("MangaDex returned an HTML verification page instead of API data. Please retry later.", url)
+	}
+	return JSONObject(body)
+}
+
+internal fun isMangaDexBrowserVerificationPage(body: String): Boolean {
+	val responseStart = body.trimStart()
+	if (!responseStart.startsWith("<!doctype html", ignoreCase = true) &&
+		!responseStart.startsWith("<html", ignoreCase = true)
+	) {
+		return false
+	}
+	val normalizedBody = body.lowercase(Locale.ROOT)
+	return "browser verification" in normalizedBody &&
+		("powblock" in normalizedBody || "challenge-assets/" in normalizedBody)
+}
+
 @MangaSourceParser("MANGADEX", "MangaDex")
 internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser(context, MangaParserSource.MANGADEX) {
 
@@ -252,7 +274,7 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 			append((query.order ?: defaultSortOrder).toQueryParam())
 		}
 
-		val json = webClient.httpGet(url).parseJson().getJSONArray("data")
+		val json = getApiJson(url).getJSONArray("data")
 		return json.mapJSON { jo -> jo.fetchManga(null) }
 	}
 
@@ -269,18 +291,15 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 
 	private suspend fun getDetails(mangaId: String): Manga = coroutineScope {
 		val jsonDeferred = async {
-			webClient.httpGet(
-				"https://api.$domain/manga/${mangaId}?includes[]=artist&includes[]=author&includes[]=cover_art",
-			).parseJson().getJSONObject("data")
+			getApiJson("https://api.$domain/manga/${mangaId}?includes[]=artist&includes[]=author&includes[]=cover_art")
+				.getJSONObject("data")
 		}
 		val feedDeferred = async { loadChapters(mangaId) }
 		jsonDeferred.await().fetchManga(mapChapters(feedDeferred.await()))
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val json = webClient.httpGet(
-			"https://api.$domain/at-home/server/${chapter.url}?forcePort443=false",
-		).parseJson()
+		val json = getApiJson("https://api.$domain/at-home/server/${chapter.url}?forcePort443=false")
 		val chapterJson = json.getJSONObject("chapter")
 		val server = config[preferredServerKey] ?: SERVER_DATA
 		val pages = chapterJson.getJSONArray(
@@ -299,7 +318,7 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 	}
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> {
-		val tags = webClient.httpGet("https://api.${domain}/manga/tag").parseJson()
+		val tags = getApiJson("https://api.${domain}/manga/tag")
 			.getJSONArray("data")
 		return tags.mapJSONToSet { jo ->
 			MangaTag(
@@ -319,6 +338,14 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 				val raw = meta.attrOrNull("content") ?: return@mapNotNullToSet null
 				Locale(raw.substringBefore('_'), raw.substringAfter('_', ""))
 			}
+	}
+
+	private suspend fun getApiJson(url: String): JSONObject {
+		val body = webClient.httpGet(url).parseRaw()
+		if (isMangaDexBrowserVerificationPage(body)) {
+			loaderContext.requestBrowserAction(this, url)
+		}
+		return parseMangaDexApiResponse(body, url)
 	}
 
 	private fun JSONObject.fetchManga(chapters: List<MangaChapter>?): Manga {
@@ -442,7 +469,7 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 			append(offset)
 			append("&contentRating[]=safe&contentRating[]=suggestive")
 		}
-		val json = webClient.httpGet(url).parseJson()
+		val json = getApiJson(url)
 		if (json.getString("result") == "ok") {
 			return Chapters(
 				data = json.optJSONArray("data")?.asTypedList<JSONObject>().orEmpty(),
