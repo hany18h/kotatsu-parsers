@@ -56,7 +56,8 @@ internal fun isMangaDexBrowserVerificationPage(body: String): Boolean {
 }
 
 @MangaSourceParser("MANGADEX", "MangaDex")
-internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser(context, MangaParserSource.MANGADEX) {
+internal class MangaDexParser(private val loaderContext: MangaLoaderContext) :
+	FlexibleMangaParser(loaderContext, MangaParserSource.MANGADEX) {
 
 	override val configKeyDomain = ConfigKey.Domain("mangadex.org")
 
