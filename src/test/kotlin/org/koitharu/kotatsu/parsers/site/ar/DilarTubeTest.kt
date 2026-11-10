@@ -21,6 +21,7 @@ import org.koitharu.kotatsu.parsers.model.MangaChapter
 import org.koitharu.kotatsu.parsers.model.MangaParserSource
 import org.koitharu.kotatsu.parsers.model.MangaSource
 import org.koitharu.kotatsu.parsers.network.UserAgents
+import java.io.IOException
 
 internal class DilarTubeTest {
 
@@ -208,6 +209,20 @@ internal class DilarTubeTest {
 	}
 
 	@Test
+	fun blockedNativeChapterRequestFallsBackToDilarBrowserClient() = runBlocking {
+		val context = CloudFlareBlockedDilarContext()
+		val parser = DilarTube(context)
+		val chapter = MangaChapter(
+			id = 1L, title = "Test", number = 1f, volume = 0, url = "/api/chapters/123",
+			uploadDate = 0L, scanlator = null, branch = null, source = MangaParserSource.DILARTUBE,
+		)
+
+		assertEquals("https://dilar.tube/uploads/page.webp", parser.getPages(chapter).single().url)
+		assertEquals(1, context.nativeRequests)
+		assertEquals(1, context.browserRequests)
+	}
+
+	@Test
 	fun opensXChaCha20VectorFromDilarLibraryAndRejectsTampering() {
 		val key = ByteArray(32) { it.toByte() }
 		val nonce = ByteArray(24) { (it + 32).toByte() }
@@ -312,6 +327,31 @@ internal class DilarTubeTest {
 			if (requiresFreePass && browserRequests == 1) {
 				return JSONObject.quote("""{"data":{"free_pass_required":true,"pages":[]}}""")
 			}
+			return JSONObject.quote("""{"data":{"pages":[{"url":"page.webp"}]}}""")
+		}
+		override fun getConfig(source: MangaSource) = MangaLoaderContextMock.getConfig(source)
+		override fun getDefaultUserAgent() = UserAgents.CHROME_MOBILE
+		override fun redrawImageResponse(response: Response, redraw: (Bitmap) -> Bitmap) = error("Not used")
+		override fun createBitmap(width: Int, height: Int): Bitmap = error("Not used")
+	}
+
+	private class CloudFlareBlockedDilarContext : MangaLoaderContext() {
+		var nativeRequests = 0
+		var browserRequests = 0
+		override val cookieJar = MangaLoaderContextMock.cookieJar
+		override val httpClient = OkHttpClient.Builder().addInterceptor { _ ->
+			nativeRequests++
+			throw IOException("Blocked by CloudFlare")
+		}.build()
+		@Deprecated("Provide a base url")
+		override suspend fun evaluateJs(script: String): String? = error("Base URL is required")
+		override suspend fun evaluateJs(baseUrl: String, script: String): String? = evaluateJs(baseUrl, script, emptyMap())
+		override suspend fun evaluateJs(baseUrl: String, script: String, headers: Map<String, String>): String? {
+			if (script.contains("dilar.client.credential")) return JSONObject.quote("existing-token")
+			assertEquals("https://dilar.tube/", baseUrl)
+			assertEquals(UserAgents.CHROME_MOBILE, headers["User-Agent"])
+			assertEquals("existing-token", headers["X-Client-Token"])
+			browserRequests++
 			return JSONObject.quote("""{"data":{"pages":[{"url":"page.webp"}]}}""")
 		}
 		override fun getConfig(source: MangaSource) = MangaLoaderContextMock.getConfig(source)

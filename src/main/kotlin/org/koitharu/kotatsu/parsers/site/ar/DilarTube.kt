@@ -17,6 +17,7 @@ import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.util.*
 import java.math.BigInteger
 import java.nio.charset.StandardCharsets
+import java.io.IOException
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -344,17 +345,26 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         }.generateKeyPair()
         val publicKey = encodeRawPublicKey(keyPair.public as ECPublicKey)
         val publicKeyHeader = publicKey.toByteString().base64Url().trimEnd('=')
-        val envelope = webClient.httpGet(
-            url,
-            apiHeaders(clientToken)
-                .newBuilder()
-                .add("X-DH-Pub", publicKeyHeader)
-                .add("X-Crypto-Caps", NATIVE_CRYPTO_CAPABILITIES)
-                .apply {
-                    freePass?.let { add("X-Unlock-Free-Chapter", it) }
-                }
-                .build(),
-        ).parseJson()
+        val envelope = try {
+            webClient.httpGet(
+                url,
+                apiHeaders(clientToken)
+                    .newBuilder()
+                    .add("X-DH-Pub", publicKeyHeader)
+                    .add("X-Crypto-Caps", NATIVE_CRYPTO_CAPABILITIES)
+                    .apply {
+                        freePass?.let { add("X-Unlock-Free-Chapter", it) }
+                    }
+                    .build(),
+            ).parseJson()
+        } catch (error: IOException) {
+            if (!error.isCloudFlareBlocked()) throw error
+            // The native client can be denied even when Dilar's own browser app
+            // is available. Retry through that same-origin client and its live
+            // browser session; never synthesize clearance cookies or tokens.
+            useCurrentWebClient = true
+            return loadWithCurrentWebClient(url, clientToken, freePass)
+        }
         if (!envelope.has("epk") || !envelope.has("ct")) return envelope
         // Never assume a future version uses today's cipher. Let the website's
         // current authenticated client negotiate and open its own response.
@@ -808,6 +818,9 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         .add("User-Agent", config[userAgentKey])
         .apply { clientToken?.let { add("X-Client-Token", it) } }
         .build()
+
+    private fun Throwable.isCloudFlareBlocked(): Boolean =
+        generateSequence(this) { it.cause }.any { it.message == "Blocked by CloudFlare" }
 
     private var cachedClientToken: String? = null
 
