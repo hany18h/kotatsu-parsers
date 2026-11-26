@@ -23,3 +23,6 @@ jobs:
 
         -   name: Compile parsers 🚀
             run: ./gradlew compileKotlin
+
+        -   name: Test updated Arabic parsers
+            run: ./gradlew test --tests org.koitharu.kotatsu.parsers.site.ar.KawaiiMangaTest --tests org.koitharu.kotatsu.parsers.site.ar.MangaDarTest --tests org.koitharu.kotatsu.parsers.site.ar.KolNovelCurrentMarkupTest --tests org.koitharu.kotatsu.parsers.site.ar.DilarTubeTest

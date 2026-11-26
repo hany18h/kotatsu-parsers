@@ -4,6 +4,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
 import org.json.JSONObject
+import okio.ByteString.Companion.decodeBase64
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -26,8 +27,13 @@ import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.urlEncoded
 import java.text.SimpleDateFormat
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.EnumSet
 import java.util.Locale
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * Arabic manga and manhwa from Kawaii Manga's public web client API.
@@ -102,18 +108,17 @@ internal class KawaiiManga(context: MangaLoaderContext) : PagedMangaParser(
 			if (chaptersJson != null) {
 				for (index in 0 until chaptersJson.length()) {
 					val item = chaptersJson.optJSONObject(index) ?: continue
-					val chapterId = item.optString("id").trim()
-					if (chapterId.isEmpty()) continue
+					val chapterId = item.optNonNullString("id") ?: continue
 					val number = item.optDouble("number", index + 1.0).toFloat()
 					add(
 						MangaChapter(
 							id = generateUid(chapterId),
-							title = item.optString("title").trim().ifEmpty { "الفصل ${formatNumber(number)}" },
+							title = item.optNonNullString("title") ?: "الفصل ${formatNumber(number)}",
 							number = number,
 							volume = 0,
 							url = "/chapter/$chapterId",
 							scanlator = "كواي مانجا",
-							uploadDate = parseDate(item.optString("createdAt")),
+							uploadDate = parseDate(item.optNonNullString("createdAt").orEmpty()),
 							branch = null,
 							source = source,
 						),
@@ -131,32 +136,51 @@ internal class KawaiiManga(context: MangaLoaderContext) : PagedMangaParser(
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val chapterId = chapter.url.substringAfter("/chapter/").substringBefore('/')
-		val pages = apiGet("pages&chapterId=${chapterId.urlEncoded()}").optJSONArray("pages")
+		val token = getApiToken()
+		val response = webClient.httpGet(
+			"$API_BASE/own?action=pages&chapterId=${chapterId.urlEncoded()}",
+			apiHeaders(token),
+		).parseJson()
+		val pages = response.optJSONArray("pages")
+			?: response.optJSONObject("box")?.let { decryptPages(it, token) }
 			?: return emptyList()
 		return buildList(pages.length()) {
 			for (index in 0 until pages.length()) {
-				val url = pages.optString(index).trim()
-				if (url.isNotEmpty()) {
+				val url = pages.optString(index).trim().takeUnless { it.isBlank() || it.equals("null", true) }
+				if (url != null) {
 					add(MangaPage(generateUid("$chapterId:$index:$url"), url, null, source))
 				}
 			}
 		}
 	}
 
-	private fun parseManga(json: JSONObject): Manga {
-		val slug = json.optString("slug").trim()
-		val id = json.optString("id").trim().ifEmpty { slug }
-		val titleAr = json.optString("titleAr").trim()
-		val title = titleAr.ifEmpty {
-			json.optString("title").trim().ifEmpty { json.optString("titleEn").trim() }
-		}
+	internal fun decryptPages(box: JSONObject, token: String): org.json.JSONArray {
+		val iv = box.optString("i").decodeBase64()?.toByteArray()
+			?: error("Kawaii Manga returned an invalid encrypted page IV")
+		val encrypted = box.optString("d").decodeBase64()?.toByteArray()
+			?: error("Kawaii Manga returned invalid encrypted page data")
+		val keyMaterial = (PAGE_KEY_PARTS.joinToString("") + "|" + token.takeLast(24))
+			.toByteArray(StandardCharsets.UTF_8)
+		val key = MessageDigest.getInstance("SHA-256").digest(keyMaterial)
+		val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+		cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+		val json = JSONObject(String(cipher.doFinal(encrypted), StandardCharsets.UTF_8))
+		return json.optJSONArray("pages") ?: error("Kawaii Manga returned no decrypted page list")
+	}
+
+	internal fun parseManga(json: JSONObject): Manga {
+		val slug = json.optNonNullString("slug").orEmpty()
+		val id = json.optNonNullString("id") ?: slug
+		val titleAr = json.optNonNullString("titleAr")
+		val title = titleAr ?: json.optNonNullString("title") ?: json.optNonNullString("titleEn").orEmpty()
 		val altTitles = buildSet {
-			listOf(json.optString("title"), json.optString("titleEn"), titleAr)
-				.map(String::trim)
-				.filterTo(this) { it.isNotEmpty() && it != title }
+			listOfNotNull(json.optNonNullString("title"), json.optNonNullString("titleEn"), titleAr)
+				.filterTo(this) { it != title }
 			json.optJSONArray("altTitles")?.let { array ->
 				for (index in 0 until array.length()) {
-					array.optString(index).trim().takeIf(String::isNotEmpty)?.let(::add)
+					array.optString(index).trim()
+						.takeUnless { it.isBlank() || it.equals("null", true) || it == title }
+						?.let(::add)
 				}
 			}
 		}
@@ -164,13 +188,13 @@ internal class KawaiiManga(context: MangaLoaderContext) : PagedMangaParser(
 			json.optJSONArray("genres")?.let { array ->
 				for (index in 0 until array.length()) {
 					val genre = array.optString(index).trim()
-					if (genre.isNotEmpty()) add(MangaTag(genre, genre, source))
+					if (genre.isNotEmpty() && !genre.equals("null", true)) add(MangaTag(genre, genre, source))
 				}
 			}
 		}
 		val authors = setOfNotNull(
-			json.optString("author").trim().takeIf(String::isNotEmpty),
-			json.optString("artist").trim().takeIf(String::isNotEmpty),
+			json.optNonNullString("author"),
+			json.optNonNullString("artist"),
 		)
 		val rating = json.optDouble("rating", Double.NaN).takeUnless(Double::isNaN)
 			?.div(5.0)?.toFloat()?.coerceIn(0f, 1f) ?: RATING_UNKNOWN
@@ -182,9 +206,9 @@ internal class KawaiiManga(context: MangaLoaderContext) : PagedMangaParser(
 			publicUrl = "https://$domain/manga/$slug",
 			rating = rating,
 			contentRating = ContentRating.SAFE,
-			coverUrl = json.optString("coverUrl").trim().takeIf(String::isNotEmpty),
+			coverUrl = json.optNonNullString("coverUrl"),
 			tags = tags,
-			state = when (json.optString("status").lowercase(Locale.ENGLISH)) {
+			state = when (json.optNonNullString("status")?.lowercase(Locale.ENGLISH)) {
 				"ongoing" -> MangaState.ONGOING
 				"completed", "finished" -> MangaState.FINISHED
 				"hiatus", "paused" -> MangaState.PAUSED
@@ -192,8 +216,8 @@ internal class KawaiiManga(context: MangaLoaderContext) : PagedMangaParser(
 			},
 			authors = authors,
 			source = source,
-			description = json.optString("description").trim().takeIf(String::isNotEmpty),
-			largeCoverUrl = json.optString("coverUrl").trim().takeIf(String::isNotEmpty),
+			description = json.optNonNullString("description"),
+			largeCoverUrl = json.optNonNullString("coverUrl"),
 		)
 	}
 
@@ -239,6 +263,13 @@ internal class KawaiiManga(context: MangaLoaderContext) : PagedMangaParser(
 		private const val APP_KEY = "km_2026_live"
 		private const val PAGE_SIZE = 30
 		private const val TOKEN_EXPIRY_MARGIN_SECONDS = 60L
+		private val PAGE_KEY_PARTS = arrayOf("1153b3c53436", "8ded1f8386fe", "03beaa5ebb16", "6a15f4275e25")
 		private val DATE_FORMAT = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSX", Locale.ENGLISH)
 	}
 }
+
+private fun JSONObject.optNonNullString(key: String): String? = opt(key)
+	?.takeUnless { it == JSONObject.NULL }
+	?.toString()
+	?.trim()
+	?.takeUnless { it.isBlank() || it.equals("null", true) }

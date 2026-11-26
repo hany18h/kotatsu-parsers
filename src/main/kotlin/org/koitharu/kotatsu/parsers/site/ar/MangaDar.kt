@@ -77,10 +77,12 @@ internal class MangaDar(context: MangaLoaderContext) : PagedMangaParser(
 			if (parameters.isNotEmpty()) append(parameters.joinToString(prefix = "?", separator = "&"))
 		}
 		val doc = webClient.httpGet(url).parseHtml()
-		return doc.select("main a[href*=/manga/]:has(h3):has(img)").mapNotNull { anchor ->
+		return doc.select("main a[href*=/manga/]:has(img)").mapNotNull { anchor ->
 			val href = anchor.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
 			if (!MANGA_PATH.matches(href)) return@mapNotNull null
-			val title = anchor.selectFirst("h3")?.text()?.trim().orEmpty()
+			val title = anchor.selectFirst("h3, h2")?.text()?.trim().orEmpty()
+				.ifEmpty { anchor.selectFirst("img")?.attr("alt")?.trim().orEmpty() }
+				.ifEmpty { anchor.text().trim() }
 			if (title.isEmpty()) return@mapNotNull null
 			Manga(
 				id = generateUid(href),
@@ -126,19 +128,7 @@ internal class MangaDar(context: MangaLoaderContext) : PagedMangaParser(
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-		val json = doc.selectFirst("script[type=application/json][id^=mv-pages-]")?.data()?.trim()
-		val urls = if (!json.isNullOrEmpty()) {
-			runCatching {
-				val array = JSONArray(json)
-				List(array.length()) { index -> array.optString(index) }.filter(String::isNotEmpty)
-			}.getOrDefault(emptyList())
-		} else {
-			emptyList()
-		}
-		val resolved = urls.ifEmpty {
-			doc.select(".reader-page img").mapNotNull { it.src() }
-		}
-		return resolved.distinct().map { imageUrl ->
+		return parsePageUrls(doc).distinct().map { imageUrl ->
 			MangaPage(
 				id = generateUid(imageUrl),
 				url = imageUrl,
@@ -148,7 +138,52 @@ internal class MangaDar(context: MangaLoaderContext) : PagedMangaParser(
 		}
 	}
 
+	internal fun parsePageUrls(doc: Document): List<String> {
+		val json = doc.selectFirst("script[type=application/json][id^=mv-pages-]")?.data()?.trim()
+		val urls = if (!json.isNullOrEmpty()) {
+			runCatching {
+				val array = JSONArray(json)
+				List(array.length()) { index -> array.optString(index) }
+					.filter { it.isNotBlank() && !it.equals("null", true) }
+			}.getOrDefault(emptyList())
+		} else {
+			emptyList()
+		}
+		return urls.ifEmpty {
+			doc.select(".reader-page img").mapNotNull { it.src() }
+		}
+	}
+
 	internal fun parseChapters(doc: Document): List<MangaChapter> {
+		// MangaDar's current theme embeds chapter objects as `mv-chapters-{mangaId}`.
+		// Keep supporting the earlier rows payload so existing cached pages still parse.
+		val currentRows = doc.selectFirst("script[id^=mv-chapters-][type=application/json]")
+			?.data()?.trim()?.takeIf(String::isNotEmpty)
+			?.let { data -> runCatching { JSONArray(data) }.getOrNull() }
+		if (currentRows != null) {
+			return List(currentRows.length()) { currentRows.optJSONObject(it) }
+				.mapNotNull { row ->
+					row ?: return@mapNotNull null
+					val absoluteUrl = row.optString("url").takeIf(String::isNotBlank) ?: return@mapNotNull null
+					val href = absoluteUrl.substringAfter(domain).let { if (it.startsWith('/')) it else "/$it" }
+					val numberText = row.optString("number").trim().takeIf(String::isNotEmpty)
+						?: return@mapNotNull null
+					val number = numberText.toFloatOrNull() ?: return@mapNotNull null
+					MangaChapter(
+						id = generateUid(href),
+						title = "الفصل $numberText",
+						number = number,
+						volume = 0,
+						url = href,
+						scanlator = null,
+						uploadDate = row.optLong("date", 0L) * 1000L,
+						branch = null,
+						source = source,
+					)
+				}
+				.distinctBy(MangaChapter::url)
+				.sortedBy(MangaChapter::number)
+		}
 		val scriptRows = doc.selectFirst("script#mdg-manga-chapters-json[type=application/json]")
 			?.data()
 			?.trim()

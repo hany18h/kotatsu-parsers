@@ -62,8 +62,8 @@ internal class KolNovel(context: MangaLoaderContext) :
 						},
 					)
 					filter.tags.oneOrThrowIfMany()?.let {
-						append("&genre=")
-						append(it.key)
+						append("&genre%5B%5D=")
+						append(it.key.urlEncoded())
 					}
 					filter.states.oneOrThrowIfMany()?.let {
 						append("&status=")
@@ -79,15 +79,23 @@ internal class KolNovel(context: MangaLoaderContext) :
 			}
 		}
 		val doc = webClient.httpGet(url).parseHtml()
-		return doc.select(".listupd article.maindet").map { article ->
-			val a = article.selectFirstOrThrow(".mdthumb a")
-			val href = a.attrAsRelativeUrl("href")
-			val title = a.attr("title").ifEmpty {
-				article.selectFirst(".mdinfo h2")?.text().orEmpty()
-			}
-			val img = article.selectFirst(".mdthumb img")
-			val ratingText = article.selectFirst(".mdminf")?.ownText()?.trim()
+		val articles = doc.select("article.kol-series-archive__item")
+			.ifEmpty { doc.select(".listupd article.maindet") }
+		return articles.mapNotNull { article ->
+			val link = article.selectFirst("h3 a, a[data-kol-series-title-source], .kol-series-archive__cover")
+				?: article.selectFirst(".mdthumb a")
+				?: return@mapNotNull null
+			val href = link.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
+			val title = article.selectFirst("h3 a")?.text()?.trim().orEmpty()
+				.ifEmpty { article.selectFirst(".mdinfo h2")?.text()?.trim().orEmpty() }
+				.ifEmpty { article.selectFirst("img[alt]")?.attr("alt")?.trim().orEmpty() }
+			if (title.isEmpty()) return@mapNotNull null
+			val img = article.selectFirst(".kol-series-archive__cover img, .mdthumb img, img")
+			val ratingText = article.selectFirst(".kol-series-archive__rating b")?.text()?.trim()
+				?: article.selectFirst(".mdminf")?.ownText()?.trim()
 			val rating = ratingText?.toFloatOrNull()?.div(10f) ?: RATING_UNKNOWN
+			val status = article.selectFirst(".kol-series-archive__status")?.text()
+				?: article.selectFirst(".sertostat span")?.text().orEmpty()
 			Manga(
 				id = generateUid(href),
 				title = title,
@@ -98,45 +106,36 @@ internal class KolNovel(context: MangaLoaderContext) :
 				contentRating = null,
 				coverUrl = img?.src(),
 				tags = emptySet(),
-				state = null,
+				state = parseState(status),
 				authors = emptySet(),
 				source = source,
 			)
-		}
+		}.distinctBy(Manga::url)
 	}
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> {
 		val doc = webClient.httpGet("https://$domain/series/").parseHtml()
-		return doc.select(".quickfilter .genrez li label").mapNotNullToSet { label ->
-			val input = label.selectFirst("input") ?: return@mapNotNullToSet null
-			val key = input.attr("value")
-			if (key.isEmpty()) return@mapNotNullToSet null
-			MangaTag(
-				key = key,
-				title = label.text().trim(),
-				source = source,
-			)
+		return doc.select("input[name='genre[]']").mapNotNullToSet { input ->
+			val key = input.attr("value").trim()
+			val title = input.parent()?.text()?.trim().orEmpty()
+			if (key.isEmpty() || title.isEmpty()) return@mapNotNullToSet null
+			MangaTag(key = key, title = title, source = source)
 		}
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
 
-		val statusText = doc.selectFirst(".sertostat span")?.text()?.trim().orEmpty()
-		val state = when {
-			statusText.contains("Ongoing", ignoreCase = true) || statusText.contains("مستمرة") -> MangaState.ONGOING
-			statusText.contains("Completed", ignoreCase = true) || statusText.contains("مكتمل") -> MangaState.FINISHED
-			else -> manga.state
-		}
-
-		val authors = doc.select(".sertoauth .serl").mapNotNull { serl ->
-			val label = serl.selectFirst(".sername")?.text().orEmpty()
-			if (label.contains("الكاتب") || label.contains("المؤلف")) {
-				serl.selectFirst(".serval")?.text()
-			} else null
-		}.toSet()
-
-		val tags = doc.select(".sertogenre a").mapToSet { a ->
+		val statusText = (doc.selectFirst(".kol-series-editorial__quick-fact--status")
+			?: doc.selectFirst(".sertostat span"))?.text()?.trim().orEmpty()
+		val state = parseState(statusText)
+		val byline = doc.selectFirst(".kol-series-editorial__byline")?.text()?.trim().orEmpty()
+		val authors = byline.substringAfter("بقلم", "").trim().takeIf(String::isNotEmpty)?.let(::setOf)
+			?: doc.select(".sertoauth .serl").mapNotNullToSet { row ->
+				val label = row.selectFirst(".sername")?.text().orEmpty()
+				if (label.contains("الكاتب") || label.contains("المؤلف")) row.selectFirst(".serval")?.text() else null
+			}
+		val tags = doc.select(".kol-series-editorial__genres a, .sertogenre a").mapToSet { a ->
 			MangaTag(
 				key = a.attr("href").removeSuffix("/").substringAfterLast("/"),
 				title = a.text().trim(),
@@ -147,58 +146,117 @@ internal class KolNovel(context: MangaLoaderContext) :
 		val ratingValue = doc.selectFirst("meta[itemprop=ratingValue]")
 			?.attr("content")?.toFloatOrNull()?.div(10f) ?: manga.rating
 
-		val coverUrl = doc.selectFirst(".sertothumb img")?.src() ?: manga.coverUrl
-		val altTitle = doc.selectFirst(".sertoinfo .alter")?.text()
+		val coverUrl = doc.selectFirst(".kol-series-editorial__cover img, .sertothumb img")?.src()
+			?: doc.selectFirst("meta[property=og:image]")?.attr("content")
+			?: manga.coverUrl
+		val altTitle = (doc.selectFirst(".kol-series-editorial__alt-title")
+			?: doc.selectFirst(".sertoinfo .alter"))?.text()?.trim()
 
 		return manga.copy(
-			title = doc.selectFirst("h1.entry-title")?.text() ?: manga.title,
+			title = (doc.selectFirst("h1.kol-series-editorial__title")
+				?: doc.selectFirst("h1.entry-title"))?.text()?.trim() ?: manga.title,
 			altTitles = setOfNotNull(altTitle),
-			description = doc.selectFirst(".sersys.entry-content")?.html(),
+			description = (doc.selectFirst(".kol-series-editorial__synopsis .kol-series-editorial__prose")
+				?: doc.selectFirst(".sersys.entry-content"))?.html(),
 			coverUrl = coverUrl,
 			largeCoverUrl = coverUrl,
 			rating = ratingValue,
 			state = state,
 			authors = authors,
 			tags = tags,
-			chapters = parseChapters(doc),
+			chapters = loadAllChapters(manga.url, doc),
 		)
 	}
 
 	private val dateFormat = SimpleDateFormat("MMMM dd, yyyy", Locale("ar"))
 	private val dateFormatEn = SimpleDateFormat("MMMM dd, yyyy", Locale.ENGLISH)
+	private val dateFormatIso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.ENGLISH)
+	private val dateFormatIsoNoMillis = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.ENGLISH)
 
-	private fun parseChapters(doc: Document): List<MangaChapter> {
-		return doc.select(".eplister ul li").mapNotNull { li ->
-			val a = li.selectFirst("a") ?: return@mapNotNull null
-			val href = a.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
-			val numText = li.selectFirst(".epl-num")?.text().orEmpty()
-			val title = li.selectFirst(".epl-title")?.text().orEmpty()
-			val dateText = li.selectFirst(".epl-date")?.text().orEmpty()
-
-			val number = numText.filter { it.isDigit() || it == '.' }.toFloatOrNull() ?: 0f
-
-			val uploadDate = parseChapterDate(dateText)
-
+	internal fun parseChapters(doc: Document): List<MangaChapter> {
+		val currentRows = doc.select(".kol-series-chapter")
+		if (currentRows.isEmpty()) {
+			return doc.select(".eplister ul li").mapNotNull { row ->
+				val link = row.selectFirst("a") ?: return@mapNotNull null
+				val href = link.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
+				val numberText = row.selectFirst(".epl-num")?.text().orEmpty()
+				val number = numberText.filter { it.isDigit() || it == '.' }.toFloatOrNull() ?: return@mapNotNull null
+				MangaChapter(
+					id = generateUid(href),
+					title = row.selectFirst(".epl-title")?.text().orEmpty().ifEmpty { numberText },
+					number = number,
+					volume = 0,
+					url = href,
+					scanlator = null,
+					uploadDate = parseChapterDate(row.selectFirst(".epl-date")?.text().orEmpty()),
+					branch = null,
+					source = source,
+				)
+			}.distinctBy(MangaChapter::url).sortedBy(MangaChapter::number)
+		}
+		return currentRows.mapNotNull { row ->
+			val link = row.selectFirst("a[data-kol-chapter-transition-link], a[href]") ?: return@mapNotNull null
+			val href = link.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
+			val numberText = row.selectFirst("[data-kol-chapter-number]")
+				?.attr("data-kol-chapter-number")?.trim()
+				?: Regex("""\d+(?:\.\d+)?""").find(link.text())?.value
+			val number = numberText?.toFloatOrNull() ?: return@mapNotNull null
+			val title = row.selectFirst("[data-kol-chapter-title]")?.text()?.trim().orEmpty()
+			val dateText = row.selectFirst("time[data-kol-chapter-date]")?.attr("datetime")
+				?: row.selectFirst("time")?.text().orEmpty()
 			MangaChapter(
 				id = generateUid(href),
-				title = title.ifEmpty { numText },
+				title = title.ifEmpty { "الفصل $numberText" },
 				number = number,
 				volume = 0,
 				url = href,
 				scanlator = null,
-				uploadDate = uploadDate,
+				uploadDate = parseChapterDate(dateText),
 				branch = null,
 				source = source,
 			)
-		}.reversed()
+		}.distinctBy(MangaChapter::url).sortedBy(MangaChapter::number)
+	}
+
+	private suspend fun loadAllChapters(mangaUrl: String, firstDocument: Document): List<MangaChapter> {
+		val chapters = LinkedHashMap<String, MangaChapter>()
+		val seriesUrl = mangaUrl.toAbsoluteUrl(domain).substringBefore('#').substringBefore('?')
+		var document = firstDocument
+		var page = 1
+		while (page <= MAX_CHAPTER_PAGES) {
+			parseChapters(document).forEach { chapters.putIfAbsent(it.url, it) }
+			val nextPage = document.select("a[href*='chapter_page=']")
+				.mapNotNull { link -> Regex("""[?&]chapter_page=(\d+)""").find(link.attr("href"))?.groupValues?.get(1)?.toIntOrNull() }
+				.filter { it > page }
+				.minOrNull() ?: break
+			if (nextPage > MAX_CHAPTER_PAGES) break
+			page = nextPage
+			val pageUrl = "$seriesUrl" +
+				"?chapter_volume=__kol_all__&chapter_search=&chapter_order=newest&chapter_page=$page#chapters"
+			document = webClient.httpGet(pageUrl).parseHtml()
+			if (document.select(".kol-series-chapter").isEmpty()) break
+		}
+		return chapters.values.sortedBy(MangaChapter::number)
+	}
+
+	private fun parseState(value: String): MangaState? = when {
+		value.contains("مستمرة") || value.contains("مستمر") || value.contains("ongoing", ignoreCase = true) -> MangaState.ONGOING
+		value.contains("مكتملة") || value.contains("مكتمل") || value.contains("completed", ignoreCase = true) -> MangaState.FINISHED
+		value.contains("متوقفة") || value.contains("متوقف") || value.contains("paused", ignoreCase = true) -> MangaState.PAUSED
+		else -> null
 	}
 
 	private fun parseChapterDate(dateText: String): Long {
 		if (dateText.isBlank()) return 0L
-		return runCatching { dateFormat.parse(dateText)?.time }.getOrNull()
+		return parseDate(dateFormatIso, dateText)
+			?: parseDate(dateFormatIsoNoMillis, dateText)
+			?: runCatching { dateFormat.parse(dateText)?.time }.getOrNull()
 			?: runCatching { dateFormatEn.parse(dateText)?.time }.getOrNull()
 			?: 0L
 	}
+
+	private fun parseDate(format: SimpleDateFormat, value: String): Long? =
+		synchronized(format) { runCatching { format.parse(value)?.time }.getOrNull() }
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = emptyList()
 
@@ -297,6 +355,7 @@ internal class KolNovel(context: MangaLoaderContext) :
 	}
 
 	internal companion object {
+		private const val MAX_CHAPTER_PAGES = 100
 		private val ONLY_NUMBER = Regex("^\\d+$")
 		// Android's ICU regex engine does not accept an unmatched literal closing
 		// brace here, although the desktop JVM does. Escape both CSS braces so class
