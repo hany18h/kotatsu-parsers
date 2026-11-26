@@ -20,6 +20,7 @@ internal class KolNovelCurrentMarkupTest {
 			  <time data-kol-chapter-date datetime="2026-11-26T10:00:00+00:00"></time>
 			</div>
 			""".trimIndent(),
+			"https://kolnovel.com/series/example/",
 		)
 
 		val chapters = parser.parseChapters(document)
