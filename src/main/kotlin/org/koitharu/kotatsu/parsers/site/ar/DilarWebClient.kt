@@ -7,6 +7,76 @@ import org.koitharu.kotatsu.parsers.exception.ContentUnavailableException
 /** Uses the site's public, same-origin client, not a guessed future cipher. */
 internal object DilarWebClient {
 
+    /** Hook the same response parsers used by Dilar's reader before its scripts run. */
+    fun buildReaderCaptureScript(releaseId: String, requestId: String): String = """
+        (() => {
+          const key = ${JSONObject.quote("__dilarPages_$requestId")};
+          const wanted = ${JSONObject.quote(releaseId)};
+          let release = null;
+          const capture = function(result) {
+            if (!result || typeof result !== 'object') return;
+            if (String(result.id) === wanted) {
+              release = {
+                storage_key: result.storage_key || (release && release.storage_key),
+                media_token: result.media_token || (release && release.media_token)
+              };
+            }
+            const storageKey = result.storage_key || (release && release.storage_key);
+            if (release && storageKey && Array.isArray(result.pages) && result.pages.length) {
+              const payload = JSON.stringify({
+                storage_key: storageKey,
+                media_token: result.media_token || release.media_token,
+                pages: result.pages
+              });
+              try { window.top[key] = payload; } catch (_) { window[key] = payload; }
+            }
+          };
+          const parse = JSON.parse;
+          JSON.parse = function() {
+            const result = parse.apply(this, arguments);
+            capture(result);
+            return result;
+          };
+          if (window.Response && Response.prototype.json) {
+            const responseJson = Response.prototype.json;
+            Response.prototype.json = async function() {
+              const result = await responseJson.apply(this, arguments);
+              capture(result);
+              return result;
+            };
+          }
+        })();
+    """.trimIndent()
+
+    fun buildReaderPollScript(requestId: String): String =
+        "window[${JSONObject.quote("__dilarPages_$requestId")}] || null"
+
+    fun parseCapturedResult(raw: String?, url: String): JSONObject {
+        if (!url.contains("/reader/")) {
+            throw ContentUnavailableException("Dilar chapter capture must run on the site's reader page")
+        }
+        if (raw.isNullOrBlank() || raw == "null") {
+            throw ContentUnavailableException(
+                "Dilar's reader did not return chapter images. Update Android System WebView and refresh the chapter list.",
+            )
+        }
+        val value = runCatching { JSONObject("{\"value\":$raw}").getString("value") }
+            .getOrElse {
+                throw ContentUnavailableException("Dilar returned an invalid chapter page list")
+            }
+        val result = runCatching { JSONObject(value) }
+            .getOrElse {
+                throw ContentUnavailableException("Dilar returned an invalid chapter page list")
+            }
+        if (result.optJSONArray("pages")?.length() == 0 || !result.has("pages")) {
+            throw ContentUnavailableException("Dilar's reader did not return any chapter images")
+        }
+        if (result.has("epk") && result.has("ct")) {
+            throw ContentUnavailableException("Dilar's reader returned encrypted chapter data instead of images")
+        }
+        return result
+    }
+
     fun buildScript(baseUrl: String, url: String, clientToken: String, freePass: String?, requestId: String): String = """
         (function() {
           const key = ${JSONObject.quote("__dilarRequest_$requestId")};

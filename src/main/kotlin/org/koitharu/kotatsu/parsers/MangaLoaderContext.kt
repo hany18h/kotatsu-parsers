@@ -56,6 +56,14 @@ public abstract class MangaLoaderContext {
 		headers: Map<String, String>,
 	): String? = evaluateJs(baseUrl, script)
 
+	/** Execute [documentStartScript] before the page's own JavaScript, then poll [script] for a result. */
+	public open suspend fun evaluateJsAtDocumentStart(
+		baseUrl: String,
+		script: String,
+		documentStartScript: String,
+		headers: Map<String, String>,
+	): String? = evaluateJs(baseUrl, script, headers)
+
 	/**
 	 * Open [url] in browser for some external action (e.g. captcha solving or non cookie-based authorization)
 	 */

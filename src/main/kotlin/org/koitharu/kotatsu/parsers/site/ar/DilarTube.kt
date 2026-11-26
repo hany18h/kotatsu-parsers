@@ -243,7 +243,7 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
                     title = title,
                     number = chapterNum,
                     volume = volNum,
-                    url = "/api/chapters/$releaseId",
+                    url = "/reader/$seriesId?release=$releaseId",
                     uploadDate = date,
                     source = source,
                     scanlator = null,
@@ -255,19 +255,44 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val id = chapter.url.substringAfterLast("/")
-        val url = "https://$domain/api/chapters/$id"
-        var json = loadEncryptedJson(url)
-        if (json.optBoolean("free_pass_required") && json.optJSONArray("pages")?.length() == 0) {
-            val unlocked = loadUnlockedJson(url, id)
-            json = unlocked.json
-            json.optJSONObject("assets_enc")?.let { encryptedAssets ->
-                val mediaToken = json.optString("media_token").nullIfEmpty()
-                    ?: throw ContentUnavailableException("Dilar did not provide a media token")
-                mergeJson(json, decryptMediaPayload(encryptedAssets, unlocked.freePass, mediaToken))
-                json.remove("assets_enc")
+        val path = chapter.url.substringBefore('?')
+        val readerChapter = path.startsWith("/reader/")
+        val releaseId = if (readerChapter) {
+            chapter.url.substringAfter("release=", "").substringBefore('&')
+        } else {
+            chapter.url.substringAfterLast('/')
+        }.takeIf(String::isNotBlank)
+            ?: throw ContentUnavailableException("Refresh Dilar's chapter list to open this chapter in the current reader")
+        val json = if (readerChapter) {
+            val seriesId = path.substringAfterLast('/').takeIf(String::isNotBlank)
+                ?: throw ContentUnavailableException("Refresh Dilar's chapter list to open this chapter in the current reader")
+            val url = "https://$domain/reader/$seriesId?release=$releaseId"
+            val requestId = UUID.randomUUID().toString().replace("-", "")
+            DilarWebClient.parseCapturedResult(
+                loaderContext.evaluateJsAtDocumentStart(
+                    baseUrl = url,
+                    script = DilarWebClient.buildReaderPollScript(requestId),
+                    documentStartScript = DilarWebClient.buildReaderCaptureScript(releaseId, requestId),
+                    headers = mapOf("User-Agent" to config[userAgentKey]),
+                ),
+                url,
+            )
+        } else {
+            val apiUrl = "https://$domain/api/chapters/$releaseId"
+            var response = loadEncryptedJson(apiUrl)
+            if (response.optBoolean("free_pass_required") && response.optJSONArray("pages")?.length() == 0) {
+                val unlocked = loadUnlockedJson(apiUrl, releaseId)
+                response = unlocked.json
+                response.optJSONObject("assets_enc")?.let { encryptedAssets ->
+                    val mediaToken = response.optString("media_token").nullIfEmpty()
+                        ?: throw ContentUnavailableException("Dilar did not provide a media token")
+                    mergeJson(response, decryptMediaPayload(encryptedAssets, unlocked.freePass, mediaToken))
+                    response.remove("assets_enc")
+                }
             }
+            response
         }
+        val id = releaseId
         val pagesJson = json.getJSONArray("pages")
         if (pagesJson.length() == 0) {
             throw ContentUnavailableException(
@@ -279,7 +304,9 @@ internal class DilarTube(private val loaderContext: MangaLoaderContext) :
         val teamId = json.optString("init_team_id").nullIfEmpty()
             ?: json.optJSONArray("teams")?.optJSONObject(0)?.optString("id")?.nullIfEmpty()
 
-        return (0 until pagesJson.length()).map { i ->
+        return (0 until pagesJson.length()).sortedBy { index ->
+            pagesJson.optJSONObject(index)?.optInt("order", index) ?: index
+        }.map { i ->
             val page = pagesJson.getJSONObject(i)
             val imageUrl = page.getString("url")
             

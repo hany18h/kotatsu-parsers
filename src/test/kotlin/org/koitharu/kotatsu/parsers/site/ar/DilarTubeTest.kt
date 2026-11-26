@@ -223,6 +223,28 @@ internal class DilarTubeTest {
 	}
 
 	@Test
+	fun capturesCurrentReaderPagesFromDocumentStart() = runBlocking {
+		val context = ReaderCaptureDilarContext()
+		val parser = DilarTube(context)
+		val chapter = MangaChapter(
+			id = 1L, title = "Test", number = 1f, volume = 0, url = "/reader/456?release=123",
+			uploadDate = 0L, scanlator = null, branch = null, source = MangaParserSource.DILARTUBE,
+		)
+
+		val pages = parser.getPages(chapter)
+
+		assertEquals("https://dilar.tube/reader/456?release=123", context.readerUrl)
+		assertTrue(context.captureScript.contains("Response.prototype.json"))
+		assertEquals(
+			listOf(
+				"https://dilar.tube/uploads/releases/team/series/hq/first.webp?t=media-token",
+				"https://dilar.tube/uploads/releases/team/series/hq/last.webp?t=media-token",
+			),
+			pages.map { it.url },
+		)
+	}
+
+	@Test
 	fun opensXChaCha20VectorFromDilarLibraryAndRejectsTampering() {
 		val key = ByteArray(32) { it.toByte() }
 		val nonce = ByteArray(24) { (it + 32).toByte() }
@@ -353,6 +375,35 @@ internal class DilarTubeTest {
 			assertEquals("existing-token", headers["X-Client-Token"])
 			browserRequests++
 			return JSONObject.quote("""{"data":{"pages":[{"url":"page.webp"}]}}""")
+		}
+		override fun getConfig(source: MangaSource) = MangaLoaderContextMock.getConfig(source)
+		override fun getDefaultUserAgent() = UserAgents.CHROME_MOBILE
+		override fun redrawImageResponse(response: Response, redraw: (Bitmap) -> Bitmap) = error("Not used")
+		override fun createBitmap(width: Int, height: Int): Bitmap = error("Not used")
+	}
+
+	private class ReaderCaptureDilarContext : MangaLoaderContext() {
+		var readerUrl: String? = null
+		var captureScript = ""
+		override val cookieJar = MangaLoaderContextMock.cookieJar
+		override val httpClient = OkHttpClient()
+		@Deprecated("Provide a base url")
+		override suspend fun evaluateJs(script: String): String? = error("Base URL is required")
+		override suspend fun evaluateJs(baseUrl: String, script: String): String? = evaluateJs(baseUrl, script, emptyMap())
+		override suspend fun evaluateJs(baseUrl: String, script: String, headers: Map<String, String>): String? = null
+		override suspend fun evaluateJsAtDocumentStart(
+			baseUrl: String,
+			script: String,
+			documentStartScript: String,
+			headers: Map<String, String>,
+		): String? {
+			readerUrl = baseUrl
+			captureScript = documentStartScript
+			assertTrue(script.contains("__dilarPages_"))
+			assertEquals(UserAgents.CHROME_MOBILE, headers["User-Agent"])
+			return JSONObject.quote(
+				"""{"storage_key":"team/series","media_token":"media-token","pages":[{"url":"last.webp","order":2},{"url":"first.webp","order":1}]}""",
+			)
 		}
 		override fun getConfig(source: MangaSource) = MangaLoaderContextMock.getConfig(source)
 		override fun getDefaultUserAgent() = UserAgents.CHROME_MOBILE
